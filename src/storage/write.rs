@@ -5,13 +5,13 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info};
 
-use light_indexer_core::metrics;
-use light_indexer_core::types::*;
+use crate::metrics;
+use crate::types::*;
 
-use crate::accounts::AccountProcessor;
-use crate::files::BlockFileStorage;
-use crate::postgres::PgStorage;
-use crate::rocks::UnifiedRocksDb;
+use super::accounts::AccountProcessor;
+use super::files::BlockFileStorage;
+use super::postgres::PgStorage;
+use super::rocks::UnifiedRocksDb;
 
 /// The write worker consumes from the source pipeline and persists data
 /// to RocksDB (blocks + accounts), file storage (block data), and PostgreSQL

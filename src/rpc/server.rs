@@ -15,12 +15,12 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 
-use light_indexer_core::config::RpcConfig;
-use light_indexer_core::metrics;
-use light_indexer_storage::read::StorageReader;
+use crate::config::RpcConfig;
+use crate::metrics;
+use crate::storage::read::StorageReader;
 
-use crate::methods;
-use crate::upstream::UpstreamForwarder;
+use super::methods;
+use super::upstream::UpstreamForwarder;
 
 pub struct RpcServer {
     config: RpcConfig,

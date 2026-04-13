@@ -14,11 +14,11 @@ use solana_signature::Signature;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use light_indexer_core::config::SourceConfig;
-use light_indexer_core::metrics;
-use light_indexer_core::types::*;
+use crate::config::SourceConfig;
+use crate::metrics;
+use crate::types::*;
 
-use crate::commitment::CommitmentTracker;
+use super::commitment::CommitmentTracker;
 
 /// Accumulates partial data for an in-progress slot from the gRPC stream.
 struct SlotAccumulator {

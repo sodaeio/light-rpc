@@ -3,9 +3,9 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::time::Duration;
 use tracing::info;
 
-use light_indexer_core::config::PostgresConfig;
-use light_indexer_core::types::*;
-use light_indexer_core::metrics;
+use crate::config::PostgresConfig;
+use crate::types::*;
+use crate::metrics;
 
 pub struct PgStorage {
     pool: PgPool,

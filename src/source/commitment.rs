@@ -1,4 +1,4 @@
-use light_indexer_core::{Slot, SlotStatus};
+use crate::{Slot, SlotStatus};
 use std::collections::BTreeMap;
 
 /// Tracks commitment progression for all in-flight slots.

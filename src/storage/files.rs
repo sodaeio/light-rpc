@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use light_indexer_core::config::BlockStorageConfig;
-use light_indexer_core::Slot;
+use crate::config::BlockStorageConfig;
+use crate::Slot;
 
 /// Circular file storage for encoded blocks.
 ///

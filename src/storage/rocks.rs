@@ -6,8 +6,8 @@ use rocksdb::{
 use std::path::Path;
 use std::sync::Arc;
 
-use light_indexer_core::config::RocksDbConfig;
-use light_indexer_core::types::*;
+use crate::config::RocksDbConfig;
+use crate::types::*;
 
 /// Column family names for all indexed data.
 ///

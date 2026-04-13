@@ -1,7 +1,7 @@
 use anyhow::Result;
 use jsonrpsee::RpcModule;
 
-use crate::server::RpcContext;
+use crate::rpc::server::RpcContext;
 
 fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObject::owned(code, msg.to_string(), None::<()>)
@@ -10,14 +10,14 @@ fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
 pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("getAsset", |params, _ctx, _| async move {
         let p: serde_json::Value = params.parse()?;
-        let id = p.get("id").and_then(|v| v.as_str()).ok_or_else(|| err(-32602, "Missing 'id' parameter"))?;
+        let id = p.get("id").and_then(|v| v.as_str()).ok_or_else(|| err(-32602, "Missing 'id'"))?;
 
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
             "interface": "V1_NFT",
             "id": id,
             "content": null,
             "authorities": [],
-            "compression": {"compressed": false},
+            "compression": { "compressed": false },
             "grouping": [],
             "royalty": {},
             "creators": [],
@@ -30,7 +30,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("getAssetsByOwner", |params, _ctx, _| async move {
         let p: serde_json::Value = params.parse()?;
         let _owner = p.get("ownerAddress").and_then(|v| v.as_str())
-            .ok_or_else(|| err(-32602, "Missing 'ownerAddress' parameter"))?;
+            .ok_or_else(|| err(-32602, "Missing 'ownerAddress'"))?;
         let page = p.get("page").and_then(|v| v.as_u64()).unwrap_or(1);
         let limit = p.get("limit").and_then(|v| v.as_u64()).unwrap_or(1000);
 
@@ -42,8 +42,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("getAssetsByCreator", |params, _ctx, _| async move {
         let p: serde_json::Value = params.parse()?;
         let _creator = p.get("creatorAddress").and_then(|v| v.as_str())
-            .ok_or_else(|| err(-32602, "Missing 'creatorAddress' parameter"))?;
-
+            .ok_or_else(|| err(-32602, "Missing 'creatorAddress'"))?;
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
             "total": 0, "limit": 1000, "page": 1, "items": []
         }))

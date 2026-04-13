@@ -7,7 +7,7 @@ pub mod transactions;
 use anyhow::Result;
 use jsonrpsee::RpcModule;
 
-use crate::server::RpcContext;
+use crate::rpc::server::RpcContext;
 
 pub type RpcResult = Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 

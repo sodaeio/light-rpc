@@ -1,5 +1,5 @@
-use light_indexer_core::types::*;
-use crate::rocks::{StoredAccountEntry, UnifiedRocksDb};
+use crate::types::*;
+use super::rocks::{StoredAccountEntry, UnifiedRocksDb};
 
 /// Serialized account data stored in RocksDB.
 #[derive(serde::Serialize, serde::Deserialize)]

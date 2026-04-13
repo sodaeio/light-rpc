@@ -5,16 +5,16 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{error, info};
 
-use light_indexer_core::config::Config;
-use light_indexer_core::metrics::REGISTRY;
-use light_indexer_rpc::server::RpcServer;
-use light_indexer_rpc::upstream::UpstreamForwarder;
-use light_indexer_source::StreamSource;
-use light_indexer_storage::files::BlockFileStorage;
-use light_indexer_storage::postgres::PgStorage;
-use light_indexer_storage::read::{MemoryCache, StorageReader};
-use light_indexer_storage::rocks::UnifiedRocksDb;
-use light_indexer_storage::write::{pg_writer_loop, StorageWriter};
+use light_indexer::config::Config;
+use light_indexer::metrics::REGISTRY;
+use light_indexer::rpc::server::RpcServer;
+use light_indexer::rpc::upstream::UpstreamForwarder;
+use light_indexer::source::StreamSource;
+use light_indexer::storage::files::BlockFileStorage;
+use light_indexer::storage::postgres::PgStorage;
+use light_indexer::storage::read::{MemoryCache, StorageReader};
+use light_indexer::storage::rocks::UnifiedRocksDb;
+use light_indexer::storage::write::{pg_writer_loop, StorageWriter};
 
 #[derive(Parser)]
 #[command(name = "light-indexer", about = "Unified Solana indexer and RPC server")]
@@ -57,7 +57,6 @@ fn main() -> Result<()> {
 }
 
 async fn run(config: Config) -> Result<()> {
-    // Storage layer
     let rocks = UnifiedRocksDb::open(&config.storage.rocksdb).context("opening rocksdb")?;
     info!(path = %config.storage.rocksdb.path, "rocksdb opened");
 
@@ -71,12 +70,10 @@ async fn run(config: Config) -> Result<()> {
 
     let memory_cache = Arc::new(MemoryCache::new());
 
-    // Pipeline channels
     let (source_tx, source_rx) = tokio::sync::mpsc::channel(config.storage.pipeline.source_to_write);
     let (broadcast_tx, _) = tokio::sync::broadcast::channel(config.storage.pipeline.write_to_read);
     let (pg_tx, pg_rx) = tokio::sync::mpsc::channel(config.storage.pipeline.pg_write_buffer);
 
-    // Metrics server
     let metrics_endpoint = config.metrics.endpoint.clone();
     tokio::spawn(async move {
         if let Err(e) = run_metrics_server(&metrics_endpoint).await {
@@ -84,16 +81,13 @@ async fn run(config: Config) -> Result<()> {
         }
     });
 
-    // PG writer (isolated task)
     let pg_writer = pg.clone();
     tokio::spawn(async move { pg_writer_loop(pg_writer, pg_rx).await });
 
-    // Cache updater (broadcast subscriber)
     let cache_rx = broadcast_tx.subscribe();
     let cache_ref = Arc::clone(&memory_cache);
     tokio::spawn(async move { StorageReader::run_cache_updater(cache_ref, cache_rx).await });
 
-    // Storage writer
     let writer = StorageWriter::new(
         rocks.clone(),
         files.as_ref().clone_for_writer(),
@@ -106,7 +100,6 @@ async fn run(config: Config) -> Result<()> {
         }
     });
 
-    // gRPC source
     let source = StreamSource::new(config.source, source_tx);
     tokio::spawn(async move {
         if let Err(e) = source.run().await {
@@ -114,7 +107,6 @@ async fn run(config: Config) -> Result<()> {
         }
     });
 
-    // RPC server (blocks)
     let reader = Arc::new(StorageReader::new(memory_cache, rocks, files, pg));
     let upstream = config.rpc.upstream.as_ref().map(|endpoint| {
         UpstreamForwarder::new(endpoint.clone(), config.rpc.forwarded_methods.clone())
