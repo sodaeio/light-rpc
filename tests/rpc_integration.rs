@@ -45,7 +45,9 @@ const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 #[tokio::test]
 async fn test_get_slot() {
     let resp = rpc_call("getSlot", json!([])).await;
-    let slot = resp["result"].as_u64().expect("getSlot should return a number");
+    let slot = resp["result"]
+        .as_u64()
+        .expect("getSlot should return a number");
     assert!(slot > 400_000_000, "slot should be recent: {slot}");
 }
 
@@ -62,16 +64,26 @@ async fn test_get_slot_with_commitment() {
     let f = finalized["result"].as_u64().unwrap();
 
     // Allow small tolerance for network timing between sequential requests
-    assert!(p + 5 >= c, "processed ({p}) should be >= confirmed ({c}) (with tolerance)");
+    assert!(
+        p + 5 >= c,
+        "processed ({p}) should be >= confirmed ({c}) (with tolerance)"
+    );
     assert!(c >= f, "confirmed ({c}) >= finalized ({f})");
-    assert!(p - f < 100, "processed-finalized gap should be < 100 slots: {}", p - f);
+    assert!(
+        p - f < 100,
+        "processed-finalized gap should be < 100 slots: {}",
+        p - f
+    );
 }
 
 #[tokio::test]
 async fn test_get_block_height() {
     let resp = rpc_call("getBlockHeight", json!([])).await;
     let height = resp["result"].as_u64().expect("should return block height");
-    assert!(height > 380_000_000, "block height should be recent: {height}");
+    assert!(
+        height > 380_000_000,
+        "block height should be recent: {height}"
+    );
 }
 
 #[tokio::test]
@@ -79,11 +91,16 @@ async fn test_get_latest_blockhash() {
     let resp = rpc_call("getLatestBlockhash", json!([])).await;
     let value = &resp["result"]["value"];
     let blockhash = value["blockhash"].as_str().expect("should have blockhash");
-    let last_valid = value["lastValidBlockHeight"].as_u64().expect("should have lastValidBlockHeight");
+    let last_valid = value["lastValidBlockHeight"]
+        .as_u64()
+        .expect("should have lastValidBlockHeight");
 
     assert!(!blockhash.is_empty(), "blockhash should not be empty");
     assert!(blockhash.len() >= 32, "blockhash should be base58 encoded");
-    assert!(last_valid > 380_000_000, "lastValidBlockHeight should be recent: {last_valid}");
+    assert!(
+        last_valid > 380_000_000,
+        "lastValidBlockHeight should be recent: {last_valid}"
+    );
 }
 
 #[tokio::test]
@@ -93,19 +110,29 @@ async fn test_is_blockhash_valid() {
     let blockhash = bh_resp["result"]["value"]["blockhash"].as_str().unwrap();
 
     let resp = rpc_call("isBlockhashValid", json!([blockhash])).await;
-    let valid = resp["result"]["value"].as_bool().expect("should return bool");
+    let valid = resp["result"]["value"]
+        .as_bool()
+        .expect("should return bool");
     assert!(valid, "fresh blockhash should be valid");
 
     // Old/fake blockhash should be invalid
-    let resp2 = rpc_call("isBlockhashValid", json!(["1111111111111111111111111111111111111111111111"])).await;
-    let valid2 = resp2["result"]["value"].as_bool().expect("should return bool");
+    let resp2 = rpc_call(
+        "isBlockhashValid",
+        json!(["1111111111111111111111111111111111111111111111"]),
+    )
+    .await;
+    let valid2 = resp2["result"]["value"]
+        .as_bool()
+        .expect("should return bool");
     assert!(!valid2, "fake blockhash should be invalid");
 }
 
 #[tokio::test]
 async fn test_get_version() {
     let resp = rpc_call("getVersion", json!([])).await;
-    let version = resp["result"]["light-indexer"].as_str().expect("should have version");
+    let version = resp["result"]["light-indexer"]
+        .as_str()
+        .expect("should have version");
     assert_eq!(version, "0.1.0");
 }
 
@@ -120,7 +147,10 @@ async fn test_get_token_supply_usdc() {
 
     assert_eq!(decimals, 6, "USDC has 6 decimals");
     let supply: u64 = amount.parse().expect("amount should be numeric");
-    assert!(supply > 1_000_000_000_000, "USDC supply should be > 1B (raw): {supply}");
+    assert!(
+        supply > 1_000_000_000_000,
+        "USDC supply should be > 1B (raw): {supply}"
+    );
 }
 
 #[tokio::test]
@@ -133,14 +163,23 @@ async fn test_get_token_supply_usdt() {
 
 #[tokio::test]
 async fn test_get_token_supply_invalid_mint() {
-    let resp = rpc_call("getTokenSupply", json!(["1111111111111111111111111111111111111111111"])).await;
-    assert!(resp["error"].is_object(), "should return error for non-existent mint");
+    let resp = rpc_call(
+        "getTokenSupply",
+        json!(["1111111111111111111111111111111111111111111"]),
+    )
+    .await;
+    assert!(
+        resp["error"].is_object(),
+        "should return error for non-existent mint"
+    );
 }
 
 #[tokio::test]
 async fn test_get_token_accounts_by_owner() {
     let resp = rpc_call("getTokenAccountsByOwner", json!([JUPITER_V6])).await;
-    let accounts = resp["result"]["value"].as_array().expect("should return array");
+    let accounts = resp["result"]["value"]
+        .as_array()
+        .expect("should return array");
     assert!(!accounts.is_empty(), "Jupiter should have token accounts");
 
     let first = &accounts[0];
@@ -155,21 +194,40 @@ async fn test_get_token_accounts_by_owner() {
 async fn test_get_account_info_token_program() {
     let resp = rpc_call("getAccountInfo", json!([TOKEN_PROGRAM])).await;
     let value = &resp["result"]["value"];
-    assert!(value["executable"].as_bool().unwrap_or(false), "Token Program should be executable");
-    assert!(value["lamports"].as_u64().unwrap_or(0) > 0, "should have lamports");
+    assert!(
+        value["executable"].as_bool().unwrap_or(false),
+        "Token Program should be executable"
+    );
+    assert!(
+        value["lamports"].as_u64().unwrap_or(0) > 0,
+        "should have lamports"
+    );
 }
 
 #[tokio::test]
 async fn test_get_account_info_not_found() {
-    let resp = rpc_call("getAccountInfo", json!(["1111111111111111111111111111111111111111111"])).await;
+    let resp = rpc_call(
+        "getAccountInfo",
+        json!(["1111111111111111111111111111111111111111111"]),
+    )
+    .await;
     // Should return null value, not error
-    assert!(resp["result"]["value"].is_null(), "non-existent account should return null value");
+    assert!(
+        resp["result"]["value"].is_null(),
+        "non-existent account should return null value"
+    );
 }
 
 #[tokio::test]
 async fn test_get_multiple_accounts() {
-    let resp = rpc_call("getMultipleAccounts", json!([[TOKEN_PROGRAM, SYSTEM_PROGRAM]])).await;
-    let accounts = resp["result"]["value"].as_array().expect("should return array");
+    let resp = rpc_call(
+        "getMultipleAccounts",
+        json!([[TOKEN_PROGRAM, SYSTEM_PROGRAM]]),
+    )
+    .await;
+    let accounts = resp["result"]["value"]
+        .as_array()
+        .expect("should return array");
     assert_eq!(accounts.len(), 2, "should return 2 accounts");
 }
 
@@ -185,13 +243,19 @@ async fn test_get_balance() {
 #[tokio::test]
 async fn test_invalid_method() {
     let resp = rpc_call("nonExistentMethod", json!([])).await;
-    assert!(resp["error"].is_object(), "unknown method should return error");
+    assert!(
+        resp["error"].is_object(),
+        "unknown method should return error"
+    );
 }
 
 #[tokio::test]
 async fn test_invalid_pubkey() {
     let resp = rpc_call("getAccountInfo", json!(["not-a-valid-pubkey"])).await;
-    assert!(resp["error"].is_object(), "invalid pubkey should return error");
+    assert!(
+        resp["error"].is_object(),
+        "invalid pubkey should return error"
+    );
     assert_eq!(resp["error"]["code"].as_i64().unwrap(), -32602);
 }
 
@@ -226,7 +290,10 @@ async fn test_latency_get_slot() {
     let elapsed = start.elapsed();
     let avg_ms = elapsed.as_millis() / 10;
     println!("getSlot avg latency: {avg_ms}ms");
-    assert!(avg_ms < 5000, "getSlot should be < 5s avg over network: {avg_ms}ms");
+    assert!(
+        avg_ms < 5000,
+        "getSlot should be < 5s avg over network: {avg_ms}ms"
+    );
 }
 
 #[tokio::test]
@@ -238,7 +305,10 @@ async fn test_latency_get_token_supply() {
     let elapsed = start.elapsed();
     let avg_ms = elapsed.as_millis() / 5;
     println!("getTokenSupply avg latency: {avg_ms}ms");
-    assert!(avg_ms < 10000, "getTokenSupply should be < 10s avg over network: {avg_ms}ms");
+    assert!(
+        avg_ms < 10000,
+        "getTokenSupply should be < 10s avg over network: {avg_ms}ms"
+    );
 }
 
 #[tokio::test]
@@ -250,7 +320,10 @@ async fn test_latency_get_account_info() {
     let elapsed = start.elapsed();
     let avg_ms = elapsed.as_millis() / 5;
     println!("getAccountInfo avg latency: {avg_ms}ms");
-    assert!(avg_ms < 30000, "getAccountInfo should be < 30s avg over network: {avg_ms}ms");
+    assert!(
+        avg_ms < 30000,
+        "getAccountInfo should be < 30s avg over network: {avg_ms}ms"
+    );
 }
 
 // --- Concurrent load test ---
@@ -287,7 +360,10 @@ async fn test_concurrent_requests() {
     }
 
     let elapsed = start.elapsed();
-    println!("50 concurrent requests: {success} ok, {errors} errors in {}ms", elapsed.as_millis());
+    println!(
+        "50 concurrent requests: {success} ok, {errors} errors in {}ms",
+        elapsed.as_millis()
+    );
     assert!(success >= 45, "at least 90% should succeed: {success}/50");
 }
 
@@ -311,10 +387,17 @@ async fn test_rapid_fire_no_leak() {
             json!([])
         };
         let resp = rpc_call(method, params).await;
-        assert!(!resp["result"].is_null() || !resp["error"].is_null(), "request {i} returned nothing");
+        assert!(
+            !resp["result"].is_null() || !resp["error"].is_null(),
+            "request {i} returned nothing"
+        );
     }
     let elapsed = start.elapsed();
-    println!("200 sequential requests in {}ms ({}ms avg)", elapsed.as_millis(), elapsed.as_millis() / 200);
+    println!(
+        "200 sequential requests in {}ms ({}ms avg)",
+        elapsed.as_millis(),
+        elapsed.as_millis() / 200
+    );
 }
 
 // --- Data consistency: compare with DAS ---
@@ -326,15 +409,30 @@ async fn test_consistency_token_supply_matches_das() {
     let client = reqwest::Client::new();
     let body = json!({"jsonrpc":"2.0","id":1,"method":"getTokenSupply","params":[USDC_MINT]});
 
-    let das_resp: Value = client.post(&das_url).json(&body).send().await.unwrap().json().await.unwrap();
+    let das_resp: Value = client
+        .post(&das_url)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let li_resp = rpc_call("getTokenSupply", json!([USDC_MINT])).await;
 
-    let das_amount = das_resp["result"]["value"]["amount"].as_str().unwrap_or("0");
+    let das_amount = das_resp["result"]["value"]["amount"]
+        .as_str()
+        .unwrap_or("0");
     let li_amount = li_resp["result"]["value"]["amount"].as_str().unwrap_or("0");
 
-    assert_eq!(das_amount, li_amount, "USDC supply should match DAS: DAS={das_amount} LI={li_amount}");
+    assert_eq!(
+        das_amount, li_amount,
+        "USDC supply should match DAS: DAS={das_amount} LI={li_amount}"
+    );
 
-    let das_decimals = das_resp["result"]["value"]["decimals"].as_u64().unwrap_or(0);
+    let das_decimals = das_resp["result"]["value"]["decimals"]
+        .as_u64()
+        .unwrap_or(0);
     let li_decimals = li_resp["result"]["value"]["decimals"].as_u64().unwrap_or(0);
     assert_eq!(das_decimals, li_decimals, "decimals should match");
 }

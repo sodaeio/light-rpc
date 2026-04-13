@@ -1,4 +1,7 @@
-use figment::{providers::{Format, Yaml}, Figment};
+use figment::{
+    providers::{Format, Yaml},
+    Figment,
+};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -168,29 +171,65 @@ impl ThreadConfig {
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let config: Config = Figment::new()
-            .merge(Yaml::file(path))
-            .extract()?;
+        let config: Config = Figment::new().merge(Yaml::file(path)).extract()?;
         Ok(config)
     }
 }
 
-fn default_connect_timeout() -> u64 { 10 }
-fn default_request_timeout() -> u64 { 60 }
-fn default_max_message_size() -> usize { 64 * 1024 * 1024 }
-fn default_write_buffer() -> usize { 256 * 1024 * 1024 }
-fn default_max_open_files() -> i32 { 512 }
-fn default_true() -> bool { true }
-fn default_compression() -> String { "lz4".into() }
-fn default_max_stored_blocks() -> usize { 500_000 }
-fn default_max_pg_connections() -> u32 { 50 }
-fn default_min_pg_connections() -> u32 { 5 }
-fn default_idle_timeout() -> u64 { 300 }
-fn default_source_to_write() -> usize { 2048 }
-fn default_write_to_read() -> usize { 1024 }
-fn default_read_to_rpc() -> usize { 4096 }
-fn default_pg_write_buffer() -> usize { 10_000 }
-fn default_rpc_endpoint() -> String { "0.0.0.0:8876".into() }
-fn default_max_connections() -> usize { 1024 }
-fn default_metrics_endpoint() -> String { "0.0.0.0:9090".into() }
-fn default_one() -> usize { 1 }
+fn default_connect_timeout() -> u64 {
+    10
+}
+fn default_request_timeout() -> u64 {
+    60
+}
+fn default_max_message_size() -> usize {
+    64 * 1024 * 1024
+}
+fn default_write_buffer() -> usize {
+    256 * 1024 * 1024
+}
+fn default_max_open_files() -> i32 {
+    512
+}
+fn default_true() -> bool {
+    true
+}
+fn default_compression() -> String {
+    "lz4".into()
+}
+fn default_max_stored_blocks() -> usize {
+    500_000
+}
+fn default_max_pg_connections() -> u32 {
+    50
+}
+fn default_min_pg_connections() -> u32 {
+    5
+}
+fn default_idle_timeout() -> u64 {
+    300
+}
+fn default_source_to_write() -> usize {
+    2048
+}
+fn default_write_to_read() -> usize {
+    1024
+}
+fn default_read_to_rpc() -> usize {
+    4096
+}
+fn default_pg_write_buffer() -> usize {
+    10_000
+}
+fn default_rpc_endpoint() -> String {
+    "0.0.0.0:8876".into()
+}
+fn default_max_connections() -> usize {
+    1024
+}
+fn default_metrics_endpoint() -> String {
+    "0.0.0.0:9090".into()
+}
+fn default_one() -> usize {
+    1
+}

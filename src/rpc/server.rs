@@ -91,7 +91,7 @@ impl RpcServer {
 async fn handle_jsonrpc(
     State(module): State<RpcState>,
     body: String,
-) -> (StatusCode, [(& 'static str, &'static str); 1], String) {
+) -> (StatusCode, [(&'static str, &'static str); 1], String) {
     let start = Instant::now();
     let method = extract_method(&body).unwrap_or("unknown").to_string();
     metrics::RPC_REQUESTS.with_label_values(&[&method]).inc();
@@ -103,7 +103,11 @@ async fn handle_jsonrpc(
             Ok(v) => v,
             Err(_) => {
                 let err = r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"},"id":null}"#;
-                return (StatusCode::OK, [("content-type", "application/json")], err.to_string());
+                return (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    err.to_string(),
+                );
             }
         };
 
@@ -126,14 +130,26 @@ async fn handle_jsonrpc(
 
         let batch_response = format!("[{}]", responses.join(","));
         let elapsed = start.elapsed();
-        metrics::RPC_LATENCY.with_label_values(&["batch"]).observe(elapsed.as_secs_f64());
-        (StatusCode::OK, [("content-type", "application/json")], batch_response)
+        metrics::RPC_LATENCY
+            .with_label_values(&["batch"])
+            .observe(elapsed.as_secs_f64());
+        (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            batch_response,
+        )
     } else {
         match module.raw_json_request(&body, 1).await {
             Ok((response, _)) => {
                 let elapsed = start.elapsed();
-                metrics::RPC_LATENCY.with_label_values(&[&method]).observe(elapsed.as_secs_f64());
-                (StatusCode::OK, [("content-type", "application/json")], response)
+                metrics::RPC_LATENCY
+                    .with_label_values(&[&method])
+                    .observe(elapsed.as_secs_f64());
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    response,
+                )
             }
             Err(e) => {
                 metrics::RPC_ERRORS.with_label_values(&[&method]).inc();
@@ -143,7 +159,11 @@ async fn handle_jsonrpc(
                     "error": {"code": -32603, "message": e.to_string()},
                     "id": null
                 });
-                (StatusCode::OK, [("content-type", "application/json")], error_response.to_string())
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    error_response.to_string(),
+                )
             }
         }
     }

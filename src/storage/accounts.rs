@@ -1,5 +1,5 @@
-use crate::types::*;
 use super::rocks::{StoredAccountEntry, UnifiedRocksDb};
+use crate::types::*;
 
 /// Serialized account data stored in RocksDB.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -40,7 +40,11 @@ impl AccountProcessor {
     /// Separate a batch of account updates by kind.
     pub fn classify_batch(
         updates: &[AccountUpdate],
-    ) -> (Vec<&AccountUpdate>, Vec<&AccountUpdate>, Vec<&AccountUpdate>) {
+    ) -> (
+        Vec<&AccountUpdate>,
+        Vec<&AccountUpdate>,
+        Vec<&AccountUpdate>,
+    ) {
         let mut mints = Vec::new();
         let mut token_accounts = Vec::new();
         let mut program_accounts = Vec::new();

@@ -55,9 +55,7 @@ impl SlotAccumulator {
             return false;
         }
         match self.expected_tx_count {
-            Some(expected) => {
-                self.transactions.len() >= expected && self.blockhash.is_some()
-            }
+            Some(expected) => self.transactions.len() >= expected && self.blockhash.is_some(),
             None => false,
         }
     }

@@ -10,8 +10,13 @@ fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
 pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("getAsset", |params, ctx, _| async move {
         let p: serde_json::Value = params.parse()?;
-        let id_str = p.get("id").and_then(|v| v.as_str()).ok_or_else(|| err(-32602, "Missing 'id'"))?;
-        let id_bytes = bs58::decode(id_str).into_vec().map_err(|_| err(-32602, "Invalid id encoding"))?;
+        let id_str = p
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| err(-32602, "Missing 'id'"))?;
+        let id_bytes = bs58::decode(id_str)
+            .into_vec()
+            .map_err(|_| err(-32602, "Invalid id encoding"))?;
 
         match ctx.reader.get_asset(&id_bytes).await {
             Ok(Some(asset)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(asset),
@@ -22,13 +27,21 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
     module.register_async_method("getAssetsByOwner", |params, ctx, _| async move {
         let p: serde_json::Value = params.parse()?;
-        let owner_str = p.get("ownerAddress").and_then(|v| v.as_str())
+        let owner_str = p
+            .get("ownerAddress")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| err(-32602, "Missing 'ownerAddress'"))?;
-        let owner_bytes = bs58::decode(owner_str).into_vec().map_err(|_| err(-32602, "Invalid encoding"))?;
+        let owner_bytes = bs58::decode(owner_str)
+            .into_vec()
+            .map_err(|_| err(-32602, "Invalid encoding"))?;
         let page = p.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
         let limit = p.get("limit").and_then(|v| v.as_i64()).unwrap_or(1000);
 
-        match ctx.reader.get_assets_by_owner(&owner_bytes, page, limit).await {
+        match ctx
+            .reader
+            .get_assets_by_owner(&owner_bytes, page, limit)
+            .await
+        {
             Ok(result) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(result),
             Err(e) => Err(err(-32603, &e.to_string())),
         }
@@ -36,13 +49,21 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
     module.register_async_method("getAssetsByCreator", |params, ctx, _| async move {
         let p: serde_json::Value = params.parse()?;
-        let creator_str = p.get("creatorAddress").and_then(|v| v.as_str())
+        let creator_str = p
+            .get("creatorAddress")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| err(-32602, "Missing 'creatorAddress'"))?;
-        let creator_bytes = bs58::decode(creator_str).into_vec().map_err(|_| err(-32602, "Invalid encoding"))?;
+        let creator_bytes = bs58::decode(creator_str)
+            .into_vec()
+            .map_err(|_| err(-32602, "Invalid encoding"))?;
         let page = p.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
         let limit = p.get("limit").and_then(|v| v.as_i64()).unwrap_or(1000);
 
-        match ctx.reader.get_assets_by_creator(&creator_bytes, page, limit).await {
+        match ctx
+            .reader
+            .get_assets_by_creator(&creator_bytes, page, limit)
+            .await
+        {
             Ok(result) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(result),
             Err(e) => Err(err(-32603, &e.to_string())),
         }
@@ -50,13 +71,22 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
     module.register_async_method("getAssetsByGroup", |params, ctx, _| async move {
         let p: serde_json::Value = params.parse()?;
-        let group_key = p.get("groupKey").and_then(|v| v.as_str()).unwrap_or("collection");
-        let group_value = p.get("groupValue").and_then(|v| v.as_str())
+        let group_key = p
+            .get("groupKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("collection");
+        let group_value = p
+            .get("groupValue")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| err(-32602, "Missing 'groupValue'"))?;
         let page = p.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
         let limit = p.get("limit").and_then(|v| v.as_i64()).unwrap_or(1000);
 
-        match ctx.reader.get_assets_by_group(group_key, group_value, page, limit).await {
+        match ctx
+            .reader
+            .get_assets_by_group(group_key, group_value, page, limit)
+            .await
+        {
             Ok(result) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(result),
             Err(e) => Err(err(-32603, &e.to_string())),
         }
@@ -64,13 +94,21 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
     module.register_async_method("getAssetsByAuthority", |params, ctx, _| async move {
         let p: serde_json::Value = params.parse()?;
-        let authority_str = p.get("authorityAddress").and_then(|v| v.as_str())
+        let authority_str = p
+            .get("authorityAddress")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| err(-32602, "Missing 'authorityAddress'"))?;
-        let authority_bytes = bs58::decode(authority_str).into_vec().map_err(|_| err(-32602, "Invalid encoding"))?;
+        let authority_bytes = bs58::decode(authority_str)
+            .into_vec()
+            .map_err(|_| err(-32602, "Invalid encoding"))?;
         let page = p.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
         let limit = p.get("limit").and_then(|v| v.as_i64()).unwrap_or(1000);
 
-        match ctx.reader.get_assets_by_authority(&authority_bytes, page, limit).await {
+        match ctx
+            .reader
+            .get_assets_by_authority(&authority_bytes, page, limit)
+            .await
+        {
             Ok(result) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(result),
             Err(e) => Err(err(-32603, &e.to_string())),
         }
@@ -83,16 +121,28 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let limit = p.get("limit").and_then(|v| v.as_i64()).unwrap_or(1000);
 
         if let Some(owner) = p.get("ownerAddress").and_then(|v| v.as_str()) {
-            let owner_bytes = bs58::decode(owner).into_vec().map_err(|_| err(-32602, "Invalid encoding"))?;
-            match ctx.reader.get_assets_by_owner(&owner_bytes, page, limit).await {
+            let owner_bytes = bs58::decode(owner)
+                .into_vec()
+                .map_err(|_| err(-32602, "Invalid encoding"))?;
+            match ctx
+                .reader
+                .get_assets_by_owner(&owner_bytes, page, limit)
+                .await
+            {
                 Ok(result) => return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(result),
                 Err(e) => return Err(err(-32603, &e.to_string())),
             }
         }
 
         if let Some(creator) = p.get("creatorAddress").and_then(|v| v.as_str()) {
-            let creator_bytes = bs58::decode(creator).into_vec().map_err(|_| err(-32602, "Invalid encoding"))?;
-            match ctx.reader.get_assets_by_creator(&creator_bytes, page, limit).await {
+            let creator_bytes = bs58::decode(creator)
+                .into_vec()
+                .map_err(|_| err(-32602, "Invalid encoding"))?;
+            match ctx
+                .reader
+                .get_assets_by_creator(&creator_bytes, page, limit)
+                .await
+            {
                 Ok(result) => return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(result),
                 Err(e) => return Err(err(-32603, &e.to_string())),
             }

@@ -113,8 +113,8 @@ pub enum AccountKind {
 
 impl AccountUpdate {
     pub fn classify(&self) -> AccountKind {
-        let is_token_program = self.owner == programs::token_program()
-            || self.owner == programs::token_2022_program();
+        let is_token_program =
+            self.owner == programs::token_program() || self.owner == programs::token_2022_program();
 
         if is_token_program && self.data.len() == 82 {
             AccountKind::TokenMint

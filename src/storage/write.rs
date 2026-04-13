@@ -176,7 +176,9 @@ impl StorageWriter {
             }
         }
         if !addr_tx_entries.is_empty() {
-            let _ = self.pg_tx.try_send(PgWriteJob::AddressTransactions(addr_tx_entries));
+            let _ = self
+                .pg_tx
+                .try_send(PgWriteJob::AddressTransactions(addr_tx_entries));
         }
 
         // 6. Broadcast to read workers
@@ -190,23 +192,14 @@ impl StorageWriter {
         debug!(slot, elapsed_ms = elapsed.as_millis(), "block persisted");
     }
 
-    async fn handle_slot_status(
-        &self,
-        slot: Slot,
-        _parent_slot: Option<Slot>,
-        status: SlotStatus,
-    ) {
+    async fn handle_slot_status(&self, slot: Slot, _parent_slot: Option<Slot>, status: SlotStatus) {
         let msg = match status {
             SlotStatus::Confirmed => {
                 let _ = self.pg_tx.try_send(PgWriteJob::SlotUpdate(slot));
                 WriteToReadMessage::BlockConfirmed { slot }
             }
-            SlotStatus::Finalized => {
-                WriteToReadMessage::SlotFinalized { slot }
-            }
-            SlotStatus::Dead => {
-                WriteToReadMessage::BlockDead { slot }
-            }
+            SlotStatus::Finalized => WriteToReadMessage::SlotFinalized { slot },
+            SlotStatus::Dead => WriteToReadMessage::BlockDead { slot },
             SlotStatus::ProcessedOrSkipped => return,
         };
 
@@ -222,8 +215,7 @@ impl StorageWriter {
         buffer.sort_by(|a, b| a.pubkey.cmp(&b.pubkey).then(b.slot.cmp(&a.slot)));
         buffer.dedup_by_key(|u| u.pubkey);
 
-        let (mints, token_accounts, program_accounts) =
-            AccountProcessor::classify_batch(buffer);
+        let (mints, token_accounts, program_accounts) = AccountProcessor::classify_batch(buffer);
 
         // Token mints → PG (async, non-blocking)
         if !mints.is_empty() {

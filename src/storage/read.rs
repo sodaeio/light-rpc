@@ -66,7 +66,10 @@ impl MemoryCache {
     }
 
     pub fn is_blockhash_valid(&self, blockhash: &str) -> bool {
-        self.recent_blockhashes.read().values().any(|h| h == blockhash)
+        self.recent_blockhashes
+            .read()
+            .values()
+            .any(|h| h == blockhash)
     }
 
     pub fn set_confirmed(&self, slot: Slot) {
@@ -122,7 +125,12 @@ impl StorageReader {
         files: Arc<BlockFileStorage>,
         pg: PgStorage,
     ) -> Self {
-        Self { cache, rocks, files, pg }
+        Self {
+            cache,
+            rocks,
+            files,
+            pg,
+        }
     }
 
     pub fn cache(&self) -> &Arc<MemoryCache> {
@@ -144,7 +152,9 @@ impl StorageReader {
                 Ok(WriteToReadMessage::BlockConfirmed { slot }) => cache.set_confirmed(slot),
                 Ok(WriteToReadMessage::SlotFinalized { slot }) => cache.set_finalized(slot),
                 Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(n)) => warn!(skipped = n, "cache updater lagged"),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "cache updater lagged")
+                }
                 Err(broadcast::error::RecvError::Closed) => {
                     info!("broadcast closed, cache updater exiting");
                     return;
@@ -156,59 +166,218 @@ impl StorageReader {
     // -- Private helpers (RocksDB point lookups) --
 
     fn rocks_get_account(&self, pubkey: &[u8; 32]) -> Option<StoredAccount> {
-        self.rocks.get_account(pubkey).ok().flatten()
+        self.rocks
+            .get_account(pubkey)
+            .ok()
+            .flatten()
             .and_then(|data| StoredAccount::deserialize(&data))
     }
 
-    fn account_to_json(account: &StoredAccount, encoding: &str) -> serde_json::Value {
-        let data_field = match encoding {
-            "base58" => serde_json::json!([bs58::encode(&account.data).into_string(), "base58"]),
-            _ => {
-                use base64::Engine;
+    fn encode_account_data(data: &[u8], encoding: &str) -> serde_json::Value {
+        use base64::Engine;
+        match encoding {
+            "base58" => serde_json::json!([bs58::encode(data).into_string(), "base58"]),
+            "base64+zstd" => {
+                let compressed = zstd::encode_all(data, 0).unwrap_or_default();
                 serde_json::json!([
-                    base64::engine::general_purpose::STANDARD.encode(&account.data),
-                    "base64"
+                    base64::engine::general_purpose::STANDARD.encode(&compressed),
+                    "base64+zstd"
                 ])
             }
-        };
+            _ => serde_json::json!([
+                base64::engine::general_purpose::STANDARD.encode(data),
+                "base64"
+            ]),
+        }
+    }
+
+    fn account_to_json(account: &StoredAccount, encoding: &str) -> serde_json::Value {
+        let owner_str = bs58::encode(&account.owner).into_string();
+
+        // jsonParsed: attempt to parse known program data
+        if encoding == "jsonParsed" {
+            if let Some(parsed) = Self::try_parse_account(account, &owner_str) {
+                return serde_json::json!({
+                    "lamports": account.lamports,
+                    "owner": owner_str,
+                    "data": parsed,
+                    "executable": account.executable,
+                    "rentEpoch": account.rent_epoch,
+                    "space": account.data.len(),
+                });
+            }
+            // Fall through to base64 if parsing fails
+        }
+
         serde_json::json!({
             "lamports": account.lamports,
-            "owner": bs58::encode(&account.owner).into_string(),
-            "data": data_field,
+            "owner": owner_str,
+            "data": Self::encode_account_data(&account.data, encoding),
             "executable": account.executable,
             "rentEpoch": account.rent_epoch,
             "space": account.data.len(),
         })
     }
 
-    /// Format token account as Solana-compatible jsonParsed RpcKeyedAccount
-    fn token_account_to_json(row: &super::postgres::TokenAccountRow) -> serde_json::Value {
-        let state = if row.frozen { "frozen" } else { "initialized" };
+    /// Try to parse known account types (SPL Token mint/account) into jsonParsed format.
+    fn try_parse_account(account: &StoredAccount, owner: &str) -> Option<serde_json::Value> {
+        let is_token_program = owner == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            || owner == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+
+        if !is_token_program {
+            return None;
+        }
+
+        let data = &account.data;
+        let program = if owner == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" {
+            "spl-token"
+        } else {
+            "spl-token-2022"
+        };
+
+        // SPL Token Account (165 bytes)
+        if data.len() == 165 {
+            let mint = bs58::encode(&data[0..32]).into_string();
+            let acct_owner = bs58::encode(&data[32..64]).into_string();
+            let amount = u64::from_le_bytes(data[64..72].try_into().ok()?);
+            let has_delegate = u32::from_le_bytes(data[72..76].try_into().ok()?) == 1;
+            let delegate = if has_delegate {
+                Some(bs58::encode(&data[76..108]).into_string())
+            } else {
+                None
+            };
+            let state = match data[108] {
+                0 => "uninitialized",
+                1 => "initialized",
+                2 => "frozen",
+                _ => "initialized",
+            };
+
+            return Some(serde_json::json!({
+                "program": program,
+                "parsed": {
+                    "type": "account",
+                    "info": {
+                        "mint": mint,
+                        "owner": acct_owner,
+                        "tokenAmount": {
+                            "amount": amount.to_string(),
+                            "decimals": 0,
+                            "uiAmount": null,
+                            "uiAmountString": amount.to_string(),
+                        },
+                        "delegate": delegate,
+                        "state": state,
+                        "isNative": false,
+                    }
+                },
+                "space": 165
+            }));
+        }
+
+        // SPL Token Mint (82 bytes)
+        if data.len() == 82 {
+            let has_mint_authority = data[0] == 1;
+            let mint_authority = if has_mint_authority {
+                Some(bs58::encode(&data[4..36]).into_string())
+            } else {
+                None
+            };
+            let supply = u64::from_le_bytes(data[36..44].try_into().ok()?);
+            let decimals = data[44];
+            let is_initialized = data[45] == 1;
+            let has_freeze = data[46] == 1;
+            let freeze_authority = if has_freeze {
+                Some(bs58::encode(&data[50..82]).into_string())
+            } else {
+                None
+            };
+
+            return Some(serde_json::json!({
+                "program": program,
+                "parsed": {
+                    "type": "mint",
+                    "info": {
+                        "mintAuthority": mint_authority,
+                        "supply": supply.to_string(),
+                        "decimals": decimals,
+                        "isInitialized": is_initialized,
+                        "freezeAuthority": freeze_authority,
+                    }
+                },
+                "space": 82
+            }));
+        }
+
+        None
+    }
+
+    /// Reconstruct 165-byte SPL token account binary from parsed PG fields.
+    fn reconstruct_token_account_data(row: &super::postgres::TokenAccountRow) -> Vec<u8> {
+        let mut data = vec![0u8; 165];
+        // mint (0..32)
+        let mint_len = row.mint.len().min(32);
+        data[..mint_len].copy_from_slice(&row.mint[..mint_len]);
+        // owner (32..64)
+        let owner_len = row.owner.len().min(32);
+        data[32..32 + owner_len].copy_from_slice(&row.owner[..owner_len]);
+        // amount (64..72)
+        data[64..72].copy_from_slice(&(row.amount as u64).to_le_bytes());
+        // delegate COption (72..108)
+        if let Some(ref delegate) = row.delegate {
+            data[72..76].copy_from_slice(&1u32.to_le_bytes());
+            let d_len = delegate.len().min(32);
+            data[76..76 + d_len].copy_from_slice(&delegate[..d_len]);
+        }
+        // state (108)
+        data[108] = if row.frozen { 2 } else { 1 };
+        // is_native COption (109..121) — 0 = not native
+        // delegated_amount (121..129) — only if delegate present
+        // close_authority COption (129..165) — skip
+        data
+    }
+
+    /// Format token account as Solana-compatible RpcKeyedAccount.
+    /// Supports all encoding formats just like agave.
+    fn token_account_to_json(
+        row: &super::postgres::TokenAccountRow,
+        encoding: &str,
+    ) -> serde_json::Value {
+        let owner_str = bs58::encode(&row.token_program).into_string();
+
+        let data_field = if encoding == "jsonParsed" {
+            let state = if row.frozen { "frozen" } else { "initialized" };
+            serde_json::json!({
+                "program": if owner_str.starts_with("Token") { "spl-token" } else { "spl-token-2022" },
+                "parsed": {
+                    "type": "account",
+                    "info": {
+                        "mint": bs58::encode(&row.mint).into_string(),
+                        "owner": bs58::encode(&row.owner).into_string(),
+                        "tokenAmount": {
+                            "amount": row.amount.to_string(),
+                            "decimals": 0,
+                            "uiAmount": null,
+                            "uiAmountString": row.amount.to_string(),
+                        },
+                        "delegate": row.delegate.as_ref().map(|d| bs58::encode(d).into_string()),
+                        "state": state,
+                        "isNative": false,
+                    }
+                },
+                "space": 165
+            })
+        } else {
+            let raw = Self::reconstruct_token_account_data(row);
+            Self::encode_account_data(&raw, encoding)
+        };
+
         serde_json::json!({
             "pubkey": bs58::encode(&row.pubkey).into_string(),
             "account": {
-                "lamports": 2039280_u64, // rent-exempt minimum for token accounts
-                "data": {
-                    "program": "spl-token",
-                    "parsed": {
-                        "type": "account",
-                        "info": {
-                            "mint": bs58::encode(&row.mint).into_string(),
-                            "owner": bs58::encode(&row.owner).into_string(),
-                            "tokenAmount": {
-                                "amount": row.amount.to_string(),
-                                "decimals": 0,
-                                "uiAmount": null,
-                                "uiAmountString": row.amount.to_string(),
-                            },
-                            "delegate": row.delegate.as_ref().map(|d| bs58::encode(d).into_string()),
-                            "state": state,
-                            "isNative": false,
-                        }
-                    },
-                    "space": 165
-                },
-                "owner": bs58::encode(&row.token_program).into_string(),
+                "lamports": 2039280_u64,
+                "data": data_field,
+                "owner": owner_str,
                 "executable": false,
                 "rentEpoch": 18446744073709551615_u64,
                 "space": 165
@@ -217,10 +386,16 @@ impl StorageReader {
     }
 
     fn asset_to_json(a: &super::postgres::AssetRow) -> serde_json::Value {
-        let name = a.raw_name.as_ref()
-            .map(|n| String::from_utf8_lossy(n).trim_end_matches('\0').to_string());
-        let symbol = a.raw_symbol.as_ref()
-            .map(|s| String::from_utf8_lossy(s).trim_end_matches('\0').to_string());
+        let name = a.raw_name.as_ref().map(|n| {
+            String::from_utf8_lossy(n)
+                .trim_end_matches('\0')
+                .to_string()
+        });
+        let symbol = a.raw_symbol.as_ref().map(|s| {
+            String::from_utf8_lossy(s)
+                .trim_end_matches('\0')
+                .to_string()
+        });
         serde_json::json!({
             "id": bs58::encode(&a.id).into_string(),
             "interface": a.specification_asset_class.as_deref().unwrap_or("V1_NFT"),
@@ -248,7 +423,12 @@ impl StorageReader {
         })
     }
 
-    fn asset_list_response(total: i64, page: i64, limit: i64, assets: &[super::postgres::AssetRow]) -> serde_json::Value {
+    fn asset_list_response(
+        total: i64,
+        page: i64,
+        limit: i64,
+        assets: &[super::postgres::AssetRow],
+    ) -> serde_json::Value {
         serde_json::json!({
             "total": total,
             "limit": limit,
@@ -348,62 +528,145 @@ impl StorageReader {
     // -- Public API: Account State --
     // RocksDB first for point lookups, PG fallback for program scans
 
-    pub fn get_account_info(&self, pubkey: &[u8; 32], encoding: &str) -> Result<Option<serde_json::Value>> {
+    pub async fn get_account_info(
+        &self,
+        pubkey: &[u8; 32],
+        encoding: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        // RocksDB first (fast point lookup)
         if let Some(stored) = self.rocks_get_account(pubkey) {
             return Ok(Some(Self::account_to_json(&stored, encoding)));
         }
-        // PG program_accounts fallback
-        // (sync context — use block_on or accept no PG fallback for point lookups)
+
+        // PG program_accounts table
+        if let Some(row) = self.pg.get_program_account_by_pubkey(pubkey).await? {
+            let stored = StoredAccount {
+                owner: row.owner.try_into().unwrap_or([0u8; 32]),
+                lamports: row.lamports as u64,
+                data: row.data,
+                executable: row.executable,
+                rent_epoch: row.rent_epoch as u64,
+                slot: row.slot_updated as u64,
+            };
+            return Ok(Some(Self::account_to_json(&stored, encoding)));
+        }
+
+        // PG tokens table (SPL token mints are stored here, not in program_accounts)
+        if let Some(mint_row) = self.pg.get_token_mint(pubkey).await? {
+            let supply = mint_row.supply.to_string().parse::<u64>().unwrap_or(0);
+            let mut data = vec![0u8; 82];
+            // Reconstruct SPL mint binary layout from parsed fields
+            if let Some(ref auth) = mint_row.mint_authority {
+                data[0] = 1; // COption::Some
+                if auth.len() == 32 {
+                    data[4..36].copy_from_slice(auth);
+                }
+            }
+            data[36..44].copy_from_slice(&supply.to_le_bytes());
+            data[44] = mint_row.decimals as u8;
+            data[45] = 1; // is_initialized
+            if let Some(ref freeze) = mint_row.freeze_authority {
+                data[46] = 1; // COption::Some
+                if freeze.len() == 32 {
+                    data[50..82].copy_from_slice(freeze);
+                }
+            }
+
+            let stored = StoredAccount {
+                owner: mint_row.token_program.try_into().unwrap_or([0u8; 32]),
+                lamports: 496630637030, // typical rent-exempt for mint
+                data,
+                executable: false,
+                rent_epoch: u64::MAX,
+                slot: mint_row.slot_updated as u64,
+            };
+            return Ok(Some(Self::account_to_json(&stored, encoding)));
+        }
+
         Ok(None)
     }
 
-    pub async fn get_multiple_accounts(&self, pubkeys: &[[u8; 32]], encoding: &str) -> Vec<Option<serde_json::Value>> {
-        pubkeys.iter().map(|pk| {
-            self.rocks_get_account(pk).map(|stored| Self::account_to_json(&stored, encoding))
-        }).collect()
+    pub async fn get_multiple_accounts(
+        &self,
+        pubkeys: &[[u8; 32]],
+        encoding: &str,
+    ) -> Vec<Option<serde_json::Value>> {
+        let mut results = Vec::with_capacity(pubkeys.len());
+        for pk in pubkeys {
+            let val = match self.get_account_info(pk, encoding).await {
+                Ok(v) => v,
+                Err(_) => None,
+            };
+            results.push(val);
+        }
+        results
     }
 
-    pub async fn get_program_accounts(&self, program_id: &[u8; 32], encoding: &str) -> Result<Vec<serde_json::Value>> {
+    pub async fn get_program_accounts(
+        &self,
+        program_id: &[u8; 32],
+        encoding: &str,
+    ) -> Result<Vec<serde_json::Value>> {
         // RocksDB prefix scan
         let rocks_result = self.rocks.get_program_accounts(program_id)?;
         if !rocks_result.is_empty() {
-            return Ok(rocks_result.iter().filter_map(|(pubkey, data)| {
-                StoredAccount::deserialize(data).map(|account| {
-                    serde_json::json!({
-                        "pubkey": bs58::encode(pubkey).into_string(),
-                        "account": Self::account_to_json(&account, encoding)
+            return Ok(rocks_result
+                .iter()
+                .filter_map(|(pubkey, data)| {
+                    StoredAccount::deserialize(data).map(|account| {
+                        serde_json::json!({
+                            "pubkey": bs58::encode(pubkey).into_string(),
+                            "account": Self::account_to_json(&account, encoding)
+                        })
                     })
                 })
-            }).collect());
+                .collect());
         }
 
         // PostgreSQL program_accounts table
         let rows = self.pg.get_program_accounts_pg(program_id).await?;
-        Ok(rows.iter().map(|row| {
-            serde_json::json!({
-                "pubkey": bs58::encode(&row.pubkey).into_string(),
-                "account": {
-                    "lamports": row.lamports,
-                    "owner": bs58::encode(&row.owner).into_string(),
-                    "data": [bs58::encode(&row.data).into_string(), "base58"],
-                    "executable": row.executable,
-                    "rentEpoch": row.rent_epoch,
-                    "space": row.data.len(),
-                }
+        Ok(rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "pubkey": bs58::encode(&row.pubkey).into_string(),
+                    "account": {
+                        "lamports": row.lamports,
+                        "owner": bs58::encode(&row.owner).into_string(),
+                        "data": [bs58::encode(&row.data).into_string(), "base58"],
+                        "executable": row.executable,
+                        "rentEpoch": row.rent_epoch,
+                        "space": row.data.len(),
+                    }
+                })
             })
-        }).collect())
+            .collect())
     }
 
     // -- Public API: Tokens (PostgreSQL) --
 
-    pub async fn get_token_accounts_by_owner(&self, owner: &[u8]) -> Result<Vec<serde_json::Value>> {
+    pub async fn get_token_accounts_by_owner(
+        &self,
+        owner: &[u8],
+        encoding: &str,
+    ) -> Result<Vec<serde_json::Value>> {
         let rows = self.pg.get_token_accounts_by_owner(owner).await?;
-        Ok(rows.iter().map(Self::token_account_to_json).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::token_account_to_json(r, encoding))
+            .collect())
     }
 
-    pub async fn get_token_accounts_by_delegate(&self, delegate: &[u8]) -> Result<Vec<serde_json::Value>> {
+    pub async fn get_token_accounts_by_delegate(
+        &self,
+        delegate: &[u8],
+        encoding: &str,
+    ) -> Result<Vec<serde_json::Value>> {
         let rows = self.pg.get_token_accounts_by_delegate(delegate).await?;
-        Ok(rows.iter().map(Self::token_account_to_json).collect())
+        Ok(rows
+            .iter()
+            .map(|r| Self::token_account_to_json(r, encoding))
+            .collect())
     }
 
     pub async fn get_token_supply(&self, mint_pubkey: &[u8]) -> Result<Option<serde_json::Value>> {
@@ -425,7 +688,11 @@ impl StorageReader {
         Ok(None)
     }
 
-    pub async fn get_token_largest_accounts(&self, mint: &[u8], limit: i64) -> Result<Vec<serde_json::Value>> {
+    pub async fn get_token_largest_accounts(
+        &self,
+        mint: &[u8],
+        limit: i64,
+    ) -> Result<Vec<serde_json::Value>> {
         // Get decimals from mint for proper UI formatting
         let decimals = if let Some(mint_row) = self.pg.get_token_mint(mint).await? {
             mint_row.decimals
@@ -433,20 +700,23 @@ impl StorageReader {
             0
         };
         let rows = self.pg.get_token_largest_accounts(mint, limit).await?;
-        Ok(rows.iter().map(|row| {
-            let ui_amount = if decimals > 0 {
-                row.amount as f64 / 10f64.powi(decimals)
-            } else {
-                row.amount as f64
-            };
-            serde_json::json!({
-                "address": bs58::encode(&row.pubkey).into_string(),
-                "amount": row.amount.to_string(),
-                "decimals": decimals,
-                "uiAmount": ui_amount,
-                "uiAmountString": format!("{ui_amount}"),
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let ui_amount = if decimals > 0 {
+                    row.amount as f64 / 10f64.powi(decimals)
+                } else {
+                    row.amount as f64
+                };
+                serde_json::json!({
+                    "address": bs58::encode(&row.pubkey).into_string(),
+                    "amount": row.amount.to_string(),
+                    "decimals": decimals,
+                    "uiAmount": ui_amount,
+                    "uiAmountString": format!("{ui_amount}"),
+                })
             })
-        }).collect())
+            .collect())
     }
 
     // -- Public API: DAS Assets (PostgreSQL) --
@@ -463,47 +733,85 @@ impl StorageReader {
         let mut json = Self::asset_to_json(&asset);
         let obj = json.as_object_mut().unwrap();
 
-        obj.insert("authorities".to_string(), serde_json::json!(
-            authority.map(|a| vec![serde_json::json!({
-                "address": bs58::encode(&a.authority).into_string(),
-                "scopes": a.scopes,
-            })]).unwrap_or_default()
-        ));
-        obj.insert("creators".to_string(), serde_json::json!(
-            creators.iter().map(|c| serde_json::json!({
-                "address": bs58::encode(&c.creator).into_string(),
-                "share": c.share,
-                "verified": c.verified,
-            })).collect::<Vec<_>>()
-        ));
-        obj.insert("grouping".to_string(), serde_json::json!(
-            grouping.iter().map(|g| serde_json::json!({
-                "group_key": g.group_key,
-                "group_value": g.group_value,
-                "verified": g.verified,
-            })).collect::<Vec<_>>()
-        ));
+        obj.insert(
+            "authorities".to_string(),
+            serde_json::json!(authority
+                .map(|a| vec![serde_json::json!({
+                    "address": bs58::encode(&a.authority).into_string(),
+                    "scopes": a.scopes,
+                })])
+                .unwrap_or_default()),
+        );
+        obj.insert(
+            "creators".to_string(),
+            serde_json::json!(creators
+                .iter()
+                .map(|c| serde_json::json!({
+                    "address": bs58::encode(&c.creator).into_string(),
+                    "share": c.share,
+                    "verified": c.verified,
+                }))
+                .collect::<Vec<_>>()),
+        );
+        obj.insert(
+            "grouping".to_string(),
+            serde_json::json!(grouping
+                .iter()
+                .map(|g| serde_json::json!({
+                    "group_key": g.group_key,
+                    "group_value": g.group_value,
+                    "verified": g.verified,
+                }))
+                .collect::<Vec<_>>()),
+        );
 
         Ok(Some(json))
     }
 
-    pub async fn get_assets_by_owner(&self, owner: &[u8], page: i64, limit: i64) -> Result<serde_json::Value> {
+    pub async fn get_assets_by_owner(
+        &self,
+        owner: &[u8],
+        page: i64,
+        limit: i64,
+    ) -> Result<serde_json::Value> {
         let (total, rows) = self.pg.get_assets_by_owner(owner, page, limit).await?;
         Ok(Self::asset_list_response(total, page, limit, &rows))
     }
 
-    pub async fn get_assets_by_creator(&self, creator: &[u8], page: i64, limit: i64) -> Result<serde_json::Value> {
+    pub async fn get_assets_by_creator(
+        &self,
+        creator: &[u8],
+        page: i64,
+        limit: i64,
+    ) -> Result<serde_json::Value> {
         let (total, rows) = self.pg.get_assets_by_creator(creator, page, limit).await?;
         Ok(Self::asset_list_response(total, page, limit, &rows))
     }
 
-    pub async fn get_assets_by_group(&self, group_key: &str, group_value: &str, page: i64, limit: i64) -> Result<serde_json::Value> {
-        let (total, rows) = self.pg.get_assets_by_group(group_key, group_value, page, limit).await?;
+    pub async fn get_assets_by_group(
+        &self,
+        group_key: &str,
+        group_value: &str,
+        page: i64,
+        limit: i64,
+    ) -> Result<serde_json::Value> {
+        let (total, rows) = self
+            .pg
+            .get_assets_by_group(group_key, group_value, page, limit)
+            .await?;
         Ok(Self::asset_list_response(total, page, limit, &rows))
     }
 
-    pub async fn get_assets_by_authority(&self, authority: &[u8], page: i64, limit: i64) -> Result<serde_json::Value> {
-        let (total, rows) = self.pg.get_assets_by_authority(authority, page, limit).await?;
+    pub async fn get_assets_by_authority(
+        &self,
+        authority: &[u8],
+        page: i64,
+        limit: i64,
+    ) -> Result<serde_json::Value> {
+        let (total, rows) = self
+            .pg
+            .get_assets_by_authority(authority, page, limit)
+            .await?;
         Ok(Self::asset_list_response(total, page, limit, &rows))
     }
 

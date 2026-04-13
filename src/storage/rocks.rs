@@ -126,7 +126,9 @@ impl UnifiedRocksDb {
     }
 
     pub fn get_slot_index(&self, slot: Slot) -> Result<Option<Vec<u8>>> {
-        Ok(self.db.get_cf(&self.cf(CF_SLOT_INDEX), slot.to_be_bytes())?)
+        Ok(self
+            .db
+            .get_cf(&self.cf(CF_SLOT_INDEX), slot.to_be_bytes())?)
     }
 
     pub fn put_tx_index(&self, signature: &[u8; 64], data: &[u8]) -> Result<()> {
@@ -140,10 +142,7 @@ impl UnifiedRocksDb {
 
     /// Write address → signature entries for a slot.
     /// Key format: [address(32) | slot(8 BE)]
-    pub fn put_sfa_batch(
-        &self,
-        entries: &[(solana_pubkey::Pubkey, Slot, Vec<u8>)],
-    ) -> Result<()> {
+    pub fn put_sfa_batch(&self, entries: &[(solana_pubkey::Pubkey, Slot, Vec<u8>)]) -> Result<()> {
         let cf = self.cf(CF_SFA_INDEX);
         let mut batch = WriteBatch::default();
         for (address, slot, data) in entries {
@@ -200,11 +199,7 @@ impl UnifiedRocksDb {
     }
 
     /// Store program index entry. Key: [program_id(32) | pubkey(32)] → empty
-    pub fn put_program_index(
-        &self,
-        program_id: &[u8; 32],
-        pubkey: &[u8; 32],
-    ) -> Result<()> {
+    pub fn put_program_index(&self, program_id: &[u8; 32], pubkey: &[u8; 32]) -> Result<()> {
         let mut key = Vec::with_capacity(64);
         key.extend_from_slice(program_id);
         key.extend_from_slice(pubkey);
@@ -213,10 +208,7 @@ impl UnifiedRocksDb {
     }
 
     /// Get all accounts owned by a program via prefix scan.
-    pub fn get_program_accounts(
-        &self,
-        program_id: &[u8; 32],
-    ) -> Result<Vec<([u8; 32], Vec<u8>)>> {
+    pub fn get_program_accounts(&self, program_id: &[u8; 32]) -> Result<Vec<([u8; 32], Vec<u8>)>> {
         let cf_prog = self.cf(CF_PROGRAM_INDEX);
         let cf_acct = self.cf(CF_ACCOUNTS);
 

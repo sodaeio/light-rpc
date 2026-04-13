@@ -163,22 +163,35 @@ impl PgStorage {
 
         for account in accounts {
             // SPL token account layout: [mint(32) | owner(32) | amount(8) | delegate_option(4) | delegate(32) | state(1) | ...]
-            let acct_mint = if account.data.len() >= 32 { &account.data[..32] } else { &[0u8; 32][..] };
-            let acct_owner = if account.data.len() >= 64 { &account.data[32..64] } else { &[0u8; 32][..] };
+            let acct_mint = if account.data.len() >= 32 {
+                &account.data[..32]
+            } else {
+                &[0u8; 32][..]
+            };
+            let acct_owner = if account.data.len() >= 64 {
+                &account.data[32..64]
+            } else {
+                &[0u8; 32][..]
+            };
             let amount = if account.data.len() >= 72 {
                 u64::from_le_bytes(account.data[64..72].try_into().unwrap_or([0; 8]))
             } else {
                 0
             };
 
-            let has_delegate = account.data.len() >= 76 && u32::from_le_bytes(account.data[72..76].try_into().unwrap_or([0; 4])) == 1;
+            let has_delegate = account.data.len() >= 76
+                && u32::from_le_bytes(account.data[72..76].try_into().unwrap_or([0; 4])) == 1;
             let delegate = if has_delegate && account.data.len() >= 108 {
                 Some(&account.data[76..108])
             } else {
                 None
             };
 
-            let state = if account.data.len() >= 109 { account.data[108] } else { 0 };
+            let state = if account.data.len() >= 109 {
+                account.data[108]
+            } else {
+                0
+            };
             let frozen = state == 2;
 
             let delegated_amount = if account.data.len() >= 121 && has_delegate {
@@ -219,7 +232,13 @@ impl PgStorage {
 
     pub async fn insert_address_transactions(
         &self,
-        entries: &[(solana_pubkey::Pubkey, Slot, solana_signature::Signature, Option<UnixTimestamp>, Option<String>)],
+        entries: &[(
+            solana_pubkey::Pubkey,
+            Slot,
+            solana_signature::Signature,
+            Option<UnixTimestamp>,
+            Option<String>,
+        )],
     ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -255,10 +274,9 @@ impl PgStorage {
     // --- Read operations ---
 
     pub async fn get_latest_slot(&self) -> Result<Option<Slot>> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT MAX(slot) FROM slot_metas")
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(i64,)> = sqlx::query_as("SELECT MAX(slot) FROM slot_metas")
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.and_then(|(s,)| if s > 0 { Some(s as Slot) } else { None }))
     }
 
@@ -330,7 +348,11 @@ impl PgStorage {
         Ok(rows)
     }
 
-    pub async fn get_token_largest_accounts(&self, mint: &[u8], limit: i64) -> Result<Vec<TokenAccountRow>> {
+    pub async fn get_token_largest_accounts(
+        &self,
+        mint: &[u8],
+        limit: i64,
+    ) -> Result<Vec<TokenAccountRow>> {
         let rows: Vec<TokenAccountRow> = sqlx::query_as(
             "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program
              FROM token_accounts WHERE mint = $1 ORDER BY amount DESC LIMIT $2",
@@ -342,7 +364,10 @@ impl PgStorage {
         Ok(rows)
     }
 
-    pub async fn get_token_accounts_by_delegate(&self, delegate: &[u8]) -> Result<Vec<TokenAccountRow>> {
+    pub async fn get_token_accounts_by_delegate(
+        &self,
+        delegate: &[u8],
+    ) -> Result<Vec<TokenAccountRow>> {
         let rows: Vec<TokenAccountRow> = sqlx::query_as(
             "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program
              FROM token_accounts WHERE delegate = $1",
@@ -353,7 +378,24 @@ impl PgStorage {
         Ok(rows)
     }
 
-    pub async fn get_program_accounts_pg(&self, program_id: &[u8]) -> Result<Vec<ProgramAccountRow>> {
+    pub async fn get_program_account_by_pubkey(
+        &self,
+        pubkey: &[u8],
+    ) -> Result<Option<ProgramAccountRow>> {
+        let row: Option<ProgramAccountRow> = sqlx::query_as(
+            "SELECT pubkey, program_id, lamports, data, owner, executable, rent_epoch, slot_updated
+             FROM program_accounts WHERE pubkey = $1",
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    pub async fn get_program_accounts_pg(
+        &self,
+        program_id: &[u8],
+    ) -> Result<Vec<ProgramAccountRow>> {
         let rows: Vec<ProgramAccountRow> = sqlx::query_as(
             "SELECT pubkey, program_id, lamports, data, owner, executable, rent_epoch, slot_updated
              FROM program_accounts WHERE program_id = $1 LIMIT 1000",
@@ -413,11 +455,17 @@ impl PgStorage {
         Ok(rows)
     }
 
-    pub async fn get_assets_by_owner(&self, owner: &[u8], page: i64, limit: i64) -> Result<(i64, Vec<AssetRow>)> {
-        let count: (i64,) = sqlx::query_as("SELECT count(*) FROM asset WHERE owner = $1 AND burnt = false")
-            .bind(owner)
-            .fetch_one(&self.pool)
-            .await?;
+    pub async fn get_assets_by_owner(
+        &self,
+        owner: &[u8],
+        page: i64,
+        limit: i64,
+    ) -> Result<(i64, Vec<AssetRow>)> {
+        let count: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM asset WHERE owner = $1 AND burnt = false")
+                .bind(owner)
+                .fetch_one(&self.pool)
+                .await?;
         let offset = (page - 1) * limit;
         let rows: Vec<AssetRow> = sqlx::query_as(
             "SELECT a.id, a.specification_asset_class::text, a.owner, a.delegate, a.frozen, a.supply,
@@ -438,7 +486,12 @@ impl PgStorage {
         Ok((count.0, rows))
     }
 
-    pub async fn get_assets_by_creator(&self, creator: &[u8], page: i64, limit: i64) -> Result<(i64, Vec<AssetRow>)> {
+    pub async fn get_assets_by_creator(
+        &self,
+        creator: &[u8],
+        page: i64,
+        limit: i64,
+    ) -> Result<(i64, Vec<AssetRow>)> {
         let count: (i64,) = sqlx::query_as(
             "SELECT count(*) FROM asset_creators ac JOIN asset a ON a.id = ac.asset_id WHERE ac.creator = $1 AND a.burnt = false")
             .bind(creator)
@@ -465,14 +518,21 @@ impl PgStorage {
         Ok((count.0, rows))
     }
 
-    pub async fn get_assets_by_group(&self, group_key: &str, group_value: &str, page: i64, limit: i64) -> Result<(i64, Vec<AssetRow>)> {
+    pub async fn get_assets_by_group(
+        &self,
+        group_key: &str,
+        group_value: &str,
+        page: i64,
+        limit: i64,
+    ) -> Result<(i64, Vec<AssetRow>)> {
         let count: (i64,) = sqlx::query_as(
             "SELECT count(*) FROM asset_grouping ag JOIN asset a ON a.id = ag.asset_id
-             WHERE ag.group_key = $1 AND ag.group_value = $2 AND a.burnt = false")
-            .bind(group_key)
-            .bind(group_value)
-            .fetch_one(&self.pool)
-            .await?;
+             WHERE ag.group_key = $1 AND ag.group_value = $2 AND a.burnt = false",
+        )
+        .bind(group_key)
+        .bind(group_value)
+        .fetch_one(&self.pool)
+        .await?;
         let offset = (page - 1) * limit;
         let rows: Vec<AssetRow> = sqlx::query_as(
             "SELECT a.id, a.specification_asset_class::text, a.owner, a.delegate, a.frozen, a.supply,
@@ -495,7 +555,12 @@ impl PgStorage {
         Ok((count.0, rows))
     }
 
-    pub async fn get_assets_by_authority(&self, authority: &[u8], page: i64, limit: i64) -> Result<(i64, Vec<AssetRow>)> {
+    pub async fn get_assets_by_authority(
+        &self,
+        authority: &[u8],
+        page: i64,
+        limit: i64,
+    ) -> Result<(i64, Vec<AssetRow>)> {
         let count: (i64,) = sqlx::query_as(
             "SELECT count(*) FROM asset_authority aa JOIN asset a ON a.id = aa.asset_id WHERE aa.authority = $1 AND a.burnt = false")
             .bind(authority)
@@ -533,7 +598,9 @@ impl PgStorage {
 
 impl Clone for PgStorage {
     fn clone(&self) -> Self {
-        Self { pool: self.pool.clone() }
+        Self {
+            pool: self.pool.clone(),
+        }
     }
 }
 

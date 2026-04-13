@@ -70,6 +70,7 @@ parking_lot = "0.12"
 bytes = "1.10"
 lz4 = "1.28"
 reqwest = { version = "0.12", features = ["json"] }
+zstd = "0.13"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

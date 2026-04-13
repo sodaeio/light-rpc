@@ -2,9 +2,9 @@ use anyhow::Result;
 use jsonrpsee::types::Params;
 use jsonrpsee::RpcModule;
 
-use crate::types::*;
 use super::rpc_response;
 use crate::rpc::server::RpcContext;
+use crate::types::*;
 
 fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObject::owned(code, msg.to_string(), None::<()>)
@@ -32,7 +32,10 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     "version": "legacy",
                 })).collect::<Vec<_>>(),
             })),
-            Ok(None) => Err(err(-32009, "Slot was skipped, or missing in long-term storage")),
+            Ok(None) => Err(err(
+                -32009,
+                "Slot was skipped, or missing in long-term storage",
+            )),
             Err(e) => Err(err(-32603, &e.to_string())),
         }
     })?;
@@ -48,7 +51,9 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
     module.register_async_method("getSlot", |params, ctx, _| async move {
         let commitment = parse_commitment(&params);
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(ctx.reader.get_slot(commitment)))
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(ctx
+            .reader
+            .get_slot(commitment)))
     })?;
 
     module.register_async_method("getLatestBlockhash", |params, ctx, _| async move {
@@ -60,10 +65,13 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     Ok(Some(h)) => h + 150,
                     _ => bh_slot + 150,
                 };
-                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(slot, serde_json::json!({
-                    "blockhash": blockhash,
-                    "lastValidBlockHeight": last_valid
-                })))
+                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(
+                    slot,
+                    serde_json::json!({
+                        "blockhash": blockhash,
+                        "lastValidBlockHeight": last_valid
+                    }),
+                ))
             }
             None => Err(err(-32603, "No blockhash available")),
         }
@@ -73,13 +81,18 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let p: Vec<serde_json::Value> = params.parse()?;
         let blockhash = p.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
         let slot = ctx.reader.cache().processed_slot();
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(slot, serde_json::json!(ctx.reader.is_blockhash_valid(&blockhash))))
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(
+            slot,
+            serde_json::json!(ctx.reader.is_blockhash_valid(&blockhash)),
+        ))
     })?;
 
     module.register_async_method("getBlockTime", |params, ctx, _| async move {
         let (slot,): (Slot,) = params.parse()?;
         match ctx.reader.get_block(slot) {
-            Ok(Some(block)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(block.info.block_time)),
+            Ok(Some(block)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(
+                block.info.block_time
+            )),
             _ => Ok(serde_json::Value::Null),
         }
     })?;

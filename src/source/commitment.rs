@@ -39,7 +39,9 @@ impl CommitmentTracker {
 
     /// Record a slot as processed (first seen from the stream).
     pub fn set_processed(&mut self, slot: Slot) {
-        self.slots.entry(slot).or_insert(SlotStatus::ProcessedOrSkipped);
+        self.slots
+            .entry(slot)
+            .or_insert(SlotStatus::ProcessedOrSkipped);
         if slot > self.processed {
             self.processed = slot;
         }

@@ -17,7 +17,10 @@ use light_indexer::storage::rocks::UnifiedRocksDb;
 use light_indexer::storage::write::{pg_writer_loop, StorageWriter};
 
 #[derive(Parser)]
-#[command(name = "light-indexer", about = "Unified Solana indexer and RPC server")]
+#[command(
+    name = "light-indexer",
+    about = "Unified Solana indexer and RPC server"
+)]
 struct Cli {
     #[arg(short, long, default_value = "config.yml")]
     config: PathBuf,
@@ -44,7 +47,10 @@ fn main() -> Result<()> {
         .with_target(true)
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "starting light-indexer");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "starting light-indexer"
+    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.threads.rpc_count())
@@ -60,17 +66,19 @@ async fn run(config: Config) -> Result<()> {
     let rocks = UnifiedRocksDb::open(&config.storage.rocksdb).context("opening rocksdb")?;
     info!(path = %config.storage.rocksdb.path, "rocksdb opened");
 
-    let files = Arc::new(
-        BlockFileStorage::open(&config.storage.blocks).context("opening block storage")?,
-    );
+    let files =
+        Arc::new(BlockFileStorage::open(&config.storage.blocks).context("opening block storage")?);
     info!(path = %config.storage.blocks.path, "block storage opened");
 
-    let pg = PgStorage::connect(&config.storage.postgres).await.context("connecting to postgres")?;
+    let pg = PgStorage::connect(&config.storage.postgres)
+        .await
+        .context("connecting to postgres")?;
     pg.migrate().await.context("running migrations")?;
 
     let memory_cache = Arc::new(MemoryCache::new());
 
-    let (source_tx, source_rx) = tokio::sync::mpsc::channel(config.storage.pipeline.source_to_write);
+    let (source_tx, source_rx) =
+        tokio::sync::mpsc::channel(config.storage.pipeline.source_to_write);
     let (broadcast_tx, _) = tokio::sync::broadcast::channel(config.storage.pipeline.write_to_read);
     let (pg_tx, pg_rx) = tokio::sync::mpsc::channel(config.storage.pipeline.pg_write_buffer);
 
@@ -132,9 +140,9 @@ async fn run_metrics_server(endpoint: &str) -> Result<()> {
                 let metric_families = REGISTRY.gather();
                 let mut buffer = Vec::new();
                 encoder.encode(&metric_families, &mut buffer).unwrap();
-                Ok::<_, std::convert::Infallible>(hyper::Response::new(
-                    http_body_util::Full::new(bytes::Bytes::from(buffer)),
-                ))
+                Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(
+                    bytes::Bytes::from(buffer),
+                )))
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)

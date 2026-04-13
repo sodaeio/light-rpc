@@ -1,6 +1,6 @@
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
-    Opts, Registry,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 use std::sync::LazyLock;
 
@@ -13,15 +13,17 @@ pub static INGESTED_BLOCKS: LazyLock<IntCounter> = LazyLock::new(|| {
 });
 
 pub static INGESTED_ACCOUNTS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter =
-        IntCounter::new("li_ingested_accounts_total", "Total account updates ingested").unwrap();
+    let counter = IntCounter::new(
+        "li_ingested_accounts_total",
+        "Total account updates ingested",
+    )
+    .unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
 });
 
 pub static INGESTED_TRANSACTIONS: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter =
-        IntCounter::new("li_ingested_txs_total", "Total transactions ingested").unwrap();
+    let counter = IntCounter::new("li_ingested_txs_total", "Total transactions ingested").unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
 });
@@ -80,9 +82,8 @@ pub static RPC_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
 
 pub static STORAGE_WRITE_LATENCY: LazyLock<Histogram> = LazyLock::new(|| {
     let histogram = Histogram::with_opts(
-        HistogramOpts::new("li_storage_write_seconds", "Storage write latency").buckets(vec![
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
-        ]),
+        HistogramOpts::new("li_storage_write_seconds", "Storage write latency")
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
     )
     .unwrap();
     REGISTRY.register(Box::new(histogram.clone())).unwrap();
@@ -91,9 +92,9 @@ pub static STORAGE_WRITE_LATENCY: LazyLock<Histogram> = LazyLock::new(|| {
 
 pub static PG_WRITE_LATENCY: LazyLock<Histogram> = LazyLock::new(|| {
     let histogram = Histogram::with_opts(
-        HistogramOpts::new("li_pg_write_seconds", "PostgreSQL batch write latency").buckets(
-            vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5],
-        ),
+        HistogramOpts::new("li_pg_write_seconds", "PostgreSQL batch write latency").buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+        ]),
     )
     .unwrap();
     REGISTRY.register(Box::new(histogram.clone())).unwrap();
