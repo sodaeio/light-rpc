@@ -28,18 +28,15 @@ pub mod programs {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Commitment {
     Processed,
     Confirmed,
+    #[default]
     Finalized,
-}
-
-impl Default for Commitment {
-    fn default() -> Self {
-        Self::Finalized
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

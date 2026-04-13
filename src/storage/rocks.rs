@@ -31,10 +31,16 @@ impl UnifiedRocksDb {
         let path = Path::new(&config.path);
         std::fs::create_dir_all(path).context("creating rocksdb directory")?;
 
+        // Shared block cache across all CFs — bounds total memory usage.
+        // Without this, each CF allocates its own unbounded cache.
+        let cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024); // 512MB shared
+
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        db_opts.set_write_buffer_size(config.write_buffer_size);
+        // Per-CF write buffer. 5 CFs × 64MB × 2 (active + flushing) = 640MB max memtables.
+        db_opts.set_write_buffer_size(64 * 1024 * 1024);
+        db_opts.set_max_write_buffer_number(2);
         db_opts.set_max_open_files(config.max_open_files);
         db_opts.set_allow_concurrent_memtable_write(true);
         let parallelism = std::thread::available_parallelism()
@@ -48,16 +54,11 @@ impl UnifiedRocksDb {
         }
 
         let cfs = vec![
-            // Block pipeline: slot metadata
-            Self::slot_index_cf_opts(),
-            // Block pipeline: transaction signature → location
-            Self::tx_index_cf_opts(),
-            // Block pipeline: address → signatures
-            Self::sfa_index_cf_opts(),
-            // Account pipeline: pubkey → account data
-            Self::accounts_cf_opts(),
-            // Account pipeline: program_id + pubkey → empty (prefix scan)
-            Self::program_index_cf_opts(),
+            Self::slot_index_cf_opts(&cache),
+            Self::tx_index_cf_opts(&cache),
+            Self::sfa_index_cf_opts(&cache),
+            Self::accounts_cf_opts(&cache),
+            Self::program_index_cf_opts(&cache),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)
@@ -66,48 +67,53 @@ impl UnifiedRocksDb {
         Ok(Self { db: Arc::new(db) })
     }
 
-    fn slot_index_cf_opts() -> ColumnFamilyDescriptor {
-        let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        ColumnFamilyDescriptor::new(CF_SLOT_INDEX, opts)
-    }
-
-    fn tx_index_cf_opts() -> ColumnFamilyDescriptor {
+    fn slot_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(cache);
+        opts.set_block_based_table_factory(&block_opts);
+        ColumnFamilyDescriptor::new(CF_SLOT_INDEX, opts)
+    }
+
+    fn tx_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+        let mut opts = Options::default();
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(cache);
         block_opts.set_bloom_filter(10.0, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_TX_INDEX, opts)
     }
 
-    fn sfa_index_cf_opts() -> ColumnFamilyDescriptor {
+    fn sfa_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        // Prefix extractor: first 32 bytes = address
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
         let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(cache);
         block_opts.set_bloom_filter(10.0, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_SFA_INDEX, opts)
     }
 
-    fn accounts_cf_opts() -> ColumnFamilyDescriptor {
+    fn accounts_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
         let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(cache);
         block_opts.set_bloom_filter(10.0, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_ACCOUNTS, opts)
     }
 
-    fn program_index_cf_opts() -> ColumnFamilyDescriptor {
+    fn program_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        // Prefix extractor: first 32 bytes = program_id for prefix scans
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
         let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(cache);
         block_opts.set_bloom_filter(10.0, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_PROGRAM_INDEX, opts)
@@ -203,7 +209,7 @@ impl UnifiedRocksDb {
         let mut key = Vec::with_capacity(64);
         key.extend_from_slice(program_id);
         key.extend_from_slice(pubkey);
-        self.db.put_cf(&self.cf(CF_PROGRAM_INDEX), &key, &[])?;
+        self.db.put_cf(&self.cf(CF_PROGRAM_INDEX), &key, [])?;
         Ok(())
     }
 
@@ -222,7 +228,7 @@ impl UnifiedRocksDb {
                     break;
                 }
                 let pubkey: [u8; 32] = key[32..64].try_into().unwrap();
-                if let Ok(Some(data)) = self.db.get_cf(&cf_acct, &pubkey) {
+                if let Ok(Some(data)) = self.db.get_cf(&cf_acct, pubkey) {
                     results.push((pubkey, data));
                 }
             }
@@ -238,12 +244,12 @@ impl UnifiedRocksDb {
         let cf_prog = self.cf(CF_PROGRAM_INDEX);
 
         for entry in accounts {
-            batch.put_cf(&cf_acct, &entry.pubkey, &entry.data);
+            batch.put_cf(&cf_acct, entry.pubkey, &entry.data);
 
             let mut prog_key = Vec::with_capacity(64);
             prog_key.extend_from_slice(&entry.owner);
             prog_key.extend_from_slice(&entry.pubkey);
-            batch.put_cf(&cf_prog, &prog_key, &[]);
+            batch.put_cf(&cf_prog, &prog_key, []);
         }
 
         self.db.write(batch)?;

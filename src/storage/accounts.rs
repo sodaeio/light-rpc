@@ -60,30 +60,22 @@ impl AccountProcessor {
         (mints, token_accounts, program_accounts)
     }
 
-    /// Write program accounts to RocksDB, skip if newer data exists.
+    /// Write program accounts to RocksDB. No read-before-write — the gRPC
+    /// stream delivers accounts in slot order so newer data always wins.
     pub fn write_program_accounts(
         db: &UnifiedRocksDb,
         accounts: &[&AccountUpdate],
     ) -> anyhow::Result<usize> {
         let entries: Vec<StoredAccountEntry> = accounts
             .iter()
-            .filter_map(|update| {
-                // Check if existing data is newer
-                if let Ok(Some(existing)) = db.get_account(&update.pubkey.to_bytes()) {
-                    if let Some(stored) = StoredAccount::deserialize(&existing) {
-                        if stored.slot >= update.slot {
-                            return None; // existing is newer, skip
-                        }
-                    }
-                }
-
+            .map(|update| {
                 let stored = StoredAccount::from_update(update);
-                Some(StoredAccountEntry {
+                StoredAccountEntry {
                     pubkey: update.pubkey.to_bytes(),
                     owner: update.owner.to_bytes(),
                     data: stored.serialize(),
                     slot: update.slot,
-                })
+                }
             })
             .collect();
 

@@ -593,10 +593,10 @@ impl StorageReader {
     ) -> Vec<Option<serde_json::Value>> {
         let mut results = Vec::with_capacity(pubkeys.len());
         for pk in pubkeys {
-            let val = match self.get_account_info(pk, encoding).await {
-                Ok(v) => v,
-                Err(_) => None,
-            };
+            let val: Option<serde_json::Value> = self
+                .get_account_info(pk, encoding)
+                .await
+                .unwrap_or_default();
             results.push(val);
         }
         results

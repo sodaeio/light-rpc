@@ -23,7 +23,7 @@ async fn rpc_call(method: &str, params: Value) -> Value {
     });
 
     let resp = client
-        .post(&endpoint())
+        .post(endpoint())
         .json(&body)
         .send()
         .await
@@ -269,7 +269,7 @@ async fn test_batch_request() {
     ]);
 
     let resp = client
-        .post(&endpoint())
+        .post(endpoint())
         .json(&body)
         .send()
         .await

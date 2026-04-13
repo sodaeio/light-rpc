@@ -100,136 +100,166 @@ impl PgStorage {
 
     // --- Write operations (called from pg_writer_loop) ---
 
+    /// Batch upsert token mints using UNNEST arrays — single round-trip.
     pub async fn upsert_token_mints(&self, mints: &[AccountUpdate]) -> Result<()> {
         if mints.is_empty() {
             return Ok(());
         }
         let timer = metrics::PG_WRITE_LATENCY.start_timer();
 
-        for mint in mints {
-            // SPL mint layout: [mint_authority(36) | supply(8) | decimals(1) | ...]
-            let supply = if mint.data.len() >= 44 {
-                u64::from_le_bytes(mint.data[36..44].try_into().unwrap_or([0; 8]))
+        let mut p_mint: Vec<Vec<u8>> = Vec::with_capacity(mints.len());
+        let mut p_supply: Vec<i64> = Vec::with_capacity(mints.len());
+        let mut p_decimals: Vec<i32> = Vec::with_capacity(mints.len());
+        let mut p_program: Vec<Vec<u8>> = Vec::with_capacity(mints.len());
+        let mut p_mint_auth: Vec<Option<Vec<u8>>> = Vec::with_capacity(mints.len());
+        let mut p_freeze_auth: Vec<Option<Vec<u8>>> = Vec::with_capacity(mints.len());
+        let mut p_slot: Vec<i64> = Vec::with_capacity(mints.len());
+
+        for m in mints {
+            let supply = if m.data.len() >= 44 {
+                u64::from_le_bytes(m.data[36..44].try_into().unwrap_or([0; 8]))
             } else {
                 0
             };
-            let decimals = if mint.data.len() >= 45 {
-                mint.data[44] as i32
+            let decimals = if m.data.len() >= 45 {
+                m.data[44] as i32
             } else {
                 0
             };
-            let mint_authority = if mint.data.len() >= 36 && mint.data[0] == 1 {
-                Some(&mint.data[4..36])
+            let mint_auth = if m.data.len() >= 36 && m.data[0] == 1 {
+                Some(m.data[4..36].to_vec())
             } else {
                 None
             };
-            let freeze_authority = if mint.data.len() >= 82 && mint.data[46] == 1 {
-                Some(&mint.data[50..82])
+            let freeze_auth = if m.data.len() >= 82 && m.data[46] == 1 {
+                Some(m.data[50..82].to_vec())
             } else {
                 None
             };
 
-            sqlx::query(
-                "INSERT INTO tokens (mint, supply, decimals, token_program, mint_authority, freeze_authority, slot_updated)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (mint) DO UPDATE SET
-                     supply = EXCLUDED.supply,
-                     decimals = EXCLUDED.decimals,
-                     mint_authority = EXCLUDED.mint_authority,
-                     freeze_authority = EXCLUDED.freeze_authority,
-                     slot_updated = EXCLUDED.slot_updated
-                 WHERE EXCLUDED.slot_updated >= tokens.slot_updated",
-            )
-            .bind(mint.pubkey.as_ref())
-            .bind(supply as i64)
-            .bind(decimals)
-            .bind(mint.owner.as_ref())
-            .bind(mint_authority)
-            .bind(freeze_authority)
-            .bind(mint.slot as i64)
-            .execute(&self.pool)
-            .await?;
+            p_mint.push(m.pubkey.as_ref().to_vec());
+            p_supply.push(supply as i64);
+            p_decimals.push(decimals);
+            p_program.push(m.owner.as_ref().to_vec());
+            p_mint_auth.push(mint_auth);
+            p_freeze_auth.push(freeze_auth);
+            p_slot.push(m.slot as i64);
         }
+
+        sqlx::query(
+            "INSERT INTO tokens (mint, supply, decimals, token_program, mint_authority, freeze_authority, slot_updated)
+             SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::int[], $4::bytea[], $5::bytea[], $6::bytea[], $7::bigint[])
+             ON CONFLICT (mint) DO UPDATE SET
+                 supply = EXCLUDED.supply,
+                 decimals = EXCLUDED.decimals,
+                 mint_authority = EXCLUDED.mint_authority,
+                 freeze_authority = EXCLUDED.freeze_authority,
+                 slot_updated = EXCLUDED.slot_updated
+             WHERE EXCLUDED.slot_updated >= tokens.slot_updated",
+        )
+        .bind(&p_mint)
+        .bind(&p_supply)
+        .bind(&p_decimals)
+        .bind(&p_program)
+        .bind(&p_mint_auth)
+        .bind(&p_freeze_auth)
+        .bind(&p_slot)
+        .execute(&self.pool)
+        .await?;
 
         timer.observe_duration();
         Ok(())
     }
 
+    /// Batch upsert token accounts using UNNEST arrays — single round-trip.
     pub async fn upsert_token_accounts(&self, accounts: &[AccountUpdate]) -> Result<()> {
         if accounts.is_empty() {
             return Ok(());
         }
         let timer = metrics::PG_WRITE_LATENCY.start_timer();
 
-        for account in accounts {
-            // SPL token account layout: [mint(32) | owner(32) | amount(8) | delegate_option(4) | delegate(32) | state(1) | ...]
-            let acct_mint = if account.data.len() >= 32 {
-                &account.data[..32]
+        let mut p_pubkey: Vec<Vec<u8>> = Vec::with_capacity(accounts.len());
+        let mut p_mint: Vec<Vec<u8>> = Vec::with_capacity(accounts.len());
+        let mut p_owner: Vec<Vec<u8>> = Vec::with_capacity(accounts.len());
+        let mut p_amount: Vec<i64> = Vec::with_capacity(accounts.len());
+        let mut p_frozen: Vec<bool> = Vec::with_capacity(accounts.len());
+        let mut p_delegate: Vec<Option<Vec<u8>>> = Vec::with_capacity(accounts.len());
+        let mut p_delegated_amount: Vec<i64> = Vec::with_capacity(accounts.len());
+        let mut p_slot: Vec<i64> = Vec::with_capacity(accounts.len());
+        let mut p_program: Vec<Vec<u8>> = Vec::with_capacity(accounts.len());
+
+        for a in accounts {
+            let acct_mint = if a.data.len() >= 32 {
+                a.data[..32].to_vec()
             } else {
-                &[0u8; 32][..]
+                vec![0; 32]
             };
-            let acct_owner = if account.data.len() >= 64 {
-                &account.data[32..64]
+            let acct_owner = if a.data.len() >= 64 {
+                a.data[32..64].to_vec()
             } else {
-                &[0u8; 32][..]
+                vec![0; 32]
             };
-            let amount = if account.data.len() >= 72 {
-                u64::from_le_bytes(account.data[64..72].try_into().unwrap_or([0; 8]))
+            let amount = if a.data.len() >= 72 {
+                u64::from_le_bytes(a.data[64..72].try_into().unwrap_or([0; 8]))
             } else {
                 0
             };
-
-            let has_delegate = account.data.len() >= 76
-                && u32::from_le_bytes(account.data[72..76].try_into().unwrap_or([0; 4])) == 1;
-            let delegate = if has_delegate && account.data.len() >= 108 {
-                Some(&account.data[76..108])
+            let has_delegate = a.data.len() >= 76
+                && u32::from_le_bytes(a.data[72..76].try_into().unwrap_or([0; 4])) == 1;
+            let delegate = if has_delegate && a.data.len() >= 108 {
+                Some(a.data[76..108].to_vec())
             } else {
                 None
             };
-
-            let state = if account.data.len() >= 109 {
-                account.data[108]
-            } else {
-                0
-            };
-            let frozen = state == 2;
-
-            let delegated_amount = if account.data.len() >= 121 && has_delegate {
-                u64::from_le_bytes(account.data[113..121].try_into().unwrap_or([0; 8]))
+            let state = if a.data.len() >= 109 { a.data[108] } else { 0 };
+            let delegated_amount = if a.data.len() >= 121 && has_delegate {
+                u64::from_le_bytes(a.data[113..121].try_into().unwrap_or([0; 8]))
             } else {
                 0
             };
 
-            sqlx::query(
-                "INSERT INTO token_accounts (pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                 ON CONFLICT (pubkey) DO UPDATE SET
-                     mint = EXCLUDED.mint,
-                     owner = EXCLUDED.owner,
-                     amount = EXCLUDED.amount,
-                     frozen = EXCLUDED.frozen,
-                     delegate = EXCLUDED.delegate,
-                     delegated_amount = EXCLUDED.delegated_amount,
-                     slot_updated = EXCLUDED.slot_updated
-                 WHERE EXCLUDED.slot_updated >= token_accounts.slot_updated",
-            )
-            .bind(account.pubkey.as_ref())
-            .bind(acct_mint)
-            .bind(acct_owner)
-            .bind(amount as i64)
-            .bind(frozen)
-            .bind(delegate)
-            .bind(delegated_amount as i64)
-            .bind(account.slot as i64)
-            .bind(account.owner.as_ref())
-            .execute(&self.pool)
-            .await?;
+            p_pubkey.push(a.pubkey.as_ref().to_vec());
+            p_mint.push(acct_mint);
+            p_owner.push(acct_owner);
+            p_amount.push(amount as i64);
+            p_frozen.push(state == 2);
+            p_delegate.push(delegate);
+            p_delegated_amount.push(delegated_amount as i64);
+            p_slot.push(a.slot as i64);
+            p_program.push(a.owner.as_ref().to_vec());
         }
+
+        sqlx::query(
+            "INSERT INTO token_accounts (pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program)
+             SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bool[], $6::bytea[], $7::bigint[], $8::bigint[], $9::bytea[])
+             ON CONFLICT (pubkey) DO UPDATE SET
+                 mint = EXCLUDED.mint,
+                 owner = EXCLUDED.owner,
+                 amount = EXCLUDED.amount,
+                 frozen = EXCLUDED.frozen,
+                 delegate = EXCLUDED.delegate,
+                 delegated_amount = EXCLUDED.delegated_amount,
+                 slot_updated = EXCLUDED.slot_updated
+             WHERE EXCLUDED.slot_updated >= token_accounts.slot_updated",
+        )
+        .bind(&p_pubkey)
+        .bind(&p_mint)
+        .bind(&p_owner)
+        .bind(&p_amount)
+        .bind(&p_frozen)
+        .bind(&p_delegate)
+        .bind(&p_delegated_amount)
+        .bind(&p_slot)
+        .bind(&p_program)
+        .execute(&self.pool)
+        .await?;
 
         timer.observe_duration();
         Ok(())
     }
 
+    /// Batch insert address transactions using UNNEST — single round-trip.
+    #[allow(clippy::type_complexity)]
     pub async fn insert_address_transactions(
         &self,
         entries: &[(
@@ -244,21 +274,32 @@ impl PgStorage {
             return Ok(());
         }
 
+        let mut p_addr: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+        let mut p_sig: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+        let mut p_slot: Vec<i64> = Vec::with_capacity(entries.len());
+        let mut p_time: Vec<Option<i64>> = Vec::with_capacity(entries.len());
+        let mut p_err: Vec<bool> = Vec::with_capacity(entries.len());
+
         for (address, slot, signature, block_time, err) in entries {
-            let has_err = err.is_some();
-            sqlx::query(
-                "INSERT INTO address_transactions (address, signature, slot, block_time, err)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(address.as_ref())
-            .bind(signature.as_ref())
-            .bind(*slot as i64)
-            .bind(*block_time)
-            .bind(has_err)
-            .execute(&self.pool)
-            .await?;
+            p_addr.push(address.as_ref().to_vec());
+            p_sig.push(signature.as_ref().to_vec());
+            p_slot.push(*slot as i64);
+            p_time.push(*block_time);
+            p_err.push(err.is_some());
         }
+
+        sqlx::query(
+            "INSERT INTO address_transactions (address, signature, slot, block_time, err)
+             SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bigint[], $4::bigint[], $5::bool[])
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&p_addr)
+        .bind(&p_sig)
+        .bind(&p_slot)
+        .bind(&p_time)
+        .bind(&p_err)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }

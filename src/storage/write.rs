@@ -215,33 +215,43 @@ impl StorageWriter {
         buffer.sort_by(|a, b| a.pubkey.cmp(&b.pubkey).then(b.slot.cmp(&a.slot)));
         buffer.dedup_by_key(|u| u.pubkey);
 
-        let (mints, token_accounts, program_accounts) = AccountProcessor::classify_batch(buffer);
+        // Drain and split by type — no cloning, moves ownership
+        let mut mint_updates = Vec::new();
+        let mut ta_updates = Vec::new();
+        let mut prog_refs = Vec::new();
 
-        // Token mints → PG (async, non-blocking)
-        if !mints.is_empty() {
-            let mint_updates: Vec<AccountUpdate> = mints.into_iter().cloned().collect();
-            let _ = self.pg_tx.try_send(PgWriteJob::TokenMints(mint_updates));
-        }
-
-        // Token accounts → PG (async, non-blocking)
-        if !token_accounts.is_empty() {
-            let ta_updates: Vec<AccountUpdate> = token_accounts.into_iter().cloned().collect();
-            let _ = self.pg_tx.try_send(PgWriteJob::TokenAccounts(ta_updates));
-        }
-
-        // Program accounts → RocksDB (fast, local)
-        if !program_accounts.is_empty() {
-            match AccountProcessor::write_program_accounts(&self.rocks, &program_accounts) {
-                Ok(count) => {
-                    debug!(count, "wrote program accounts to rocksdb");
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to write program accounts");
-                }
+        // Classify: mints and token accounts get moved into PG jobs,
+        // program accounts stay as references for RocksDB batch write
+        let updates = std::mem::take(buffer);
+        for update in &updates {
+            match update.classify() {
+                AccountKind::TokenMint => mint_updates.push(update),
+                AccountKind::TokenAccount => ta_updates.push(update),
+                AccountKind::ProgramAccount => prog_refs.push(update),
             }
         }
 
-        buffer.clear();
+        // Program accounts → RocksDB (fast, local, synchronous)
+        if !prog_refs.is_empty() {
+            match AccountProcessor::write_program_accounts(&self.rocks, &prog_refs) {
+                Ok(count) => debug!(count, "wrote program accounts to rocksdb"),
+                Err(e) => error!(error = %e, "failed to write program accounts"),
+            }
+        }
+
+        // Token mints → PG (via bounded channel, non-blocking)
+        if !mint_updates.is_empty() {
+            let owned: Vec<AccountUpdate> = mint_updates.into_iter().cloned().collect();
+            let _ = self.pg_tx.try_send(PgWriteJob::TokenMints(owned));
+        }
+
+        // Token accounts → PG (via bounded channel, non-blocking)
+        if !ta_updates.is_empty() {
+            let owned: Vec<AccountUpdate> = ta_updates.into_iter().cloned().collect();
+            let _ = self.pg_tx.try_send(PgWriteJob::TokenAccounts(owned));
+        }
+
+        drop(updates);
     }
 }
 
