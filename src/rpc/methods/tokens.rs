@@ -22,34 +22,47 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         }
     })?;
 
-    module.register_async_method("getTokenAccountsByDelegate", |_params, ctx, _| async move {
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-            "value": [],
-            "context": { "slot": ctx.reader.cache().processed_slot() }
-        }))
+    module.register_async_method("getTokenAccountsByDelegate", |params, ctx, _| async move {
+        let p: Vec<serde_json::Value> = params.parse()?;
+        let delegate_str = p.first().and_then(|v| v.as_str()).ok_or_else(|| err(-32602, "Invalid delegate"))?;
+        let delegate_bytes = bs58::decode(delegate_str).into_vec().map_err(|_| err(-32602, "Invalid encoding"))?;
+
+        match ctx.reader.get_token_accounts_by_delegate(&delegate_bytes).await {
+            Ok(accounts) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                "value": accounts,
+                "context": { "slot": ctx.reader.cache().processed_slot() }
+            })),
+            Err(e) => Err(err(-32603, &e.to_string())),
+        }
     })?;
 
     module.register_async_method("getTokenSupply", |params, ctx, _| async move {
         let p: Vec<serde_json::Value> = params.parse()?;
         let mint_str = p.first().and_then(|v| v.as_str()).ok_or_else(|| err(-32602, "Invalid mint"))?;
-        let mint_bytes: [u8; 32] = bs58::decode(mint_str).into_vec()
-            .map_err(|_| err(-32602, "Invalid encoding"))?
-            .try_into().map_err(|_| err(-32602, "Invalid mint length"))?;
+        let mint_bytes = bs58::decode(mint_str).into_vec().map_err(|_| err(-32602, "Invalid encoding"))?;
 
-        match ctx.reader.get_account_info(&mint_bytes) {
-            Ok(Some(_)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-                "value": { "amount": "0", "decimals": 0, "uiAmount": 0.0, "uiAmountString": "0" },
+        match ctx.reader.get_token_supply(&mint_bytes).await {
+            Ok(Some(supply)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                "value": supply,
                 "context": { "slot": ctx.reader.cache().processed_slot() }
             })),
-            _ => Err(err(-32602, "Mint not found")),
+            Ok(None) => Err(err(-32602, "Mint not found")),
+            Err(e) => Err(err(-32603, &e.to_string())),
         }
     })?;
 
-    module.register_async_method("getTokenLargestAccounts", |_params, ctx, _| async move {
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-            "value": [],
-            "context": { "slot": ctx.reader.cache().processed_slot() }
-        }))
+    module.register_async_method("getTokenLargestAccounts", |params, ctx, _| async move {
+        let p: Vec<serde_json::Value> = params.parse()?;
+        let mint_str = p.first().and_then(|v| v.as_str()).ok_or_else(|| err(-32602, "Invalid mint"))?;
+        let mint_bytes = bs58::decode(mint_str).into_vec().map_err(|_| err(-32602, "Invalid encoding"))?;
+
+        match ctx.reader.get_token_largest_accounts(&mint_bytes, 20).await {
+            Ok(accounts) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                "value": accounts,
+                "context": { "slot": ctx.reader.cache().processed_slot() }
+            })),
+            Err(e) => Err(err(-32603, &e.to_string())),
+        }
     })?;
 
     Ok(())

@@ -15,7 +15,8 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .map_err(|_| err(-32602, "Invalid encoding"))?
             .try_into().map_err(|_| err(-32602, "Invalid pubkey length"))?;
 
-        match ctx.reader.get_account_info(&pubkey_bytes) {
+        let encoding = p.get(1).and_then(|v| v.get("encoding")).and_then(|v| v.as_str()).unwrap_or("base64");
+        match ctx.reader.get_account_info(&pubkey_bytes, encoding) {
             Ok(Some(account)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
                 "value": account,
                 "context": { "slot": ctx.reader.cache().processed_slot() }
@@ -30,20 +31,19 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
     module.register_async_method("getMultipleAccounts", |params, ctx, _| async move {
         let p: Vec<serde_json::Value> = params.parse()?;
-        let pubkeys = p.first().and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let mut accounts = Vec::with_capacity(pubkeys.len());
+        let pubkey_strs = p.first().and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let encoding = p.get(1).and_then(|v| v.get("encoding")).and_then(|v| v.as_str()).unwrap_or("base64");
 
-        for pk_val in &pubkeys {
+        let mut keys = Vec::with_capacity(pubkey_strs.len());
+        for pk_val in &pubkey_strs {
             let pk_str = pk_val.as_str().unwrap_or("");
-            let pk_bytes: [u8; 32] = match bs58::decode(pk_str).into_vec() {
-                Ok(v) if v.len() == 32 => v.try_into().unwrap(),
-                _ => { accounts.push(serde_json::Value::Null); continue; }
-            };
-            match ctx.reader.get_account_info(&pk_bytes) {
-                Ok(Some(a)) => accounts.push(a),
-                _ => accounts.push(serde_json::Value::Null),
+            match bs58::decode(pk_str).into_vec() {
+                Ok(v) if v.len() == 32 => keys.push(v.try_into().unwrap()),
+                _ => keys.push([0u8; 32]),
             }
         }
+
+        let accounts = ctx.reader.get_multiple_accounts(&keys, encoding).await;
 
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
             "value": accounts,
@@ -58,7 +58,8 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .map_err(|_| err(-32602, "Invalid encoding"))?
             .try_into().map_err(|_| err(-32602, "Invalid pubkey length"))?;
 
-        match ctx.reader.get_program_accounts(&program_bytes) {
+        let encoding = p.get(1).and_then(|v| v.get("encoding")).and_then(|v| v.as_str()).unwrap_or("base64");
+        match ctx.reader.get_program_accounts(&program_bytes, encoding).await {
             Ok(accounts) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(accounts)),
             Err(e) => Err(err(-32603, &e.to_string())),
         }
@@ -71,7 +72,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .map_err(|_| err(-32602, "Invalid encoding"))?
             .try_into().map_err(|_| err(-32602, "Invalid pubkey length"))?;
 
-        let lamports = match ctx.reader.get_account_info(&pubkey_bytes) {
+        let lamports = match ctx.reader.get_account_info(&pubkey_bytes, "base64") {
             Ok(Some(a)) => a["lamports"].as_u64().unwrap_or(0),
             _ => 0,
         };

@@ -30,7 +30,7 @@ pub enum PgWriteJob {
     TokenMints(Vec<AccountUpdate>),
     TokenAccounts(Vec<AccountUpdate>),
     AddressTransactions(Vec<AddressTxEntry>),
-    SlotUpdate(SlotMeta),
+    SlotUpdate(Slot),
 }
 
 pub struct AddressTxEntry {
@@ -193,17 +193,12 @@ impl StorageWriter {
     async fn handle_slot_status(
         &self,
         slot: Slot,
-        parent_slot: Option<Slot>,
+        _parent_slot: Option<Slot>,
         status: SlotStatus,
     ) {
         let msg = match status {
             SlotStatus::Confirmed => {
-                let _ = self.pg_tx.try_send(PgWriteJob::SlotUpdate(SlotMeta {
-                    slot,
-                    parent_slot: parent_slot.unwrap_or(0),
-                    block_time: None,
-                    status,
-                }));
+                let _ = self.pg_tx.try_send(PgWriteJob::SlotUpdate(slot));
                 WriteToReadMessage::BlockConfirmed { slot }
             }
             SlotStatus::Finalized => {
@@ -275,7 +270,7 @@ pub async fn pg_writer_loop(pg: PgStorage, mut rx: mpsc::Receiver<PgWriteJob>) {
                     .collect();
                 pg.insert_address_transactions(&tuples).await
             }
-            PgWriteJob::SlotUpdate(meta) => pg.upsert_slot(&meta).await,
+            PgWriteJob::SlotUpdate(slot) => pg.upsert_slot(slot).await,
         };
 
         if let Err(e) = result {

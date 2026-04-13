@@ -23,7 +23,7 @@ storage:
     max_stored_blocks: 500000
 
   postgres:
-    url: "postgres://light_indexer:light_indexer@localhost:5432/light_indexer"
+    url: "postgres://solanadb:solanadb@localhost:5432/solanadb"
     max_connections: 50
     min_connections: 5
     connect_timeout_secs: 10

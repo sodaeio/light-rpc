@@ -1,0 +1,50 @@
+source:
+  endpoint: "http://45.154.33.73:10100"
+  x_token: ~
+  commitment: finalized
+  connect_timeout_secs: 30
+  request_timeout_secs: 30
+  max_message_size: 67108864
+
+storage:
+  rocksdb:
+    path: "/mnt/nvme1/light-indexer/rocksdb"
+    write_buffer_size: 268435456
+    max_open_files: 512
+    enable_pipelined_writes: true
+    enable_wal: true
+
+  blocks:
+    path: "/mnt/nvme1/light-indexer/blocks"
+    compression: lz4
+    max_stored_blocks: 500000
+
+  postgres:
+    url: "postgres://solanadb:solanapwd@localhost:5432/solanadb"
+    max_connections: 50
+    min_connections: 5
+    connect_timeout_secs: 10
+    idle_timeout_secs: 300
+
+  pipeline:
+    source_to_write: 2048
+    write_to_read: 1024
+    read_to_rpc: 4096
+    pg_write_buffer: 10000
+
+rpc:
+  endpoint: "0.0.0.0:8877"
+  request_timeout_secs: 60
+  max_connections: 1024
+  workers: 0
+  upstream: ~
+  forwarded_methods: []
+
+metrics:
+  endpoint: "0.0.0.0:9092"
+
+threads:
+  source: 1
+  storage_write: 1
+  storage_read: 0
+  rpc: 0
