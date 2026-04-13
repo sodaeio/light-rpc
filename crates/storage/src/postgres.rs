@@ -36,16 +36,14 @@ impl PgStorage {
 
     /// Run schema migrations to ensure tables exist.
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS slot_status (
+        let statements = [
+            "CREATE TABLE IF NOT EXISTS slot_status (
                 slot BIGINT PRIMARY KEY,
                 parent_slot BIGINT,
                 block_time BIGINT,
                 status SMALLINT NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS token_mints (
+            )",
+            "CREATE TABLE IF NOT EXISTS token_mints (
                 pubkey BYTEA PRIMARY KEY,
                 slot BIGINT NOT NULL,
                 supply BIGINT,
@@ -54,9 +52,8 @@ impl PgStorage {
                 freeze_authority BYTEA,
                 raw_data BYTEA NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-
-            CREATE TABLE IF NOT EXISTS token_accounts (
+            )",
+            "CREATE TABLE IF NOT EXISTS token_accounts (
                 pubkey BYTEA PRIMARY KEY,
                 slot BIGINT NOT NULL,
                 mint BYTEA NOT NULL,
@@ -66,25 +63,24 @@ impl PgStorage {
                 state SMALLINT NOT NULL DEFAULT 0,
                 raw_data BYTEA NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-
-            CREATE TABLE IF NOT EXISTS address_transactions (
+            )",
+            "CREATE TABLE IF NOT EXISTS address_transactions (
                 address BYTEA NOT NULL,
                 slot BIGINT NOT NULL,
                 signature BYTEA NOT NULL,
                 block_time BIGINT,
                 err TEXT,
                 PRIMARY KEY (address, slot, signature)
-            );
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_token_accounts_owner ON token_accounts(owner)",
+            "CREATE INDEX IF NOT EXISTS idx_token_accounts_mint ON token_accounts(mint)",
+            "CREATE INDEX IF NOT EXISTS idx_address_transactions_slot ON address_transactions(address, slot DESC)",
+        ];
 
-            CREATE INDEX IF NOT EXISTS idx_token_accounts_owner ON token_accounts(owner);
-            CREATE INDEX IF NOT EXISTS idx_token_accounts_mint ON token_accounts(mint);
-            CREATE INDEX IF NOT EXISTS idx_address_transactions_slot ON address_transactions(address, slot DESC);
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("running migrations")?;
+        for stmt in statements {
+            sqlx::query(stmt).execute(&self.pool).await
+                .with_context(|| format!("migration failed: {}", &stmt[..stmt.len().min(60)]))?;
+        }
 
         info!("postgres migrations complete");
         Ok(())

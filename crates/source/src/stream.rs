@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use richat_client::grpc::ConfigGrpcClient;
 use richat_proto::geyser::{
-    subscribe_update::UpdateOneof, CommitmentLevel as RichatCommitment, SubscribeUpdate,
+    subscribe_update::UpdateOneof, SlotStatus as ProtoSlotStatus, SubscribeUpdate,
 };
 use richat_proto::richat::GrpcSubscribeRequest;
 use solana_pubkey::Pubkey;
@@ -56,9 +56,7 @@ impl SlotAccumulator {
         }
         match self.expected_tx_count {
             Some(expected) => {
-                self.transactions.len() == expected
-                    && self.blockhash.is_some()
-                    && self.encoded_block.is_some()
+                self.transactions.len() >= expected && self.blockhash.is_some()
             }
             None => false,
         }
@@ -276,15 +274,15 @@ impl StreamSource {
 
                         Some(UpdateOneof::Slot(slot_update)) => {
                             let slot = slot_update.slot;
-                            let status = match RichatCommitment::try_from(slot_update.status) {
-                                Ok(RichatCommitment::Confirmed) => {
+                            let status = match ProtoSlotStatus::try_from(slot_update.status) {
+                                Ok(ProtoSlotStatus::SlotConfirmed) => {
                                     tracker.set_confirmed(slot);
                                     metrics::LATEST_SLOT
                                         .with_label_values(&["confirmed"])
                                         .set(tracker.confirmed_slot() as i64);
                                     SlotStatus::Confirmed
                                 }
-                                Ok(RichatCommitment::Finalized) => {
+                                Ok(ProtoSlotStatus::SlotFinalized) => {
                                     tracker.set_finalized(slot);
                                     metrics::LATEST_SLOT
                                         .with_label_values(&["finalized"])
