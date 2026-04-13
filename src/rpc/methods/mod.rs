@@ -11,6 +11,16 @@ use crate::rpc::server::RpcContext;
 
 pub type RpcResult = Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>;
 
+const API_VERSION: &str = "2.2.4";
+
+/// Wrap a value in a Solana-compatible RpcResponse with context
+pub fn rpc_response(slot: u64, value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "context": { "slot": slot, "apiVersion": API_VERSION },
+        "value": value
+    })
+}
+
 /// Build the unified RPC module with all method handlers registered.
 pub fn build_rpc_module(context: RpcContext) -> Result<RpcModule<RpcContext>> {
     let mut module = RpcModule::new(context);

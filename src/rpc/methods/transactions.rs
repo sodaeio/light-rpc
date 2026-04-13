@@ -1,6 +1,7 @@
 use anyhow::Result;
 use jsonrpsee::RpcModule;
 
+use super::rpc_response;
 use crate::rpc::server::RpcContext;
 
 fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
@@ -34,13 +35,26 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
         match ctx.reader.get_signatures_for_address(&address, before_slot, limit) {
             Ok(sigs) => {
-                let results: Vec<serde_json::Value> = sigs.iter().map(|s| serde_json::json!({
-                    "signature": s.signature.to_string(),
-                    "slot": s.slot,
-                    "blockTime": s.block_time,
-                    "err": s.err,
-                    "memo": s.memo,
-                })).collect();
+                let finalized = ctx.reader.cache().finalized_slot();
+                let confirmed = ctx.reader.cache().confirmed_slot();
+                let results: Vec<serde_json::Value> = sigs.iter().map(|s| {
+                    let status = if s.slot <= finalized {
+                        "finalized"
+                    } else if s.slot <= confirmed {
+                        "confirmed"
+                    } else {
+                        "processed"
+                    };
+                    serde_json::json!({
+                        "signature": s.signature.to_string(),
+                        "slot": s.slot,
+                        "blockTime": s.block_time,
+                        "err": s.err,
+                        "memo": s.memo,
+                        "confirmationStatus": status,
+                    })
+                }).collect();
+                // getSignaturesForAddress returns array directly, no context wrapper
                 Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(results))
             }
             Err(e) => Err(err(-32603, &e.to_string())),
@@ -50,17 +64,35 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("getSignatureStatuses", |params, ctx, _| async move {
         let p: Vec<serde_json::Value> = params.parse()?;
         let sigs = p.first().and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let statuses: Vec<serde_json::Value> = sigs.iter().map(|_| serde_json::json!({
-            "slot": ctx.reader.cache().confirmed_slot(),
-            "confirmations": null,
-            "err": null,
-            "confirmationStatus": "finalized"
-        })).collect();
+        let slot = ctx.reader.cache().processed_slot();
+        let finalized = ctx.reader.cache().finalized_slot();
 
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-            "value": statuses,
-            "context": { "slot": ctx.reader.cache().processed_slot() }
-        }))
+        let statuses: Vec<serde_json::Value> = sigs.iter().map(|sig_val| {
+            let sig_str = sig_val.as_str().unwrap_or("");
+            let sig_bytes: Result<[u8; 64], _> = bs58::decode(sig_str).into_vec()
+                .map_err(|_| ())
+                .and_then(|v| v.try_into().map_err(|_| ()));
+
+            match sig_bytes {
+                Ok(bytes) => {
+                    match ctx.reader.get_transaction(&bytes) {
+                        Ok(Some(tx_info)) => {
+                            let tx_slot = tx_info["slot"].as_u64().unwrap_or(0);
+                            serde_json::json!({
+                                "slot": tx_slot,
+                                "confirmations": null,
+                                "err": tx_info.get("err").cloned().unwrap_or(serde_json::Value::Null),
+                                "confirmationStatus": if tx_slot <= finalized { "finalized" } else { "confirmed" },
+                            })
+                        }
+                        _ => serde_json::Value::Null,
+                    }
+                }
+                Err(_) => serde_json::Value::Null,
+            }
+        }).collect();
+
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(slot, serde_json::json!(statuses)))
     })?;
 
     Ok(())

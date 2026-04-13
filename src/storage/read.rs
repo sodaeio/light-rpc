@@ -181,17 +181,37 @@ impl StorageReader {
         })
     }
 
+    /// Format token account as Solana-compatible jsonParsed RpcKeyedAccount
     fn token_account_to_json(row: &super::postgres::TokenAccountRow) -> serde_json::Value {
+        let state = if row.frozen { "frozen" } else { "initialized" };
         serde_json::json!({
             "pubkey": bs58::encode(&row.pubkey).into_string(),
             "account": {
-                "mint": bs58::encode(&row.mint).into_string(),
-                "owner": bs58::encode(&row.owner).into_string(),
-                "amount": row.amount.to_string(),
-                "delegate": row.delegate.as_ref().map(|d| bs58::encode(d).into_string()),
-                "delegatedAmount": row.delegated_amount.to_string(),
-                "frozen": row.frozen,
-                "tokenProgram": bs58::encode(&row.token_program).into_string(),
+                "lamports": 2039280_u64, // rent-exempt minimum for token accounts
+                "data": {
+                    "program": "spl-token",
+                    "parsed": {
+                        "type": "account",
+                        "info": {
+                            "mint": bs58::encode(&row.mint).into_string(),
+                            "owner": bs58::encode(&row.owner).into_string(),
+                            "tokenAmount": {
+                                "amount": row.amount.to_string(),
+                                "decimals": 0,
+                                "uiAmount": null,
+                                "uiAmountString": row.amount.to_string(),
+                            },
+                            "delegate": row.delegate.as_ref().map(|d| bs58::encode(d).into_string()),
+                            "state": state,
+                            "isNative": false,
+                        }
+                    },
+                    "space": 165
+                },
+                "owner": bs58::encode(&row.token_program).into_string(),
+                "executable": false,
+                "rentEpoch": 18446744073709551615_u64,
+                "space": 165
             }
         })
     }
@@ -406,11 +426,25 @@ impl StorageReader {
     }
 
     pub async fn get_token_largest_accounts(&self, mint: &[u8], limit: i64) -> Result<Vec<serde_json::Value>> {
+        // Get decimals from mint for proper UI formatting
+        let decimals = if let Some(mint_row) = self.pg.get_token_mint(mint).await? {
+            mint_row.decimals
+        } else {
+            0
+        };
         let rows = self.pg.get_token_largest_accounts(mint, limit).await?;
         Ok(rows.iter().map(|row| {
+            let ui_amount = if decimals > 0 {
+                row.amount as f64 / 10f64.powi(decimals)
+            } else {
+                row.amount as f64
+            };
             serde_json::json!({
                 "address": bs58::encode(&row.pubkey).into_string(),
                 "amount": row.amount.to_string(),
+                "decimals": decimals,
+                "uiAmount": ui_amount,
+                "uiAmountString": format!("{ui_amount}"),
             })
         }).collect())
     }
