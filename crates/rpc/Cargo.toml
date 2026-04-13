@@ -1,0 +1,35 @@
+[package]
+name = "light-indexer-rpc"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+light-indexer-core = { workspace = true }
+light-indexer-storage = { workspace = true }
+
+solana-pubkey = { workspace = true }
+solana-signature = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+bs58 = { workspace = true }
+bytes = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+jsonrpsee = { workspace = true }
+jsonrpsee-core = { workspace = true }
+jsonrpsee-types = { workspace = true }
+hyper = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+prometheus = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }

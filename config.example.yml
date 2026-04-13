@@ -1,0 +1,60 @@
+# light-indexer configuration
+
+source:
+  # Richat / Yellowstone gRPC endpoint
+  endpoint: "http://127.0.0.1:10000"
+  x_token: ~
+  commitment: finalized
+  connect_timeout_secs: 10
+  request_timeout_secs: 10
+  max_message_size: 67108864  # 64MB
+
+storage:
+  rocksdb:
+    path: "data/rocksdb"
+    write_buffer_size: 268435456     # 256MB
+    max_open_files: 512
+    enable_pipelined_writes: true
+    enable_wal: true
+
+  blocks:
+    path: "data/blocks"
+    compression: lz4
+    max_stored_blocks: 500000
+
+  postgres:
+    url: "postgres://light_indexer:light_indexer@localhost:5432/light_indexer"
+    max_connections: 50
+    min_connections: 5
+    connect_timeout_secs: 10
+    idle_timeout_secs: 300
+
+  # Channel capacities for pipeline backpressure
+  pipeline:
+    source_to_write: 2048
+    write_to_read: 1024
+    read_to_rpc: 4096
+    pg_write_buffer: 10000
+
+rpc:
+  endpoint: "0.0.0.0:8876"
+  request_timeout_secs: 60
+  max_connections: 1024
+  workers: 0  # 0 = num_cpus
+
+  # Optional upstream validator RPC for forwarding write methods
+  upstream: ~
+
+  # Methods to forward to upstream instead of handling locally
+  forwarded_methods:
+    - sendTransaction
+    - simulateTransaction
+
+metrics:
+  endpoint: "0.0.0.0:9090"
+
+threads:
+  source: 1
+  storage_write: 1
+  storage_read: 0  # 0 = num_cpus / 2
+  rpc: 0           # 0 = num_cpus
