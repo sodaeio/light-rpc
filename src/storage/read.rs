@@ -533,6 +533,12 @@ impl StorageReader {
         pubkey: &[u8; 32],
         encoding: &str,
     ) -> Result<Option<serde_json::Value>> {
+        // Native program / sysvar registry (System, Vote, Stake, etc.)
+        // These never flow through the gRPC stream.
+        if let Some(stored) = super::native::lookup(pubkey) {
+            return Ok(Some(Self::account_to_json(&stored, encoding)));
+        }
+
         // RocksDB first (fast point lookup)
         if let Some(stored) = self.rocks_get_account(pubkey) {
             return Ok(Some(Self::account_to_json(&stored, encoding)));

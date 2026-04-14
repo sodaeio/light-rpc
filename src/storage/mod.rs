@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod files;
+pub mod native;
 pub mod postgres;
 pub mod read;
 pub mod rocks;

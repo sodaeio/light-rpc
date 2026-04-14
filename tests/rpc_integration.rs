@@ -187,7 +187,10 @@ async fn test_get_token_accounts_by_owner() {
     // Solana-compatible format: account.data.parsed.info.mint
     let info = &first["account"]["data"]["parsed"]["info"];
     assert!(info["mint"].is_string(), "should have mint in parsed info");
-    assert!(info["owner"].is_string(), "should have owner in parsed info");
+    assert!(
+        info["owner"].is_string(),
+        "should have owner in parsed info"
+    );
 }
 
 // --- Account methods ---
@@ -406,8 +409,8 @@ async fn test_rapid_fire_no_leak() {
 
 #[tokio::test]
 async fn test_consistency_token_supply_matches_reference() {
-    let ref_url = std::env::var("REF_RPC_URL")
-        .unwrap_or_else(|_| "https://solana-rpc.publicnode.com".into());
+    let ref_url =
+        std::env::var("REF_RPC_URL").unwrap_or_else(|_| "https://solana-rpc.publicnode.com".into());
 
     let client = reqwest::Client::new();
     let body = json!({"jsonrpc":"2.0","id":1,"method":"getTokenSupply","params":[USDC_MINT]});
@@ -421,13 +424,24 @@ async fn test_consistency_token_supply_matches_reference() {
     {
         Ok(r) => match r.json().await {
             Ok(v) => v,
-            Err(_) => { println!("reference RPC unavailable, skipping"); return; }
+            Err(_) => {
+                println!("reference RPC unavailable, skipping");
+                return;
+            }
         },
-        Err(_) => { println!("reference RPC unavailable, skipping"); return; }
+        Err(_) => {
+            println!("reference RPC unavailable, skipping");
+            return;
+        }
     };
     let li_resp = rpc_call("getTokenSupply", json!([USDC_MINT])).await;
 
-    let ref_decimals = ref_resp["result"]["value"]["decimals"].as_u64().unwrap_or(0);
+    let ref_decimals = ref_resp["result"]["value"]["decimals"]
+        .as_u64()
+        .unwrap_or(0);
     let li_decimals = li_resp["result"]["value"]["decimals"].as_u64().unwrap_or(0);
-    assert_eq!(ref_decimals, li_decimals, "USDC decimals should match reference");
+    assert_eq!(
+        ref_decimals, li_decimals,
+        "USDC decimals should match reference"
+    );
 }
