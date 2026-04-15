@@ -66,6 +66,7 @@ Validator (Richat gRPC)
 - `getTransaction` — transaction details by signature
 - `getSignaturesForAddress` — transaction history for an address
 - `getSignatureStatuses` — confirmation status of signatures
+- `getTransactionsForAddress` — full decoded transactions for a wallet, auto-expanding owned token accounts (ATAs) in one paginated call
 
 ### Account State
 - `getAccountInfo` — account data by pubkey

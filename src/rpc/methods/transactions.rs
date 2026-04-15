@@ -81,6 +81,37 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         }
     })?;
 
+    module.register_async_method("getTransactionsForAddress", |params, ctx, _| async move {
+        let p: Vec<serde_json::Value> = params.parse()?;
+        let address_str = p
+            .first()
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| err(-32602, "Invalid address"))?;
+        let address_bytes = bs58::decode(address_str)
+            .into_vec()
+            .map_err(|_| err(-32602, "Invalid encoding"))?;
+        if address_bytes.len() != 32 {
+            return Err(err(-32602, "Invalid pubkey length"));
+        }
+
+        let opts = p.get(1).and_then(|v| v.as_object());
+        let limit = opts
+            .and_then(|o| o.get("limit"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1000)
+            .min(10_000) as usize;
+        let before_slot = opts.and_then(|o| o.get("before")).and_then(|v| v.as_u64());
+
+        match ctx
+            .reader
+            .get_transactions_for_address(&address_bytes, before_slot, limit)
+            .await
+        {
+            Ok(results) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(results)),
+            Err(e) => Err(err(-32603, &e.to_string())),
+        }
+    })?;
+
     module.register_async_method("getSignatureStatuses", |params, ctx, _| async move {
         let p: Vec<serde_json::Value> = params.parse()?;
         let sigs = p.first().and_then(|v| v.as_array()).cloned().unwrap_or_default();

@@ -525,6 +525,47 @@ impl StorageReader {
         Ok(results)
     }
 
+    pub async fn get_transactions_for_address(
+        &self,
+        owner: &[u8],
+        before_slot: Option<Slot>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = self
+            .pg
+            .get_transactions_for_owner_with_atas(owner, before_slot, limit as i64)
+            .await?;
+        let finalized = self.cache.finalized_slot();
+        let confirmed = self.cache.confirmed_slot();
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let sig_bytes: [u8; 64] = match row.signature.as_slice().try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let tx = self
+                .get_transaction(&sig_bytes)?
+                .unwrap_or(serde_json::Value::Null);
+            let slot_u = row.slot as u64;
+            let status = if slot_u <= finalized {
+                "finalized"
+            } else if slot_u <= confirmed {
+                "confirmed"
+            } else {
+                "processed"
+            };
+            results.push(serde_json::json!({
+                "signature": bs58::encode(&row.signature).into_string(),
+                "slot": row.slot,
+                "blockTime": row.block_time,
+                "err": row.err,
+                "confirmationStatus": status,
+                "transaction": tx,
+            }));
+        }
+        Ok(results)
+    }
+
     // -- Public API: Account State --
     // RocksDB first for point lookups, PG fallback for program scans
 

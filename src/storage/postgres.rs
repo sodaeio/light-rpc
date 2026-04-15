@@ -389,6 +389,44 @@ impl PgStorage {
         Ok(rows)
     }
 
+    pub async fn get_transactions_for_owner_with_atas(
+        &self,
+        owner: &[u8],
+        before_slot: Option<Slot>,
+        limit: i64,
+    ) -> Result<Vec<AddressTransactionRow>> {
+        let rows: Vec<AddressTransactionRow> = if let Some(before) = before_slot {
+            sqlx::query_as(
+                "SELECT address, signature, slot, tx_index, block_time, err
+                 FROM address_transactions
+                 WHERE (address = $1
+                        OR address IN (SELECT pubkey FROM token_accounts WHERE owner = $1))
+                   AND slot < $2
+                 ORDER BY slot DESC, tx_index DESC
+                 LIMIT $3",
+            )
+            .bind(owner)
+            .bind(before as i64)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT address, signature, slot, tx_index, block_time, err
+                 FROM address_transactions
+                 WHERE address = $1
+                    OR address IN (SELECT pubkey FROM token_accounts WHERE owner = $1)
+                 ORDER BY slot DESC, tx_index DESC
+                 LIMIT $2",
+            )
+            .bind(owner)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(rows)
+    }
+
     pub async fn get_token_largest_accounts(
         &self,
         mint: &[u8],
