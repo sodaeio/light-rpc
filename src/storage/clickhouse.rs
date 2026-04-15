@@ -23,9 +23,101 @@
 use anyhow::{Context, Result};
 use clickhouse::Client;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 use crate::types::Slot;
+
+/// Job payload sent from the storage writer to the ClickHouse writer task.
+/// Kept as owned Vecs so the sender can return immediately (non-blocking).
+pub enum ClickHouseWriteJob {
+    Block(ClickHouseBlockBatch),
+}
+
+pub struct ClickHouseBlockBatch {
+    pub transactions: Vec<TransactionRow>,
+    pub token_owner_sigs: Vec<TokenOwnerSigRow>,
+    pub program_invocations: Vec<ProgramInvocationRow>,
+}
+
+/// Drains the ClickHouse write channel, batching per insert to match the
+/// 10k-100k row recommendation (rule: insert-batch-size). Flushes on
+/// threshold OR on a short timer so low-throughput slots still land.
+pub async fn clickhouse_writer_loop(
+    store: std::sync::Arc<ClickHouseStore>,
+    mut rx: mpsc::Receiver<ClickHouseWriteJob>,
+) {
+    use std::time::{Duration, Instant};
+
+    info!("clickhouse writer started");
+
+    const FLUSH_ROWS: usize = 50_000;
+    const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+
+    let mut tx_buf: Vec<TransactionRow> = Vec::with_capacity(FLUSH_ROWS);
+    let mut tok_buf: Vec<TokenOwnerSigRow> = Vec::with_capacity(FLUSH_ROWS);
+    let mut prog_buf: Vec<ProgramInvocationRow> = Vec::with_capacity(FLUSH_ROWS);
+    let mut last_flush = Instant::now();
+
+    loop {
+        let timeout = FLUSH_INTERVAL.saturating_sub(last_flush.elapsed());
+        let recv_result = tokio::time::timeout(timeout, rx.recv()).await;
+
+        match recv_result {
+            Ok(Some(ClickHouseWriteJob::Block(batch))) => {
+                tx_buf.extend(batch.transactions);
+                tok_buf.extend(batch.token_owner_sigs);
+                prog_buf.extend(batch.program_invocations);
+            }
+            Ok(None) => {
+                warn!("clickhouse channel closed, flushing and exiting");
+                flush(&store, &mut tx_buf, &mut tok_buf, &mut prog_buf).await;
+                return;
+            }
+            Err(_) => {
+                // Timer fired — flush whatever we have.
+            }
+        }
+
+        let should_flush = tx_buf.len() >= FLUSH_ROWS
+            || tok_buf.len() >= FLUSH_ROWS
+            || prog_buf.len() >= FLUSH_ROWS
+            || last_flush.elapsed() >= FLUSH_INTERVAL;
+
+        if should_flush
+            && !(tx_buf.is_empty() && tok_buf.is_empty() && prog_buf.is_empty())
+        {
+            flush(&store, &mut tx_buf, &mut tok_buf, &mut prog_buf).await;
+            last_flush = Instant::now();
+        }
+    }
+}
+
+async fn flush(
+    store: &ClickHouseStore,
+    tx_buf: &mut Vec<TransactionRow>,
+    tok_buf: &mut Vec<TokenOwnerSigRow>,
+    prog_buf: &mut Vec<ProgramInvocationRow>,
+) {
+    if !tx_buf.is_empty() {
+        if let Err(e) = store.insert_transactions(tx_buf).await {
+            error!(error = %e, rows = tx_buf.len(), "clickhouse transactions insert failed");
+        }
+        tx_buf.clear();
+    }
+    if !tok_buf.is_empty() {
+        if let Err(e) = store.insert_token_owner_sigs(tok_buf).await {
+            error!(error = %e, rows = tok_buf.len(), "clickhouse token_owner_sigs insert failed");
+        }
+        tok_buf.clear();
+    }
+    if !prog_buf.is_empty() {
+        if let Err(e) = store.insert_program_invocations(prog_buf).await {
+            error!(error = %e, rows = prog_buf.len(), "clickhouse program_invocations insert failed");
+        }
+        prog_buf.clear();
+    }
+}
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct ClickHouseConfig {

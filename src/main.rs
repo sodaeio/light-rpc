@@ -114,12 +114,37 @@ async fn run(config: Config) -> Result<()> {
     let cache_ref = Arc::clone(&memory_cache);
     tokio::spawn(async move { StorageReader::run_cache_updater(cache_ref, cache_rx).await });
 
-    let writer = StorageWriter::new(
+    #[allow(unused_mut)]
+    let mut writer = StorageWriter::new(
         rocks.clone(),
         files.as_ref().clone_for_writer(),
         pg_tx,
         broadcast_tx,
     );
+
+    // ClickHouse dual-write rollout: connect, migrate, spawn writer, attach
+    // to the StorageWriter. Feature-gated so builds without clickhouse
+    // dependency work unchanged.
+    #[cfg(feature = "clickhouse")]
+    {
+        use light_indexer::storage::clickhouse::{
+            clickhouse_writer_loop, ClickHouseStore,
+        };
+        if let Some(ch_cfg) = &config.storage.clickhouse {
+            let store = ClickHouseStore::connect(ch_cfg)
+                .await
+                .context("connecting to clickhouse")?;
+            let store = Arc::new(store);
+            let (ch_tx, ch_rx) = tokio::sync::mpsc::channel(4096);
+            let store_for_task = Arc::clone(&store);
+            tokio::spawn(async move {
+                clickhouse_writer_loop(store_for_task, ch_rx).await;
+            });
+            writer = writer.with_clickhouse(ch_tx);
+            info!("clickhouse dual-write enabled");
+        }
+    }
+
     tokio::spawn(async move {
         if let Err(e) = writer.run(source_rx).await {
             error!(error = %e, "storage writer failed");

@@ -23,6 +23,8 @@ pub struct StorageWriter {
     files: BlockFileStorage,
     pg_tx: mpsc::Sender<PgWriteJob>,
     broadcast_tx: broadcast::Sender<WriteToReadMessage>,
+    #[cfg(feature = "clickhouse")]
+    ch_tx: Option<mpsc::Sender<super::clickhouse::ClickHouseWriteJob>>,
 }
 
 /// Jobs sent to the isolated PostgreSQL writer task.
@@ -53,7 +55,18 @@ impl StorageWriter {
             files,
             pg_tx,
             broadcast_tx,
+            #[cfg(feature = "clickhouse")]
+            ch_tx: None,
         }
+    }
+
+    #[cfg(feature = "clickhouse")]
+    pub fn with_clickhouse(
+        mut self,
+        ch_tx: mpsc::Sender<super::clickhouse::ClickHouseWriteJob>,
+    ) -> Self {
+        self.ch_tx = Some(ch_tx);
+        self
     }
 
     /// Main write loop. Drains messages from the source and persists them.
@@ -181,7 +194,11 @@ impl StorageWriter {
                 .try_send(PgWriteJob::AddressTransactions(addr_tx_entries));
         }
 
-        // 6. Broadcast to read workers
+        // 6. ClickHouse dual-write (feature-gated, non-blocking)
+        #[cfg(feature = "clickhouse")]
+        self.send_to_clickhouse(slot, block);
+
+        // 7. Broadcast to read workers
         let _ = self.broadcast_tx.send(WriteToReadMessage::NewBlock {
             slot,
             block: Arc::clone(block),
@@ -190,6 +207,81 @@ impl StorageWriter {
         let elapsed = start.elapsed();
         metrics::STORAGE_WRITE_LATENCY.observe(elapsed.as_secs_f64());
         debug!(slot, elapsed_ms = elapsed.as_millis(), "block persisted");
+    }
+
+    #[cfg(feature = "clickhouse")]
+    fn send_to_clickhouse(&self, slot: Slot, block: &Arc<BlockWithData>) {
+        use super::clickhouse::{
+            ClickHouseBlockBatch, ClickHouseWriteJob, Pubkey32, Sig64, TransactionRow,
+        };
+
+        let Some(ch_tx) = &self.ch_tx else {
+            return;
+        };
+
+        // Invert address_signatures: per-signature list of addresses.
+        let mut sig_addrs: std::collections::HashMap<[u8; 64], Vec<[u8; 32]>> =
+            std::collections::HashMap::with_capacity(block.transactions.len());
+        for (address, sigs) in &block.address_signatures {
+            let addr_bytes: [u8; 32] = address.to_bytes();
+            for sig in sigs {
+                let sig_bytes: [u8; 64] = sig
+                    .signature
+                    .as_ref()
+                    .try_into()
+                    .unwrap_or([0u8; 64]);
+                sig_addrs.entry(sig_bytes).or_default().push(addr_bytes);
+            }
+        }
+
+        let block_time = block.info.block_time.unwrap_or(0);
+        let mut rows: Vec<TransactionRow> = Vec::with_capacity(block.transactions.len());
+        for (idx, tx) in block.transactions.iter().enumerate() {
+            let sig_bytes: [u8; 64] = tx
+                .signature
+                .as_ref()
+                .try_into()
+                .unwrap_or([0u8; 64]);
+            let addresses = sig_addrs
+                .remove(&sig_bytes)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|a| Pubkey32(a.to_vec()))
+                .collect::<Vec<_>>();
+            let addr_count = addresses.len();
+            let fee = block.fees.get(idx).copied().unwrap_or(0);
+            rows.push(TransactionRow {
+                slot,
+                tx_index: idx as u32,
+                signature: Sig64(sig_bytes.to_vec()),
+                block_time,
+                err: tx.err.is_some(),
+                fee,
+                // compute_units / message / meta / log_messages are populated
+                // once richat delivers the decoded tx payload; stub for now.
+                compute_units: 0,
+                addresses,
+                writable_mask: vec![0u8; addr_count],
+                signer_mask: vec![0u8; addr_count],
+                log_messages: Vec::new(),
+                message: String::new(),
+                meta: String::new(),
+            });
+        }
+
+        let batch = ClickHouseBlockBatch {
+            transactions: rows,
+            // token_owner_sigs and program_invocations require tx decoding —
+            // filled once the encoded_block parser lands.
+            token_owner_sigs: Vec::new(),
+            program_invocations: Vec::new(),
+        };
+
+        if ch_tx.try_send(ClickHouseWriteJob::Block(batch)).is_err() {
+            // Channel full: drop the batch rather than block the pipeline.
+            // ClickHouse dual-write is best-effort during rollout.
+            tracing::warn!(slot, "clickhouse channel full, dropping batch");
+        }
     }
 
     async fn handle_slot_status(&self, slot: Slot, _parent_slot: Option<Slot>, status: SlotStatus) {

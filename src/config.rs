@@ -39,6 +39,9 @@ pub struct StorageConfig {
     pub postgres: PostgresConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    #[cfg(feature = "clickhouse")]
+    #[serde(default)]
+    pub clickhouse: Option<crate::storage::clickhouse::ClickHouseConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

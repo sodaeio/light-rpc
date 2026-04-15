@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rocksdb::{
-    BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded,
-    Options, SliceTransform, WriteBatch,
+    BlockBasedIndexType, BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor,
+    DBCompressionType, DBWithThreadMode, MultiThreaded, Options, SliceTransform, WriteBatch,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -39,6 +39,50 @@ fn apply_cf_compaction_tuning(opts: &mut Options) {
     opts.set_target_file_size_base(64 * 1024 * 1024);
     opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
     opts.set_max_bytes_for_level_multiplier(10.0);
+    // Dynamic level sizing lets RocksDB rebalance level byte targets as data
+    // arrives — prevents the "L2 empty, L3 full" imbalance that wastes disk.
+    opts.set_level_compaction_dynamic_level_bytes(true);
+    // ZSTD on bottom level: 2-3× better compression than LZ4, at negligible
+    // read cost (only touched during deep cold queries).
+    opts.set_bottommost_compression_type(DBCompressionType::Zstd);
+    opts.set_bottommost_zstd_max_train_bytes(0, true);
+}
+
+/// Build a BlockBasedOptions factory with production-grade defaults.
+///   - Partitioned index + filters: the top-level index stays in the block
+///     cache; leaf index blocks load on demand. Massive memory saving once
+///     the DB grows past ~100GB.
+///   - Bloom filter size 10 bits/key: standard, ~1% false-positive rate.
+///   - Whole-key filtering: required for prefix-scan CFs that also do point
+///     gets on the full key.
+///   - Cache index+filter blocks: keeps hot index pages pinned.
+///   - Format v5: supports all modern features incl. compressed blocks.
+fn build_block_opts(
+    cache: &Cache,
+    block_size: usize,
+    with_bloom: bool,
+    prefix_bloom: bool,
+) -> BlockBasedOptions {
+    let mut bo = BlockBasedOptions::default();
+    bo.set_block_cache(cache);
+    bo.set_block_size(block_size);
+    bo.set_format_version(5);
+    bo.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
+    bo.set_partition_filters(true);
+    bo.set_metadata_block_size(4096);
+    bo.set_cache_index_and_filter_blocks(true);
+    bo.set_pin_top_level_index_and_filter(true);
+    bo.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    if with_bloom {
+        bo.set_bloom_filter(10.0, false);
+        if prefix_bloom {
+            // Per-CF prefix bloom: matches fixed-prefix iterator seeks, so
+            // `iter_sfa` / `get_program_accounts` skip entire SSTs that
+            // can't contain the queried prefix.
+            bo.set_whole_key_filtering(false);
+        }
+    }
+    bo
 }
 
 type DB = DBWithThreadMode<MultiThreaded>;
@@ -54,7 +98,7 @@ impl UnifiedRocksDb {
 
         // Shared block cache across all CFs — bounds total memory usage.
         // Without this, each CF allocates its own unbounded cache.
-        let cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024); // 512MB shared
+        let cache = Cache::new_lru_cache(1024 * 1024 * 1024); // 1 GiB shared
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
@@ -71,6 +115,21 @@ impl UnifiedRocksDb {
         db_opts.set_max_background_jobs(parallelism.max(4));
         // Force L0 to drain even during low-write periods; prevents silent accumulation.
         db_opts.set_periodic_compaction_seconds(3600);
+
+        // Rate-limit background I/O so compaction doesn't starve reads
+        // during burst ingest. 200 MB/s matches a mid-range NVMe sustained
+        // write; bump to 400-800 on enterprise SSDs.
+        db_opts.set_ratelimiter(200 * 1024 * 1024, 100_000, 10);
+
+        // Enable detailed statistics; `rocks.get_property` calls surface
+        // these as Prometheus gauges via update_metrics().
+        db_opts.enable_statistics();
+        db_opts.set_stats_dump_period_sec(600);
+        db_opts.set_report_bg_io_stats(true);
+
+        // Keep recovered WAL segments to let `compact_all` run safely on
+        // crash-restart without losing in-flight writes.
+        db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
 
         if config.enable_pipelined_writes {
             db_opts.set_enable_pipelined_write(true);
@@ -90,59 +149,61 @@ impl UnifiedRocksDb {
         Ok(Self { db: Arc::new(db) })
     }
 
-    fn slot_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn slot_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
+        // Point lookup by slot, small JSON value. 4KB blocks optimal.
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
+        let block_opts = build_block_opts(cache, 4 * 1024, false, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_SLOT_INDEX, opts)
     }
 
-    fn tx_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn tx_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
+        // Point lookup by signature, medium-large serialized tx meta (~1-10KB).
+        // 16KB blocks amortize compression headers over more rows.
+        // Bloom on signature gives us ~1% FP on point gets.
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 16 * 1024, true, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_TX_INDEX, opts)
     }
 
-    fn sfa_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn sfa_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
+        // Prefix scan by 32-byte address. Prefix bloom lets SSTs that
+        // don't contain the address be skipped without opening them.
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        opts.set_memtable_prefix_bloom_ratio(0.1);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 16 * 1024, true, true);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_SFA_INDEX, opts)
     }
 
-    fn accounts_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn accounts_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
+        // Point lookup by pubkey. Small-medium account blobs.
+        // Bloom filter turns cold misses into O(1) skips.
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 8 * 1024, true, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_ACCOUNTS, opts)
     }
 
-    fn program_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn program_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
+        // Prefix scan by program_id. Keys are 64 bytes; values empty.
+        // Prefix bloom + small block size maximizes index density.
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        opts.set_memtable_prefix_bloom_ratio(0.1);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 4 * 1024, true, true);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_PROGRAM_INDEX, opts)
     }
