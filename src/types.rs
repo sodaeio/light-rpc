@@ -77,9 +77,10 @@ pub struct BlockWithData {
 #[derive(Debug, Clone)]
 pub struct TransactionEntry {
     pub signature: solana_signature::Signature,
-    pub offset: u32,
-    pub length: u32,
+    pub tx_index: u32,
     pub err: Option<String>,
+    /// prost-encoded SubscribeUpdateTransactionInfo.
+    pub payload: bytes::Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

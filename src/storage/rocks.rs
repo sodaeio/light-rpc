@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rocksdb::{
-    BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded,
-    Options, SliceTransform, WriteBatch,
+    BlockBasedIndexType, BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor,
+    DBCompressionType, DBWithThreadMode, MultiThreaded, Options, SliceTransform, WriteBatch,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -10,14 +10,9 @@ use crate::config::RocksDbConfig;
 use crate::metrics;
 use crate::types::*;
 
-/// Column family names for all indexed data.
-///
-/// Block pipeline CFs (history queries):
 const CF_SLOT_INDEX: &str = "slot_index";
 const CF_TX_INDEX: &str = "tx_index";
 const CF_SFA_INDEX: &str = "sfa_index";
-
-/// Account pipeline CFs (state queries):
 const CF_ACCOUNTS: &str = "accounts";
 const CF_PROGRAM_INDEX: &str = "program_index";
 
@@ -29,9 +24,6 @@ const ALL_CFS: &[&str] = &[
     CF_PROGRAM_INDEX,
 ];
 
-/// Apply shared compaction tuning to a CF's options.
-/// Without this, RocksDB uses defaults (L0 trigger=4, unbounded level sizes)
-/// which falls behind under high ingest and piles up thousands of L0 SSTs.
 fn apply_cf_compaction_tuning(opts: &mut Options) {
     opts.set_level_zero_file_num_compaction_trigger(2);
     opts.set_level_zero_slowdown_writes_trigger(20);
@@ -39,6 +31,36 @@ fn apply_cf_compaction_tuning(opts: &mut Options) {
     opts.set_target_file_size_base(64 * 1024 * 1024);
     opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
     opts.set_max_bytes_for_level_multiplier(10.0);
+    opts.set_level_compaction_dynamic_level_bytes(true);
+    opts.set_bottommost_compression_type(DBCompressionType::Zstd);
+    opts.set_bottommost_zstd_max_train_bytes(0, true);
+}
+
+fn build_block_opts(
+    cache: &Cache,
+    block_size: usize,
+    with_bloom: bool,
+    prefix_bloom: bool,
+) -> BlockBasedOptions {
+    let mut bo = BlockBasedOptions::default();
+    bo.set_block_cache(cache);
+    bo.set_block_size(block_size);
+    bo.set_format_version(5);
+    bo.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
+    bo.set_partition_filters(true);
+    bo.set_metadata_block_size(4096);
+    bo.set_cache_index_and_filter_blocks(true);
+    bo.set_pin_top_level_index_and_filter(true);
+    bo.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    if with_bloom {
+        bo.set_bloom_filter(10.0, false);
+        if prefix_bloom {
+            // Prefix bloom only; point gets on prefix-scan CFs fall back
+            // to the full iterator.
+            bo.set_whole_key_filtering(false);
+        }
+    }
+    bo
 }
 
 type DB = DBWithThreadMode<MultiThreaded>;
@@ -54,12 +76,11 @@ impl UnifiedRocksDb {
 
         // Shared block cache across all CFs — bounds total memory usage.
         // Without this, each CF allocates its own unbounded cache.
-        let cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024); // 512MB shared
+        let cache = Cache::new_lru_cache(1024 * 1024 * 1024); // 1 GiB shared
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        // Per-CF write buffer. 5 CFs × 64MB × 2 (active + flushing) = 640MB max memtables.
         db_opts.set_write_buffer_size(64 * 1024 * 1024);
         db_opts.set_max_write_buffer_number(2);
         db_opts.set_max_open_files(config.max_open_files);
@@ -69,8 +90,15 @@ impl UnifiedRocksDb {
             .unwrap_or(4);
         db_opts.increase_parallelism(parallelism);
         db_opts.set_max_background_jobs(parallelism.max(4));
-        // Force L0 to drain even during low-write periods; prevents silent accumulation.
         db_opts.set_periodic_compaction_seconds(3600);
+
+        // 200 MB/s — tune up on enterprise SSDs.
+        db_opts.set_ratelimiter(200 * 1024 * 1024, 100_000, 10);
+
+        db_opts.enable_statistics();
+        db_opts.set_stats_dump_period_sec(600);
+        db_opts.set_report_bg_io_stats(true);
+        db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
 
         if config.enable_pipelined_writes {
             db_opts.set_enable_pipelined_write(true);
@@ -90,59 +118,51 @@ impl UnifiedRocksDb {
         Ok(Self { db: Arc::new(db) })
     }
 
-    fn slot_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn slot_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
+        let block_opts = build_block_opts(cache, 4 * 1024, false, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_SLOT_INDEX, opts)
     }
 
-    fn tx_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn tx_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 16 * 1024, true, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_TX_INDEX, opts)
     }
 
-    fn sfa_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn sfa_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        opts.set_memtable_prefix_bloom_ratio(0.1);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 16 * 1024, true, true);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_SFA_INDEX, opts)
     }
 
-    fn accounts_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn accounts_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 8 * 1024, true, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_ACCOUNTS, opts)
     }
 
-    fn program_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn program_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        opts.set_memtable_prefix_bloom_ratio(0.1);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 4 * 1024, true, true);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_PROGRAM_INDEX, opts)
     }
@@ -288,9 +308,7 @@ impl UnifiedRocksDb {
         &self.db
     }
 
-    /// Force a full-range compaction on every CF. Blocking and expensive —
-    /// use once after recovery or on a scheduled maintenance window to drain
-    /// an accumulated L0 backlog. Safe to call while serving reads.
+    /// Blocking full-range compaction across all CFs.
     pub fn compact_all(&self) -> Result<()> {
         for name in ALL_CFS {
             let cf = self.cf(name);
@@ -300,8 +318,57 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Refresh Prometheus gauges for per-CF SST counts, L0 file counts, and
-    /// estimated live data size. Call on a timer (e.g. every 60s) from main.
+    /// Delete sfa_index entries older than `cutoff_slot`, walking the CF
+    /// once and issuing one DeleteRange per distinct address.
+    pub fn prune_sfa_before(&self, cutoff_slot: Slot) -> Result<u64> {
+        let cf = self.cf(CF_SFA_INDEX);
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut dropped = 0u64;
+        let mut last_address: Option<[u8; 32]> = None;
+
+        while iter.valid() {
+            let Some(key) = iter.key() else { break };
+            if key.len() < 40 {
+                iter.next();
+                continue;
+            }
+            let address: [u8; 32] = key[0..32].try_into().unwrap();
+
+            if Some(address) == last_address {
+                iter.next();
+                continue;
+            }
+            last_address = Some(address);
+
+            // Range: [address | 0] .. [address | cutoff]
+            let mut start = Vec::with_capacity(40);
+            start.extend_from_slice(&address);
+            start.extend_from_slice(&0u64.to_be_bytes());
+            let mut end = Vec::with_capacity(40);
+            end.extend_from_slice(&address);
+            end.extend_from_slice(&cutoff_slot.to_be_bytes());
+
+            self.db.delete_range_cf(&cf, &start, &end)?;
+            dropped += 1;
+
+            let mut next_prefix = address;
+            for i in (0..32).rev() {
+                if next_prefix[i] < u8::MAX {
+                    next_prefix[i] += 1;
+                    for j in i + 1..32 {
+                        next_prefix[j] = 0;
+                    }
+                    break;
+                }
+            }
+            iter.seek(next_prefix);
+        }
+
+        Ok(dropped)
+    }
+
     pub fn update_metrics(&self) {
         for name in ALL_CFS {
             let cf = self.cf(name);
@@ -324,7 +391,6 @@ impl UnifiedRocksDb {
                     .set(total as i64);
             }
 
-            // num-live-sst-files is tracked via total across all levels.
             let mut total_sst = 0i64;
             for level in 0..7 {
                 let prop = format!("rocksdb.num-files-at-level{level}");

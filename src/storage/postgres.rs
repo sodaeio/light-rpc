@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::ConnectOptions;
+use std::str::FromStr;
 use std::time::Duration;
 use tracing::info;
 
@@ -13,12 +15,35 @@ pub struct PgStorage {
 
 impl PgStorage {
     pub async fn connect(config: &PostgresConfig) -> Result<Self> {
+        let connect_opts = PgConnectOptions::from_str(&config.url)
+            .context("parsing postgres url")?
+            .application_name("light-indexer")
+            .log_statements(tracing::log::LevelFilter::Trace)
+            .log_slow_statements(
+                tracing::log::LevelFilter::Warn,
+                Duration::from_secs(1),
+            );
+
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
             .acquire_timeout(Duration::from_secs(config.connect_timeout_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
-            .connect(&config.url)
+            .max_lifetime(Duration::from_secs(1800))
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::Executor::execute(
+                        conn,
+                        "SET statement_timeout = '60s';
+                         SET lock_timeout = '10s';
+                         SET idle_in_transaction_session_timeout = '5min';
+                         SET jit = off;",
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .connect_with(connect_opts)
             .await
             .context("connecting to postgres")?;
 
@@ -30,17 +55,13 @@ impl PgStorage {
         &self.pool
     }
 
-    /// Create tables matching the existing DAS schema (solanadb).
-    /// Safe to run against an already-populated database — all IF NOT EXISTS.
     pub async fn migrate(&self) -> Result<()> {
         let statements = [
-            // Slot tracking
             "CREATE TABLE IF NOT EXISTS slot_metas (
                 slot BIGINT PRIMARY KEY
             )",
             "CREATE INDEX IF NOT EXISTS idx_slot_desc ON slot_metas(slot DESC)",
 
-            // Token mints — matches DAS `tokens` table
             "CREATE TABLE IF NOT EXISTS tokens (
                 mint BYTEA PRIMARY KEY,
                 supply NUMERIC(20,0) NOT NULL DEFAULT 0,
@@ -54,7 +75,6 @@ impl PgStorage {
                 extensions JSONB
             )",
 
-            // Token accounts — matches DAS `token_accounts` table
             "CREATE TABLE IF NOT EXISTS token_accounts (
                 pubkey BYTEA PRIMARY KEY,
                 mint BYTEA NOT NULL,
@@ -69,22 +89,14 @@ impl PgStorage {
                 extensions JSONB
             )",
             "CREATE INDEX IF NOT EXISTS idx_token_accounts_mint_owner ON token_accounts(mint, owner)",
-
-            // Address transactions — matches DAS `address_transactions` table
-            "CREATE TABLE IF NOT EXISTS address_transactions (
-                address BYTEA NOT NULL,
-                signature BYTEA NOT NULL,
-                slot BIGINT NOT NULL,
-                tx_index INTEGER,
-                block_time BIGINT,
-                err BOOLEAN NOT NULL DEFAULT false,
-                balance_changed BOOLEAN NOT NULL DEFAULT false,
-                post_balance BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (address, signature)
+            "ALTER TABLE token_accounts SET (fillfactor = 85)",
+            "ALTER TABLE token_accounts SET (
+                autovacuum_vacuum_scale_factor = 0.05,
+                autovacuum_analyze_scale_factor = 0.02,
+                autovacuum_vacuum_cost_delay = 10
             )",
-            "CREATE INDEX IF NOT EXISTS idx_addr_txn_address_slot
-                ON address_transactions(address, slot DESC, tx_index DESC)
-                INCLUDE (signature, block_time, err, balance_changed)",
+            // idx_token_accounts_owner must be built manually — see MIGRATIONS.md.
+
         ];
 
         for stmt in statements {
@@ -94,8 +106,167 @@ impl PgStorage {
                 .with_context(|| format!("migration: {}", &stmt[..stmt.len().min(60)]))?;
         }
 
+        self.migrate_address_transactions_partitioned().await?;
+        self.bootstrap_address_partitions().await?;
+
         info!("postgres migrations complete");
         Ok(())
+    }
+
+    async fn bootstrap_address_partitions(&self) -> Result<()> {
+        // Use slot_metas (has idx_slot_desc); MAX(slot) on the legacy
+        // table is a full seq scan.
+        let latest: Option<i64> = sqlx::query_scalar(
+            "SELECT slot FROM slot_metas ORDER BY slot DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+
+        let seed_slot = latest.unwrap_or(413_000_000).max(0) as u64;
+        let current_partition = (seed_slot as i64) / Self::SLOTS_PER_PARTITION;
+        let start = (current_partition - 2).max(0);
+        for p in start..=current_partition + 4 {
+            let lower = p * Self::SLOTS_PER_PARTITION;
+            let upper = (p + 1) * Self::SLOTS_PER_PARTITION;
+            let name = format!("address_transactions_p{p:07}");
+            let sql = format!(
+                "CREATE TABLE IF NOT EXISTS {name}
+                 PARTITION OF address_transactions
+                 FOR VALUES FROM ({lower}) TO ({upper})"
+            );
+            sqlx::query(&sql).execute(&self.pool).await?;
+        }
+
+        info!(
+            seed_slot,
+            partitions_created = (current_partition + 4 - start + 1),
+            "bootstrapped address_transactions partitions"
+        );
+        Ok(())
+    }
+
+    async fn migrate_address_transactions_partitioned(&self) -> Result<()> {
+        let partitioned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_partitioned_table pt
+                JOIN pg_class c ON c.oid = pt.partrelid
+                WHERE c.relname = 'address_transactions'
+            )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        if partitioned {
+            return Ok(());
+        }
+
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_tables
+                WHERE tablename = 'address_transactions' AND schemaname = 'public'
+            )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        if exists {
+            sqlx::query(
+                "ALTER TABLE address_transactions RENAME TO address_transactions_legacy",
+            )
+            .execute(&self.pool)
+            .await?;
+            info!("renamed address_transactions to address_transactions_legacy");
+        }
+
+        sqlx::query(
+            "CREATE TABLE address_transactions (
+                address BYTEA NOT NULL,
+                signature BYTEA NOT NULL,
+                slot BIGINT NOT NULL,
+                tx_index INTEGER,
+                block_time BIGINT,
+                err BOOLEAN NOT NULL DEFAULT false,
+                balance_changed BOOLEAN NOT NULL DEFAULT false,
+                post_balance BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (address, signature, slot)
+            ) PARTITION BY RANGE (slot)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_addr_txn_address_slot
+             ON address_transactions(address, slot DESC, tx_index DESC)
+             INCLUDE (signature, block_time, err, balance_changed)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_addr_txn_slot_brin
+             ON address_transactions USING BRIN (slot) WITH (pages_per_range = 16)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        info!("address_transactions is now partitioned by slot");
+        Ok(())
+    }
+
+    /// ~1 week at 2.5 slots/sec.
+    const SLOTS_PER_PARTITION: i64 = 1_500_000;
+
+    pub async fn ensure_address_partitions(&self, current_slot: Slot, ahead: i64) -> Result<()> {
+        let current_partition = (current_slot as i64) / Self::SLOTS_PER_PARTITION;
+        for i in 0..=ahead {
+            let p = current_partition + i;
+            let lower = p * Self::SLOTS_PER_PARTITION;
+            let upper = (p + 1) * Self::SLOTS_PER_PARTITION;
+            let name = format!("address_transactions_p{p:07}");
+            let sql = format!(
+                "CREATE TABLE IF NOT EXISTS {name}
+                 PARTITION OF address_transactions
+                 FOR VALUES FROM ({lower}) TO ({upper})"
+            );
+            sqlx::query(&sql).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    /// Returns names of partitions dropped.
+    pub async fn drop_address_partitions_before(
+        &self,
+        cutoff_slot: Slot,
+    ) -> Result<Vec<String>> {
+        let cutoff = cutoff_slot as i64;
+        let partitions: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname FROM pg_class c
+             JOIN pg_inherits i ON c.oid = i.inhrelid
+             JOIN pg_class parent ON parent.oid = i.inhparent
+             WHERE parent.relname = 'address_transactions'
+               AND c.relkind = 'r'
+             ORDER BY c.relname",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut dropped = Vec::new();
+        for name in partitions {
+            let Some(rest) = name.strip_prefix("address_transactions_p") else {
+                continue;
+            };
+            let Ok(p) = rest.parse::<i64>() else {
+                continue;
+            };
+            let upper = (p + 1) * Self::SLOTS_PER_PARTITION;
+            if upper <= cutoff {
+                let sql = format!("DROP TABLE IF EXISTS {name}");
+                sqlx::query(&sql).execute(&self.pool).await?;
+                dropped.push(name);
+            }
+        }
+        Ok(dropped)
     }
 
     // --- Write operations (called from pg_writer_loop) ---
@@ -389,23 +560,38 @@ impl PgStorage {
         Ok(rows)
     }
 
+    /// Guards against custodial wallets with millions of ATAs.
+    const GTFA_ATA_CAP: i64 = 2048;
+
     pub async fn get_transactions_for_owner_with_atas(
         &self,
         owner: &[u8],
         before_slot: Option<Slot>,
         limit: i64,
     ) -> Result<Vec<AddressTransactionRow>> {
+        let ata_pubkeys: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT pubkey FROM token_accounts
+             WHERE owner = $1
+             LIMIT $2",
+        )
+        .bind(owner)
+        .bind(Self::GTFA_ATA_CAP)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut addrs: Vec<Vec<u8>> = Vec::with_capacity(ata_pubkeys.len() + 1);
+        addrs.push(owner.to_vec());
+        addrs.extend(ata_pubkeys);
+
         let rows: Vec<AddressTransactionRow> = if let Some(before) = before_slot {
             sqlx::query_as(
                 "SELECT address, signature, slot, tx_index, block_time, err
                  FROM address_transactions
-                 WHERE (address = $1
-                        OR address IN (SELECT pubkey FROM token_accounts WHERE owner = $1))
-                   AND slot < $2
+                 WHERE address = ANY($1::bytea[]) AND slot < $2
                  ORDER BY slot DESC, tx_index DESC
                  LIMIT $3",
             )
-            .bind(owner)
+            .bind(&addrs)
             .bind(before as i64)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -414,12 +600,11 @@ impl PgStorage {
             sqlx::query_as(
                 "SELECT address, signature, slot, tx_index, block_time, err
                  FROM address_transactions
-                 WHERE address = $1
-                    OR address IN (SELECT pubkey FROM token_accounts WHERE owner = $1)
+                 WHERE address = ANY($1::bytea[])
                  ORDER BY slot DESC, tx_index DESC
                  LIMIT $2",
             )
-            .bind(owner)
+            .bind(&addrs)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?

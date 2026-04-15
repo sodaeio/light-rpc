@@ -21,6 +21,10 @@ pub struct MemoryCache {
     processed_slot: AtomicU64,
     confirmed_slot: AtomicU64,
     finalized_slot: AtomicU64,
+    /// Unix timestamp (seconds) of the most recent finalized-slot update.
+    /// Drives the /readyz liveness check: if no finalized update for N
+    /// seconds the ingest pipeline is considered stalled.
+    finalized_slot_updated_at: AtomicU64,
 }
 
 impl MemoryCache {
@@ -31,7 +35,20 @@ impl MemoryCache {
             processed_slot: AtomicU64::new(0),
             confirmed_slot: AtomicU64::new(0),
             finalized_slot: AtomicU64::new(0),
+            finalized_slot_updated_at: AtomicU64::new(0),
         }
+    }
+
+    pub fn finalized_slot_age_secs(&self) -> u64 {
+        let last = self.finalized_slot_updated_at.load(Ordering::Relaxed);
+        if last == 0 {
+            return u64::MAX;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.saturating_sub(last)
     }
 
     pub fn processed_slot(&self) -> Slot {
@@ -84,6 +101,11 @@ impl MemoryCache {
         if slot > current {
             self.finalized_slot.store(slot, Ordering::Relaxed);
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.finalized_slot_updated_at.store(now, Ordering::Relaxed);
         self.gc(slot);
     }
 
@@ -497,7 +519,7 @@ impl StorageReader {
 
     pub fn get_transaction(&self, signature: &[u8; 64]) -> Result<Option<serde_json::Value>> {
         if let Some(data) = self.rocks.get_tx_index(signature)? {
-            return Ok(Some(serde_json::from_slice(&data)?));
+            return Ok(Some(crate::rpc::tx_format::decode_tx_index(&data)?));
         }
         Ok(None)
     }
