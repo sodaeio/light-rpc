@@ -676,37 +676,15 @@ impl StorageReader {
         program_id: &[u8; 32],
         encoding: &str,
     ) -> Result<Vec<serde_json::Value>> {
-        // RocksDB prefix scan
         let rocks_result = self.rocks.get_program_accounts(program_id)?;
-        if !rocks_result.is_empty() {
-            return Ok(rocks_result
-                .iter()
-                .filter_map(|(pubkey, data)| {
-                    StoredAccount::deserialize(data).map(|account| {
-                        serde_json::json!({
-                            "pubkey": bs58::encode(pubkey).into_string(),
-                            "account": Self::account_to_json(&account, encoding)
-                        })
-                    })
-                })
-                .collect());
-        }
-
-        // PostgreSQL program_accounts table
-        let rows = self.pg.get_program_accounts_pg(program_id).await?;
-        Ok(rows
+        Ok(rocks_result
             .iter()
-            .map(|row| {
-                serde_json::json!({
-                    "pubkey": bs58::encode(&row.pubkey).into_string(),
-                    "account": {
-                        "lamports": row.lamports,
-                        "owner": bs58::encode(&row.owner).into_string(),
-                        "data": [bs58::encode(&row.data).into_string(), "base58"],
-                        "executable": row.executable,
-                        "rentEpoch": row.rent_epoch,
-                        "space": row.data.len(),
-                    }
+            .filter_map(|(pubkey, data)| {
+                StoredAccount::deserialize(data).map(|account| {
+                    serde_json::json!({
+                        "pubkey": bs58::encode(pubkey).into_string(),
+                        "account": Self::account_to_json(&account, encoding)
+                    })
                 })
             })
             .collect())

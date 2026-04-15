@@ -117,7 +117,11 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     })?;
 
     module.register_async_method("getBlockTime", |params, ctx, _| async move {
-        let (slot,): (Slot,) = params.parse()?;
+        let p: Vec<serde_json::Value> = params.parse()?;
+        let slot: Slot = p
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| err(-32602, "Invalid slot"))?;
         match ctx.reader.get_block(slot) {
             Ok(Some(block)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(
                 block.info.block_time
