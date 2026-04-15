@@ -519,7 +519,7 @@ impl StorageReader {
 
     pub fn get_transaction(&self, signature: &[u8; 64]) -> Result<Option<serde_json::Value>> {
         if let Some(data) = self.rocks.get_tx_index(signature)? {
-            return Ok(Some(serde_json::from_slice(&data)?));
+            return Ok(Some(crate::rpc::tx_format::decode_tx_index(&data)?));
         }
         Ok(None)
     }

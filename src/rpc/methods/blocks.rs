@@ -12,26 +12,60 @@ fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
 
 pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("getBlock", |params, ctx, _| async move {
-        let (slot,): (Slot,) = params.parse()?;
+        // Accept both `[slot]` and `[slot, config]` shapes.
+        // Standard Solana RPC clients always pass config with at least
+        // maxSupportedTransactionVersion — rejecting that breaks every
+        // mainstream wallet and explorer. We honor transactionDetails
+        // to return the lighter payload when callers don't need full tx.
+        let p: Vec<serde_json::Value> = params.parse()?;
+        let slot: Slot = p
+            .first()
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| err(-32602, "Invalid slot"))?;
+        let cfg = p.get(1).and_then(|v| v.as_object());
+        let tx_details = cfg
+            .and_then(|o| o.get("transactionDetails"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("full");
+        let include_rewards = cfg
+            .and_then(|o| o.get("rewards"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         match ctx.reader.get_block(slot) {
-            Ok(Some(block)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-                "blockhash": block.info.blockhash,
-                "previousBlockhash": null,
-                "parentSlot": block.info.parent_slot,
-                "blockTime": block.info.block_time,
-                "blockHeight": block.info.block_height,
-                "rewards": [],
-                "transactions": block.transactions.iter().map(|t| serde_json::json!({
-                    "transaction": [t.signature.to_string()],
-                    "meta": {
-                        "err": t.err.as_ref().map(|e| serde_json::json!(e)),
-                        "fee": 0,
-                        "preBalances": [],
-                        "postBalances": [],
-                    },
-                    "version": "legacy",
-                })).collect::<Vec<_>>(),
-            })),
+            Ok(Some(block)) => {
+                let transactions = match tx_details {
+                    "none" => serde_json::Value::Array(Vec::new()),
+                    "signatures" => serde_json::json!(block
+                        .transactions
+                        .iter()
+                        .map(|t| t.signature.to_string())
+                        .collect::<Vec<_>>()),
+                    _ => serde_json::json!(block
+                        .transactions
+                        .iter()
+                        .map(|t| serde_json::json!({
+                            "transaction": [t.signature.to_string()],
+                            "meta": {
+                                "err": t.err.as_ref().map(|e| serde_json::json!(e)),
+                                "fee": 0,
+                                "preBalances": [],
+                                "postBalances": [],
+                            },
+                            "version": "legacy",
+                        }))
+                        .collect::<Vec<_>>()),
+                };
+                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                    "blockhash": block.info.blockhash,
+                    "previousBlockhash": null,
+                    "parentSlot": block.info.parent_slot,
+                    "blockTime": block.info.block_time,
+                    "blockHeight": block.info.block_height,
+                    "rewards": if include_rewards { serde_json::json!([]) } else { serde_json::Value::Null },
+                    "transactions": transactions,
+                }))
+            }
             Ok(None) => Err(err(
                 -32009,
                 "Slot was skipped, or missing in long-term storage",

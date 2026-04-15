@@ -77,9 +77,13 @@ pub struct BlockWithData {
 #[derive(Debug, Clone)]
 pub struct TransactionEntry {
     pub signature: solana_signature::Signature,
-    pub offset: u32,
-    pub length: u32,
+    /// Position of this tx in its block — populated from the geyser `index` field.
+    pub tx_index: u32,
     pub err: Option<String>,
+    /// The full yellowstone `SubscribeUpdateTransactionInfo` serialized with
+    /// prost. Deferred decode at query time keeps the ingest hot path cheap;
+    /// proto is ~40% smaller than equivalent JSON on disk.
+    pub payload: bytes::Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

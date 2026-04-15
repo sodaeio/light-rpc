@@ -195,11 +195,24 @@ impl StreamSource {
                                     .and_then(|m| m.err.as_ref())
                                     .map(|e| format!("{:?}", e));
 
+                                // Serialize the full tx_info for the tx store.
+                                // Decoding happens on-demand in the RPC handler.
+                                // Use the prost re-exported from yellowstone-grpc-proto —
+                                // our direct `prost 0.13` is a different version than the
+                                // one yellowstone's generated types implement.
+                                let payload = {
+                                    use yellowstone_grpc_proto::prost::Message;
+                                    let mut buf = Vec::with_capacity(tx_info.encoded_len());
+                                    let _ = tx_info.encode(&mut buf);
+                                    bytes::Bytes::from(buf)
+                                };
+                                let tx_idx = tx_info.index as u32;
+
                                 acc.transactions.insert(sig, TransactionEntry {
                                     signature: sig,
-                                    offset: 0,
-                                    length: 0,
+                                    tx_index: tx_idx,
                                     err: err_msg.clone(),
+                                    payload,
                                 });
 
                                 // Index address → signature for getSignaturesForAddress

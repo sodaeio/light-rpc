@@ -147,18 +147,26 @@ impl StorageWriter {
             error!(slot, error = %e, "failed to write slot index");
         }
 
-        // 3. Index transactions
+        // 3. Index transactions.
+        // Storage layout: length-prefixed header then proto payload.
+        //   [8 bytes u64 slot][4 bytes u32 tx_index][8 bytes i64 block_time]
+        //   [1 byte err_len][err_len bytes err][...proto bytes]
+        // This avoids a JSON wrapper (smaller, no allocation for nulls) and
+        // keeps the proto blob zero-copy on read.
+        let block_time = block.info.block_time.unwrap_or(0);
         for tx in &block.transactions {
-            let tx_data = serde_json::to_vec(&serde_json::json!({
-                "slot": slot,
-                "offset": tx.offset,
-                "length": tx.length,
-                "err": tx.err,
-            }))
-            .unwrap_or_default();
+            let err_bytes = tx.err.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
+            let err_len = err_bytes.len().min(u8::MAX as usize) as u8;
+            let mut value = Vec::with_capacity(21 + err_len as usize + tx.payload.len());
+            value.extend_from_slice(&slot.to_le_bytes());
+            value.extend_from_slice(&tx.tx_index.to_le_bytes());
+            value.extend_from_slice(&block_time.to_le_bytes());
+            value.push(err_len);
+            value.extend_from_slice(&err_bytes[..err_len as usize]);
+            value.extend_from_slice(&tx.payload);
 
             let sig_bytes: &[u8; 64] = tx.signature.as_ref().try_into().unwrap_or(&[0u8; 64]);
-            if let Err(e) = self.rocks.put_tx_index(sig_bytes, &tx_data) {
+            if let Err(e) = self.rocks.put_tx_index(sig_bytes, &value) {
                 error!(slot, error = %e, "failed to write tx index");
             }
         }
