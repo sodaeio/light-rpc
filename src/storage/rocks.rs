@@ -10,14 +10,9 @@ use crate::config::RocksDbConfig;
 use crate::metrics;
 use crate::types::*;
 
-/// Column family names for all indexed data.
-///
-/// Block pipeline CFs (history queries):
 const CF_SLOT_INDEX: &str = "slot_index";
 const CF_TX_INDEX: &str = "tx_index";
 const CF_SFA_INDEX: &str = "sfa_index";
-
-/// Account pipeline CFs (state queries):
 const CF_ACCOUNTS: &str = "accounts";
 const CF_PROGRAM_INDEX: &str = "program_index";
 
@@ -29,9 +24,6 @@ const ALL_CFS: &[&str] = &[
     CF_PROGRAM_INDEX,
 ];
 
-/// Apply shared compaction tuning to a CF's options.
-/// Without this, RocksDB uses defaults (L0 trigger=4, unbounded level sizes)
-/// which falls behind under high ingest and piles up thousands of L0 SSTs.
 fn apply_cf_compaction_tuning(opts: &mut Options) {
     opts.set_level_zero_file_num_compaction_trigger(2);
     opts.set_level_zero_slowdown_writes_trigger(20);
@@ -39,24 +31,11 @@ fn apply_cf_compaction_tuning(opts: &mut Options) {
     opts.set_target_file_size_base(64 * 1024 * 1024);
     opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
     opts.set_max_bytes_for_level_multiplier(10.0);
-    // Dynamic level sizing lets RocksDB rebalance level byte targets as data
-    // arrives — prevents the "L2 empty, L3 full" imbalance that wastes disk.
     opts.set_level_compaction_dynamic_level_bytes(true);
-    // ZSTD on bottom level: 2-3× better compression than LZ4, at negligible
-    // read cost (only touched during deep cold queries).
     opts.set_bottommost_compression_type(DBCompressionType::Zstd);
     opts.set_bottommost_zstd_max_train_bytes(0, true);
 }
 
-/// Build a BlockBasedOptions factory with production-grade defaults.
-///   - Partitioned index + filters: the top-level index stays in the block
-///     cache; leaf index blocks load on demand. Massive memory saving once
-///     the DB grows past ~100GB.
-///   - Bloom filter size 10 bits/key: standard, ~1% false-positive rate.
-///   - Whole-key filtering: required for prefix-scan CFs that also do point
-///     gets on the full key.
-///   - Cache index+filter blocks: keeps hot index pages pinned.
-///   - Format v5: supports all modern features incl. compressed blocks.
 fn build_block_opts(
     cache: &Cache,
     block_size: usize,
@@ -76,9 +55,8 @@ fn build_block_opts(
     if with_bloom {
         bo.set_bloom_filter(10.0, false);
         if prefix_bloom {
-            // Per-CF prefix bloom: matches fixed-prefix iterator seeks, so
-            // `iter_sfa` / `get_program_accounts` skip entire SSTs that
-            // can't contain the queried prefix.
+            // Prefix bloom only; point gets on prefix-scan CFs fall back
+            // to the full iterator.
             bo.set_whole_key_filtering(false);
         }
     }
@@ -103,7 +81,6 @@ impl UnifiedRocksDb {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        // Per-CF write buffer. 5 CFs × 64MB × 2 (active + flushing) = 640MB max memtables.
         db_opts.set_write_buffer_size(64 * 1024 * 1024);
         db_opts.set_max_write_buffer_number(2);
         db_opts.set_max_open_files(config.max_open_files);
@@ -113,22 +90,14 @@ impl UnifiedRocksDb {
             .unwrap_or(4);
         db_opts.increase_parallelism(parallelism);
         db_opts.set_max_background_jobs(parallelism.max(4));
-        // Force L0 to drain even during low-write periods; prevents silent accumulation.
         db_opts.set_periodic_compaction_seconds(3600);
 
-        // Rate-limit background I/O so compaction doesn't starve reads
-        // during burst ingest. 200 MB/s matches a mid-range NVMe sustained
-        // write; bump to 400-800 on enterprise SSDs.
+        // 200 MB/s — tune up on enterprise SSDs.
         db_opts.set_ratelimiter(200 * 1024 * 1024, 100_000, 10);
 
-        // Enable detailed statistics; `rocks.get_property` calls surface
-        // these as Prometheus gauges via update_metrics().
         db_opts.enable_statistics();
         db_opts.set_stats_dump_period_sec(600);
         db_opts.set_report_bg_io_stats(true);
-
-        // Keep recovered WAL segments to let `compact_all` run safely on
-        // crash-restart without losing in-flight writes.
         db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
 
         if config.enable_pipelined_writes {
@@ -150,7 +119,6 @@ impl UnifiedRocksDb {
     }
 
     fn slot_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
-        // Point lookup by slot, small JSON value. 4KB blocks optimal.
         let mut opts = Options::default();
         opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
@@ -160,9 +128,6 @@ impl UnifiedRocksDb {
     }
 
     fn tx_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
-        // Point lookup by signature, medium-large serialized tx meta (~1-10KB).
-        // 16KB blocks amortize compression headers over more rows.
-        // Bloom on signature gives us ~1% FP on point gets.
         let mut opts = Options::default();
         opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
@@ -172,8 +137,6 @@ impl UnifiedRocksDb {
     }
 
     fn sfa_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
-        // Prefix scan by 32-byte address. Prefix bloom lets SSTs that
-        // don't contain the address be skipped without opening them.
         let mut opts = Options::default();
         opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
@@ -185,8 +148,6 @@ impl UnifiedRocksDb {
     }
 
     fn accounts_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
-        // Point lookup by pubkey. Small-medium account blobs.
-        // Bloom filter turns cold misses into O(1) skips.
         let mut opts = Options::default();
         opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
@@ -196,8 +157,6 @@ impl UnifiedRocksDb {
     }
 
     fn program_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
-        // Prefix scan by program_id. Keys are 64 bytes; values empty.
-        // Prefix bloom + small block size maximizes index density.
         let mut opts = Options::default();
         opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
@@ -349,9 +308,7 @@ impl UnifiedRocksDb {
         &self.db
     }
 
-    /// Force a full-range compaction on every CF. Blocking and expensive —
-    /// use once after recovery or on a scheduled maintenance window to drain
-    /// an accumulated L0 backlog. Safe to call while serving reads.
+    /// Blocking full-range compaction across all CFs.
     pub fn compact_all(&self) -> Result<()> {
         for name in ALL_CFS {
             let cf = self.cf(name);
@@ -361,11 +318,8 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Delete all sfa_index entries older than `cutoff_slot`.
-    /// Keys are (address[32] | slot[8 BE]); we delete per-address ranges.
-    /// Since we don't have a global "list of addresses" cheaply, we scan
-    /// the CF once, skip-seek per prefix. For a prune-retention workload
-    /// running daily, this is acceptable.
+    /// Delete sfa_index entries older than `cutoff_slot`, walking the CF
+    /// once and issuing one DeleteRange per distinct address.
     pub fn prune_sfa_before(&self, cutoff_slot: Slot) -> Result<u64> {
         let cf = self.cf(CF_SFA_INDEX);
         let mut iter = self.db.raw_iterator_cf(&cf);
@@ -399,7 +353,6 @@ impl UnifiedRocksDb {
             self.db.delete_range_cf(&cf, &start, &end)?;
             dropped += 1;
 
-            // Seek past this address to the next one
             let mut next_prefix = address;
             for i in (0..32).rev() {
                 if next_prefix[i] < u8::MAX {
@@ -416,8 +369,6 @@ impl UnifiedRocksDb {
         Ok(dropped)
     }
 
-    /// Refresh Prometheus gauges for per-CF SST counts, L0 file counts, and
-    /// estimated live data size. Call on a timer (e.g. every 60s) from main.
     pub fn update_metrics(&self) {
         for name in ALL_CFS {
             let cf = self.cf(name);
@@ -440,7 +391,6 @@ impl UnifiedRocksDb {
                     .set(total as i64);
             }
 
-            // num-live-sst-files is tracked via total across all levels.
             let mut total_sst = 0i64;
             for level in 0..7 {
                 let prop = format!("rocksdb.num-files-at-level{level}");

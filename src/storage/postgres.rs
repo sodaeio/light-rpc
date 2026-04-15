@@ -15,14 +15,6 @@ pub struct PgStorage {
 
 impl PgStorage {
     pub async fn connect(config: &PostgresConfig) -> Result<Self> {
-        // Per-connection safety rails applied at handshake:
-        //   - statement_timeout: caps runaway analytical queries at 60s so
-        //     a bad gPA call can't pin a PG worker indefinitely.
-        //   - lock_timeout: refuse to wait longer than 10s on a row lock,
-        //     preventing cascading stalls during migrations / pg_repack.
-        //   - idle_in_transaction_session_timeout: kill forgotten txns
-        //     that would block vacuum / pin bloat in place.
-        //   - application_name: shows up in pg_stat_activity for debugging.
         let connect_opts = PgConnectOptions::from_str(&config.url)
             .context("parsing postgres url")?
             .application_name("light-indexer")
@@ -37,8 +29,6 @@ impl PgStorage {
             .min_connections(config.min_connections)
             .acquire_timeout(Duration::from_secs(config.connect_timeout_secs))
             .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
-            // Recycle connections after 30 min so long-lived prepared-statement
-            // caches don't drift from the current schema.
             .max_lifetime(Duration::from_secs(1800))
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
@@ -65,17 +55,13 @@ impl PgStorage {
         &self.pool
     }
 
-    /// Create tables matching the existing DAS schema (solanadb).
-    /// Safe to run against an already-populated database — all IF NOT EXISTS.
     pub async fn migrate(&self) -> Result<()> {
         let statements = [
-            // Slot tracking
             "CREATE TABLE IF NOT EXISTS slot_metas (
                 slot BIGINT PRIMARY KEY
             )",
             "CREATE INDEX IF NOT EXISTS idx_slot_desc ON slot_metas(slot DESC)",
 
-            // Token mints — matches DAS `tokens` table
             "CREATE TABLE IF NOT EXISTS tokens (
                 mint BYTEA PRIMARY KEY,
                 supply NUMERIC(20,0) NOT NULL DEFAULT 0,
@@ -89,7 +75,6 @@ impl PgStorage {
                 extensions JSONB
             )",
 
-            // Token accounts — matches DAS `token_accounts` table
             "CREATE TABLE IF NOT EXISTS token_accounts (
                 pubkey BYTEA PRIMARY KEY,
                 mint BYTEA NOT NULL,
@@ -104,24 +89,13 @@ impl PgStorage {
                 extensions JSONB
             )",
             "CREATE INDEX IF NOT EXISTS idx_token_accounts_mint_owner ON token_accounts(mint, owner)",
-            // FILLFACTOR and autovacuum tuning are metadata-only ALTERs —
-            // cheap, safe to run at startup. They change future behavior
-            // but don't rewrite existing pages.
-            // FILLFACTOR 85 leaves 15% free space per page so balance
-            // UPDATEs stay HOT (no index churn). Cuts bloat ~60%.
             "ALTER TABLE token_accounts SET (fillfactor = 85)",
-            // Aggressive autovacuum for 615M-row table. Triggers at 5% dead
-            // tuples vs default 20%; lower cost delay lets vacuum keep pace
-            // with write rate instead of falling behind.
             "ALTER TABLE token_accounts SET (
                 autovacuum_vacuum_scale_factor = 0.05,
                 autovacuum_analyze_scale_factor = 0.02,
                 autovacuum_vacuum_cost_delay = 10
             )",
-            // NOTE: idx_token_accounts_owner is a manual operation on large
-            // deployments — see MIGRATIONS.md. Building a covering index on
-            // 600M+ rows can take 30-60 minutes and must be done with
-            // CREATE INDEX CONCURRENTLY outside of a migration transaction.
+            // idx_token_accounts_owner must be built manually — see MIGRATIONS.md.
 
         ];
 
@@ -139,16 +113,9 @@ impl PgStorage {
         Ok(())
     }
 
-    /// Create an initial set of partitions covering the expected write range
-    /// so the writer doesn't fail with "no partition found" on the first
-    /// block before the retention loop's hourly tick runs.
-    ///
-    /// Seeds from the highest known slot (legacy table or slot_metas),
-    /// falling back to a reasonable mainnet floor if neither has data yet.
     async fn bootstrap_address_partitions(&self) -> Result<()> {
-        // Use slot_metas only — it has idx_slot_desc so this is a 1-row
-        // index lookup. Never query MAX(slot) on address_transactions_legacy:
-        // no index on slot there, the seq scan takes minutes on 2TB tables.
+        // Use slot_metas (has idx_slot_desc); MAX(slot) on the legacy
+        // table is a full seq scan.
         let latest: Option<i64> = sqlx::query_scalar(
             "SELECT slot FROM slot_metas ORDER BY slot DESC LIMIT 1",
         )
@@ -156,12 +123,7 @@ impl PgStorage {
         .await?
         .flatten();
 
-        // Fallback: mainnet was past slot 413M by April 2026.
         let seed_slot = latest.unwrap_or(413_000_000).max(0) as u64;
-
-        // Cover a window around the seed: 2 back (for stragglers / backfills)
-        // and 4 forward (covers ~4 weeks of live ingest before retention loop
-        // needs to add more).
         let current_partition = (seed_slot as i64) / Self::SLOTS_PER_PARTITION;
         let start = (current_partition - 2).max(0);
         for p in start..=current_partition + 4 {
@@ -184,11 +146,6 @@ impl PgStorage {
         Ok(())
     }
 
-    /// Converts the legacy (non-partitioned) `address_transactions` to a
-    /// range-partitioned schema. Safe to run repeatedly.
-    /// If a non-partitioned table already exists, it is renamed to
-    /// `address_transactions_legacy` — operators can DROP it once retention
-    /// has passed and it's no longer needed.
     async fn migrate_address_transactions_partitioned(&self) -> Result<()> {
         let partitioned: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -219,11 +176,7 @@ impl PgStorage {
             )
             .execute(&self.pool)
             .await?;
-            info!(
-                "renamed non-partitioned address_transactions to \
-                 address_transactions_legacy — drop it manually after retention \
-                 window passes"
-            );
+            info!("renamed address_transactions to address_transactions_legacy");
         }
 
         sqlx::query(
@@ -250,9 +203,6 @@ impl PgStorage {
         .execute(&self.pool)
         .await?;
 
-        // BRIN index on slot exploits the fact that within each partition,
-        // rows are appended in ~monotonic slot order. ~1000× smaller than a
-        // btree while serving slot-range pruning queries equally well.
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_addr_txn_slot_brin
              ON address_transactions USING BRIN (slot) WITH (pages_per_range = 16)",
@@ -264,13 +214,9 @@ impl PgStorage {
         Ok(())
     }
 
-    /// Slots per partition. At ~2.5 slots/sec, 1.5M slots ≈ 1 week.
-    /// Narrow enough that 30-day retention drops 4-5 partitions; wide enough
-    /// that we don't accumulate hundreds of partition relations.
+    /// ~1 week at 2.5 slots/sec.
     const SLOTS_PER_PARTITION: i64 = 1_500_000;
 
-    /// Ensure partitions exist for the current slot and `ahead` following partitions.
-    /// Idempotent — uses CREATE TABLE IF NOT EXISTS.
     pub async fn ensure_address_partitions(&self, current_slot: Slot, ahead: i64) -> Result<()> {
         let current_partition = (current_slot as i64) / Self::SLOTS_PER_PARTITION;
         for i in 0..=ahead {
@@ -288,8 +234,7 @@ impl PgStorage {
         Ok(())
     }
 
-    /// Drop partitions whose upper slot bound is before `cutoff_slot`.
-    /// Returns the names of dropped partitions.
+    /// Returns names of partitions dropped.
     pub async fn drop_address_partitions_before(
         &self,
         cutoff_slot: Slot,
@@ -615,9 +560,7 @@ impl PgStorage {
         Ok(rows)
     }
 
-    /// Cap the number of ATAs expanded into the query so a CEX-custody wallet
-    /// (millions of ATAs) doesn't turn into a multi-minute timeout. Real user
-    /// wallets never approach this.
+    /// Guards against custodial wallets with millions of ATAs.
     const GTFA_ATA_CAP: i64 = 2048;
 
     pub async fn get_transactions_for_owner_with_atas(
@@ -626,10 +569,6 @@ impl PgStorage {
         before_slot: Option<Slot>,
         limit: i64,
     ) -> Result<Vec<AddressTransactionRow>> {
-        // Step 1: resolve ATAs up-front as a bounded Vec. Avoids the
-        // OR/IN(subquery) pattern that the Postgres planner refuses to
-        // push through the (address, slot) btree. Capping at GTFA_ATA_CAP
-        // keeps query latency predictable regardless of whale input.
         let ata_pubkeys: Vec<Vec<u8>> = sqlx::query_scalar(
             "SELECT pubkey FROM token_accounts
              WHERE owner = $1
@@ -640,14 +579,10 @@ impl PgStorage {
         .fetch_all(&self.pool)
         .await?;
 
-        // Owner itself is always included in the address set.
         let mut addrs: Vec<Vec<u8>> = Vec::with_capacity(ata_pubkeys.len() + 1);
         addrs.push(owner.to_vec());
         addrs.extend(ata_pubkeys);
 
-        // Step 2: single indexed lookup over the materialized address set.
-        // `= ANY($1)` lets the planner iterate and use idx_addr_txn_address_slot
-        // for each address independently, then merge-sort the top-N globally.
         let rows: Vec<AddressTransactionRow> = if let Some(before) = before_slot {
             sqlx::query_as(
                 "SELECT address, signature, slot, tx_index, block_time, err

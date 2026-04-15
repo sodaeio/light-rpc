@@ -195,11 +195,7 @@ impl StreamSource {
                                     .and_then(|m| m.err.as_ref())
                                     .map(|e| format!("{:?}", e));
 
-                                // Serialize the full tx_info for the tx store.
-                                // Decoding happens on-demand in the RPC handler.
-                                // Use the prost re-exported from yellowstone-grpc-proto —
-                                // our direct `prost 0.13` is a different version than the
-                                // one yellowstone's generated types implement.
+                                // Use yellowstone's prost export (ours is a different version).
                                 let payload = {
                                     use yellowstone_grpc_proto::prost::Message;
                                     let mut buf = Vec::with_capacity(tx_info.encoded_len());

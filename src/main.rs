@@ -122,9 +122,6 @@ async fn run(config: Config) -> Result<()> {
         broadcast_tx,
     );
 
-    // ClickHouse dual-write rollout: connect, migrate, spawn writer, attach
-    // to the StorageWriter. Feature-gated so builds without clickhouse
-    // dependency work unchanged.
     #[cfg(feature = "clickhouse")]
     {
         use light_indexer::storage::clickhouse::{
@@ -167,9 +164,6 @@ async fn run(config: Config) -> Result<()> {
     server.run().await.context("rpc server failed")
 }
 
-/// Retention loop: ensures address_transactions partitions exist ahead of
-/// the current slot, drops partitions past the retention window, and prunes
-/// the sfa_index RocksDB CF. Runs every hour; cheap when no work to do.
 async fn run_retention_loop(
     pg: PgStorage,
     rocks: UnifiedRocksDb,
@@ -178,7 +172,6 @@ async fn run_retention_loop(
 ) {
     use std::time::Duration;
 
-    // Wait until we have a real slot before acting.
     loop {
         if cache.finalized_slot() > 0 {
             break;
@@ -224,10 +217,6 @@ async fn run_retention_loop(
     }
 }
 
-/// Readiness threshold: the node is considered ready if the last finalized
-/// slot was updated within this many seconds. Loose enough to tolerate
-/// normal Richat reconnects; tight enough that a stuck ingest pipeline
-/// trips the readiness probe before traffic is routed.
 const READY_MAX_LAG_SECS: u64 = 60;
 
 async fn run_metrics_server(endpoint: &str, cache: Arc<MemoryCache>) -> Result<()> {

@@ -1,17 +1,6 @@
-//! Transaction decoder: stored tx_index bytes → Solana RPC JSON.
-//!
-//! Storage layout (written by storage::write):
-//! ```text
-//! [8 bytes u64 slot LE]
-//! [4 bytes u32 tx_index LE]
-//! [8 bytes i64 block_time LE]
-//! [1 byte err_len][err_len bytes err string]
-//! [remainder: prost-encoded SubscribeUpdateTransactionInfo]
-//! ```
-//!
-//! We decode the proto on-demand and shape it into the `{slot, blockTime,
-//! transaction, meta, version}` structure that `@solana/web3.js`,
-//! explorers, and wallets expect from `getTransaction`.
+//! tx_index storage layout (written by storage::write):
+//!   [u64 slot LE][u32 tx_index LE][i64 block_time LE][u8 err_len][err][proto]
+//! proto is SubscribeUpdateTransactionInfo.
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -177,10 +166,7 @@ fn inner_ixs_json(groups: &[InnerInstructions]) -> Value {
 }
 
 fn meta_json(meta: &TransactionStatusMeta, err_str: Option<String>) -> Value {
-    // The proto TransactionError.err field is bincode-encoded
-    // solana_transaction_error::TransactionError. Deserialize then
-    // re-serialize as JSON to match agave's RPC shape exactly
-    // (e.g. `{"InstructionError":[3,{"Custom":21}]}`).
+    // Proto err field is bincode(TransactionError); re-encode to agave JSON.
     let err = match (&meta.err, err_str.as_ref()) {
         (Some(TransactionError { err }), _) if !err.is_empty() => {
             match bincode::deserialize::<solana_transaction_error::TransactionError>(err) {

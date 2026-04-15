@@ -13,11 +13,7 @@ use super::files::BlockFileStorage;
 use super::postgres::PgStorage;
 use super::rocks::UnifiedRocksDb;
 
-/// The write worker consumes from the source pipeline and persists data
-/// to RocksDB (blocks + accounts), file storage (block data), and PostgreSQL
-/// (tokens). It then broadcasts updates to the read workers.
-///
-/// Pipeline: Source →[mpsc]→ **StorageWriter** →[broadcast]→ StorageReaders
+/// Source →[mpsc]→ StorageWriter →[broadcast]→ StorageReaders.
 pub struct StorageWriter {
     rocks: UnifiedRocksDb,
     files: BlockFileStorage,
@@ -27,7 +23,6 @@ pub struct StorageWriter {
     ch_tx: Option<mpsc::Sender<super::clickhouse::ClickHouseWriteJob>>,
 }
 
-/// Jobs sent to the isolated PostgreSQL writer task.
 pub enum PgWriteJob {
     TokenMints(Vec<AccountUpdate>),
     TokenAccounts(Vec<AccountUpdate>),
@@ -69,7 +64,6 @@ impl StorageWriter {
         self
     }
 
-    /// Main write loop. Drains messages from the source and persists them.
     pub async fn run(self, mut source_rx: mpsc::Receiver<SourceMessage>) -> Result<()> {
         info!("storage writer started");
 
@@ -147,12 +141,7 @@ impl StorageWriter {
             error!(slot, error = %e, "failed to write slot index");
         }
 
-        // 3. Index transactions.
-        // Storage layout: length-prefixed header then proto payload.
-        //   [8 bytes u64 slot][4 bytes u32 tx_index][8 bytes i64 block_time]
-        //   [1 byte err_len][err_len bytes err][...proto bytes]
-        // This avoids a JSON wrapper (smaller, no allocation for nulls) and
-        // keeps the proto blob zero-copy on read.
+        // tx_index value: see rpc::tx_format for the layout.
         let block_time = block.info.block_time.unwrap_or(0);
         for tx in &block.transactions {
             let err_bytes = tx.err.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
@@ -171,7 +160,7 @@ impl StorageWriter {
             }
         }
 
-        // 4. Index address → signature mappings in RocksDB
+        // address → signatures (RocksDB)
         let mut sfa_entries = Vec::new();
         for (address, sigs) in &block.address_signatures {
             let data = serde_json::to_vec(&sigs).unwrap_or_default();
@@ -183,7 +172,7 @@ impl StorageWriter {
             }
         }
 
-        // 5. Send address-transaction entries to PG writer (non-blocking)
+        // address → signatures (PG, via isolated writer)
         let mut addr_tx_entries = Vec::new();
         for (address, sigs) in &block.address_signatures {
             for sig in sigs {
@@ -202,11 +191,9 @@ impl StorageWriter {
                 .try_send(PgWriteJob::AddressTransactions(addr_tx_entries));
         }
 
-        // 6. ClickHouse dual-write (feature-gated, non-blocking)
         #[cfg(feature = "clickhouse")]
         self.send_to_clickhouse(slot, block);
 
-        // 7. Broadcast to read workers
         let _ = self.broadcast_tx.send(WriteToReadMessage::NewBlock {
             slot,
             block: Arc::clone(block),
@@ -227,7 +214,6 @@ impl StorageWriter {
             return;
         };
 
-        // Invert address_signatures: per-signature list of addresses.
         let mut sig_addrs: std::collections::HashMap<[u8; 64], Vec<[u8; 32]>> =
             std::collections::HashMap::with_capacity(block.transactions.len());
         for (address, sigs) in &block.address_signatures {
@@ -265,8 +251,7 @@ impl StorageWriter {
                 block_time,
                 err: tx.err.is_some(),
                 fee,
-                // compute_units / message / meta / log_messages are populated
-                // once richat delivers the decoded tx payload; stub for now.
+                // TODO: populate from decoded tx payload
                 compute_units: 0,
                 addresses,
                 writable_mask: vec![0u8; addr_count],
@@ -279,15 +264,12 @@ impl StorageWriter {
 
         let batch = ClickHouseBlockBatch {
             transactions: rows,
-            // token_owner_sigs and program_invocations require tx decoding —
-            // filled once the encoded_block parser lands.
+            // TODO: populate from decoded tx payload
             token_owner_sigs: Vec::new(),
             program_invocations: Vec::new(),
         };
 
         if ch_tx.try_send(ClickHouseWriteJob::Block(batch)).is_err() {
-            // Channel full: drop the batch rather than block the pipeline.
-            // ClickHouse dual-write is best-effort during rollout.
             tracing::warn!(slot, "clickhouse channel full, dropping batch");
         }
     }
@@ -311,11 +293,10 @@ impl StorageWriter {
             return;
         }
 
-        // Deduplicate by pubkey, keeping the highest slot
+        // Dedup by pubkey, keep highest slot.
         buffer.sort_by(|a, b| a.pubkey.cmp(&b.pubkey).then(b.slot.cmp(&a.slot)));
         buffer.dedup_by_key(|u| u.pubkey);
 
-        // Drain and split by type — no cloning, moves ownership
         let mut mint_updates = Vec::new();
         let mut ta_updates = Vec::new();
         let mut prog_refs = Vec::new();

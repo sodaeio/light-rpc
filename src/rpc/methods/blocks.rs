@@ -12,11 +12,6 @@ fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
 
 pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("getBlock", |params, ctx, _| async move {
-        // Accept both `[slot]` and `[slot, config]` shapes.
-        // Standard Solana RPC clients always pass config with at least
-        // maxSupportedTransactionVersion — rejecting that breaks every
-        // mainstream wallet and explorer. We honor transactionDetails
-        // to return the lighter payload when callers don't need full tx.
         let p: Vec<serde_json::Value> = params.parse()?;
         let slot: Slot = p
             .first()
