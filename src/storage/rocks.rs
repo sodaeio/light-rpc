@@ -300,6 +300,61 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
+    /// Delete all sfa_index entries older than `cutoff_slot`.
+    /// Keys are (address[32] | slot[8 BE]); we delete per-address ranges.
+    /// Since we don't have a global "list of addresses" cheaply, we scan
+    /// the CF once, skip-seek per prefix. For a prune-retention workload
+    /// running daily, this is acceptable.
+    pub fn prune_sfa_before(&self, cutoff_slot: Slot) -> Result<u64> {
+        let cf = self.cf(CF_SFA_INDEX);
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut dropped = 0u64;
+        let mut last_address: Option<[u8; 32]> = None;
+
+        while iter.valid() {
+            let Some(key) = iter.key() else { break };
+            if key.len() < 40 {
+                iter.next();
+                continue;
+            }
+            let address: [u8; 32] = key[0..32].try_into().unwrap();
+
+            if Some(address) == last_address {
+                iter.next();
+                continue;
+            }
+            last_address = Some(address);
+
+            // Range: [address | 0] .. [address | cutoff]
+            let mut start = Vec::with_capacity(40);
+            start.extend_from_slice(&address);
+            start.extend_from_slice(&0u64.to_be_bytes());
+            let mut end = Vec::with_capacity(40);
+            end.extend_from_slice(&address);
+            end.extend_from_slice(&cutoff_slot.to_be_bytes());
+
+            self.db.delete_range_cf(&cf, &start, &end)?;
+            dropped += 1;
+
+            // Seek past this address to the next one
+            let mut next_prefix = address;
+            for i in (0..32).rev() {
+                if next_prefix[i] < u8::MAX {
+                    next_prefix[i] += 1;
+                    for j in i + 1..32 {
+                        next_prefix[j] = 0;
+                    }
+                    break;
+                }
+            }
+            iter.seek(next_prefix);
+        }
+
+        Ok(dropped)
+    }
+
     /// Refresh Prometheus gauges for per-CF SST counts, L0 file counts, and
     /// estimated live data size. Call on a timer (e.g. every 60s) from main.
     pub fn update_metrics(&self) {

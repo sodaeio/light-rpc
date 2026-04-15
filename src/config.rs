@@ -74,6 +74,15 @@ pub struct PostgresConfig {
     pub connect_timeout_secs: u64,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+    /// Retention window for address_transactions partitions, in slots.
+    /// Partitions whose upper bound is older than current_slot - this value are dropped.
+    /// Default: ~30 days (2.5 slots/sec × 86400 × 30 = 6,480,000 slots).
+    #[serde(default = "default_address_retention_slots")]
+    pub address_retention_slots: u64,
+}
+
+fn default_address_retention_slots() -> u64 {
+    6_480_000
 }
 
 #[derive(Debug, Clone, Deserialize)]

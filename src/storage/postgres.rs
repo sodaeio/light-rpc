@@ -70,21 +70,6 @@ impl PgStorage {
             )",
             "CREATE INDEX IF NOT EXISTS idx_token_accounts_mint_owner ON token_accounts(mint, owner)",
 
-            // Address transactions — matches DAS `address_transactions` table
-            "CREATE TABLE IF NOT EXISTS address_transactions (
-                address BYTEA NOT NULL,
-                signature BYTEA NOT NULL,
-                slot BIGINT NOT NULL,
-                tx_index INTEGER,
-                block_time BIGINT,
-                err BOOLEAN NOT NULL DEFAULT false,
-                balance_changed BOOLEAN NOT NULL DEFAULT false,
-                post_balance BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (address, signature)
-            )",
-            "CREATE INDEX IF NOT EXISTS idx_addr_txn_address_slot
-                ON address_transactions(address, slot DESC, tx_index DESC)
-                INCLUDE (signature, block_time, err, balance_changed)",
         ];
 
         for stmt in statements {
@@ -94,8 +79,140 @@ impl PgStorage {
                 .with_context(|| format!("migration: {}", &stmt[..stmt.len().min(60)]))?;
         }
 
+        self.migrate_address_transactions_partitioned().await?;
+
         info!("postgres migrations complete");
         Ok(())
+    }
+
+    /// Converts the legacy (non-partitioned) `address_transactions` to a
+    /// range-partitioned schema. Safe to run repeatedly.
+    /// If a non-partitioned table already exists, it is renamed to
+    /// `address_transactions_legacy` — operators can DROP it once retention
+    /// has passed and it's no longer needed.
+    async fn migrate_address_transactions_partitioned(&self) -> Result<()> {
+        let partitioned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_partitioned_table pt
+                JOIN pg_class c ON c.oid = pt.partrelid
+                WHERE c.relname = 'address_transactions'
+            )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        if partitioned {
+            return Ok(());
+        }
+
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM pg_tables
+                WHERE tablename = 'address_transactions' AND schemaname = 'public'
+            )",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        if exists {
+            sqlx::query(
+                "ALTER TABLE address_transactions RENAME TO address_transactions_legacy",
+            )
+            .execute(&self.pool)
+            .await?;
+            info!(
+                "renamed non-partitioned address_transactions to \
+                 address_transactions_legacy — drop it manually after retention \
+                 window passes"
+            );
+        }
+
+        sqlx::query(
+            "CREATE TABLE address_transactions (
+                address BYTEA NOT NULL,
+                signature BYTEA NOT NULL,
+                slot BIGINT NOT NULL,
+                tx_index INTEGER,
+                block_time BIGINT,
+                err BOOLEAN NOT NULL DEFAULT false,
+                balance_changed BOOLEAN NOT NULL DEFAULT false,
+                post_balance BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (address, signature, slot)
+            ) PARTITION BY RANGE (slot)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_addr_txn_address_slot
+             ON address_transactions(address, slot DESC, tx_index DESC)
+             INCLUDE (signature, block_time, err, balance_changed)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        info!("address_transactions is now partitioned by slot");
+        Ok(())
+    }
+
+    /// Slots per partition. At ~2.5 slots/sec, 1.5M slots ≈ 1 week.
+    /// Narrow enough that 30-day retention drops 4-5 partitions; wide enough
+    /// that we don't accumulate hundreds of partition relations.
+    const SLOTS_PER_PARTITION: i64 = 1_500_000;
+
+    /// Ensure partitions exist for the current slot and `ahead` following partitions.
+    /// Idempotent — uses CREATE TABLE IF NOT EXISTS.
+    pub async fn ensure_address_partitions(&self, current_slot: Slot, ahead: i64) -> Result<()> {
+        let current_partition = (current_slot as i64) / Self::SLOTS_PER_PARTITION;
+        for i in 0..=ahead {
+            let p = current_partition + i;
+            let lower = p * Self::SLOTS_PER_PARTITION;
+            let upper = (p + 1) * Self::SLOTS_PER_PARTITION;
+            let name = format!("address_transactions_p{p:07}");
+            let sql = format!(
+                "CREATE TABLE IF NOT EXISTS {name}
+                 PARTITION OF address_transactions
+                 FOR VALUES FROM ({lower}) TO ({upper})"
+            );
+            sqlx::query(&sql).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    /// Drop partitions whose upper slot bound is before `cutoff_slot`.
+    /// Returns the names of dropped partitions.
+    pub async fn drop_address_partitions_before(
+        &self,
+        cutoff_slot: Slot,
+    ) -> Result<Vec<String>> {
+        let cutoff = cutoff_slot as i64;
+        let partitions: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname FROM pg_class c
+             JOIN pg_inherits i ON c.oid = i.inhrelid
+             JOIN pg_class parent ON parent.oid = i.inhparent
+             WHERE parent.relname = 'address_transactions'
+               AND c.relkind = 'r'
+             ORDER BY c.relname",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut dropped = Vec::new();
+        for name in partitions {
+            let Some(rest) = name.strip_prefix("address_transactions_p") else {
+                continue;
+            };
+            let Ok(p) = rest.parse::<i64>() else {
+                continue;
+            };
+            let upper = (p + 1) * Self::SLOTS_PER_PARTITION;
+            if upper <= cutoff {
+                let sql = format!("DROP TABLE IF EXISTS {name}");
+                sqlx::query(&sql).execute(&self.pool).await?;
+                dropped.push(name);
+            }
+        }
+        Ok(dropped)
     }
 
     // --- Write operations (called from pg_writer_loop) ---

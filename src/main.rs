@@ -98,6 +98,14 @@ async fn run(config: Config) -> Result<()> {
         }
     });
 
+    let pg_retention = pg.clone();
+    let rocks_retention = rocks.clone();
+    let cache_retention = Arc::clone(&memory_cache);
+    let retention_slots = config.storage.postgres.address_retention_slots;
+    tokio::spawn(async move {
+        run_retention_loop(pg_retention, rocks_retention, cache_retention, retention_slots).await;
+    });
+
     let pg_writer = pg.clone();
     tokio::spawn(async move { pg_writer_loop(pg_writer, pg_rx).await });
 
@@ -131,6 +139,63 @@ async fn run(config: Config) -> Result<()> {
 
     let server = RpcServer::new(config.rpc, reader, upstream);
     server.run().await.context("rpc server failed")
+}
+
+/// Retention loop: ensures address_transactions partitions exist ahead of
+/// the current slot, drops partitions past the retention window, and prunes
+/// the sfa_index RocksDB CF. Runs every hour; cheap when no work to do.
+async fn run_retention_loop(
+    pg: PgStorage,
+    rocks: UnifiedRocksDb,
+    cache: Arc<MemoryCache>,
+    retention_slots: u64,
+) {
+    use std::time::Duration;
+
+    // Wait until we have a real slot before acting.
+    loop {
+        if cache.finalized_slot() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        ticker.tick().await;
+        let current = cache.finalized_slot();
+        if current == 0 {
+            continue;
+        }
+
+        match pg.ensure_address_partitions(current, 4).await {
+            Ok(_) => info!(current_slot = current, "ensured address_transactions partitions"),
+            Err(e) => error!(error = %e, "failed to ensure address_transactions partitions"),
+        }
+
+        let cutoff = current.saturating_sub(retention_slots);
+        if cutoff == 0 {
+            continue;
+        }
+
+        match pg.drop_address_partitions_before(cutoff).await {
+            Ok(dropped) if !dropped.is_empty() => {
+                info!(cutoff, dropped = ?dropped, "dropped old address_transactions partitions")
+            }
+            Ok(_) => {}
+            Err(e) => error!(error = %e, "failed to drop old partitions"),
+        }
+
+        let rocks_task = rocks.clone();
+        let dropped = tokio::task::spawn_blocking(move || rocks_task.prune_sfa_before(cutoff))
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(0);
+        if dropped > 0 {
+            info!(cutoff, addresses = dropped, "pruned sfa_index before cutoff");
+        }
+    }
 }
 
 async fn run_metrics_server(endpoint: &str) -> Result<()> {
