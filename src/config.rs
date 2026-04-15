@@ -77,9 +77,7 @@ pub struct PostgresConfig {
     pub connect_timeout_secs: u64,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
-    /// Retention window for address_transactions partitions, in slots.
-    /// Partitions whose upper bound is older than current_slot - this value are dropped.
-    /// Default: ~30 days (2.5 slots/sec × 86400 × 30 = 6,480,000 slots).
+    /// Retention window in slots (~30 days at 2.5 slots/sec).
     #[serde(default = "default_address_retention_slots")]
     pub address_retention_slots: u64,
 }
@@ -124,7 +122,27 @@ pub struct RpcConfig {
     pub upstream: Option<String>,
     #[serde(default)]
     pub forwarded_methods: Vec<String>,
+    /// Empty → use DEFAULT_GPA_BLOCKED; set to `[]` to disable blocking.
+    #[serde(default)]
+    pub gpa_blocked_programs: Option<Vec<String>>,
+    #[serde(default = "default_gpa_max_accounts")]
+    pub gpa_max_accounts: usize,
 }
+
+fn default_gpa_max_accounts() -> usize {
+    100_000
+}
+
+pub const DEFAULT_GPA_BLOCKED: &[&str] = &[
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+    "11111111111111111111111111111111",
+    "Vote111111111111111111111111111111111111111",
+    "Stake11111111111111111111111111111111111111",
+    "AddressLookupTab1e1111111111111111111111111",
+    "ComputeBudget111111111111111111111111111111",
+];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetricsConfig {

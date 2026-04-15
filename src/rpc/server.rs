@@ -31,6 +31,8 @@ pub struct RpcServer {
 pub struct RpcContext {
     pub reader: Arc<StorageReader>,
     pub upstream: Option<UpstreamForwarder>,
+    pub gpa_blocked: std::collections::HashSet<[u8; 32]>,
+    pub gpa_max_accounts: usize,
 }
 
 type RpcState = Arc<RpcModule<RpcContext>>;
@@ -48,10 +50,32 @@ impl RpcServer {
         }
     }
 
+    fn build_gpa_blocklist(config: &RpcConfig) -> std::collections::HashSet<[u8; 32]> {
+        use crate::config::DEFAULT_GPA_BLOCKED;
+        let entries: Vec<String> = match &config.gpa_blocked_programs {
+            Some(list) => list.clone(),
+            None => DEFAULT_GPA_BLOCKED.iter().map(|s| s.to_string()).collect(),
+        };
+        let mut set = std::collections::HashSet::with_capacity(entries.len());
+        for s in entries {
+            match bs58::decode(&s).into_vec() {
+                Ok(v) if v.len() == 32 => {
+                    set.insert(v.try_into().unwrap());
+                }
+                _ => tracing::warn!(pubkey = %s, "invalid gpa_blocked_programs entry, skipping"),
+            }
+        }
+        tracing::info!(count = set.len(), "gpa blocklist loaded");
+        set
+    }
+
     pub async fn run(self) -> Result<()> {
+        let gpa_blocked = Self::build_gpa_blocklist(&self.config);
         let context = RpcContext {
             reader: Arc::clone(&self.reader),
             upstream: self.upstream,
+            gpa_blocked,
+            gpa_max_accounts: self.config.gpa_max_accounts,
         };
 
         let module = methods::build_rpc_module(context)?;
