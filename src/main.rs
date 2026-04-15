@@ -83,8 +83,9 @@ async fn run(config: Config) -> Result<()> {
     let (pg_tx, pg_rx) = tokio::sync::mpsc::channel(config.storage.pipeline.pg_write_buffer);
 
     let metrics_endpoint = config.metrics.endpoint.clone();
+    let health_cache = Arc::clone(&memory_cache);
     tokio::spawn(async move {
-        if let Err(e) = run_metrics_server(&metrics_endpoint).await {
+        if let Err(e) = run_metrics_server(&metrics_endpoint, health_cache).await {
             error!(error = %e, "metrics server failed");
         }
     });
@@ -198,7 +199,13 @@ async fn run_retention_loop(
     }
 }
 
-async fn run_metrics_server(endpoint: &str) -> Result<()> {
+/// Readiness threshold: the node is considered ready if the last finalized
+/// slot was updated within this many seconds. Loose enough to tolerate
+/// normal Richat reconnects; tight enough that a stuck ingest pipeline
+/// trips the readiness probe before traffic is routed.
+const READY_MAX_LAG_SECS: u64 = 60;
+
+async fn run_metrics_server(endpoint: &str, cache: Arc<MemoryCache>) -> Result<()> {
     use prometheus::Encoder;
 
     let addr: std::net::SocketAddr = endpoint.parse()?;
@@ -207,16 +214,48 @@ async fn run_metrics_server(endpoint: &str) -> Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await?;
+        let cache = Arc::clone(&cache);
         tokio::spawn(async move {
             let io = hyper_util::rt::TokioIo::new(stream);
-            let service = hyper::service::service_fn(|_req| async {
-                let encoder = prometheus::TextEncoder::new();
-                let metric_families = REGISTRY.gather();
-                let mut buffer = Vec::new();
-                encoder.encode(&metric_families, &mut buffer).unwrap();
-                Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(
-                    bytes::Bytes::from(buffer),
-                )))
+            let service = hyper::service::service_fn(move |req: hyper::Request<_>| {
+                let cache = Arc::clone(&cache);
+                async move {
+                    let path = req.uri().path();
+                    let (status, body): (u16, bytes::Bytes) = match path {
+                        "/healthz" => (200, bytes::Bytes::from_static(b"ok\n")),
+                        "/readyz" => {
+                            let finalized = cache.finalized_slot();
+                            let last_update_age = cache.finalized_slot_age_secs();
+                            if finalized > 0 && last_update_age <= READY_MAX_LAG_SECS {
+                                (
+                                    200,
+                                    bytes::Bytes::from(format!(
+                                        "ready slot={finalized} lag_secs={last_update_age}\n"
+                                    )),
+                                )
+                            } else {
+                                (
+                                    503,
+                                    bytes::Bytes::from(format!(
+                                        "not_ready slot={finalized} lag_secs={last_update_age}\n"
+                                    )),
+                                )
+                            }
+                        }
+                        _ => {
+                            let encoder = prometheus::TextEncoder::new();
+                            let metric_families = REGISTRY.gather();
+                            let mut buffer = Vec::new();
+                            encoder.encode(&metric_families, &mut buffer).unwrap();
+                            (200, bytes::Bytes::from(buffer))
+                        }
+                    };
+                    let resp = hyper::Response::builder()
+                        .status(status)
+                        .body(http_body_util::Full::new(body))
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
             });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
