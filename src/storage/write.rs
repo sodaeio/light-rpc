@@ -364,8 +364,6 @@ impl StorageWriter {
             let owned: Vec<AccountUpdate> = ta_updates.into_iter().cloned().collect();
             let _ = self.pg_tx.try_send(PgWriteJob::TokenAccounts(owned));
         }
-
-        drop(updates);
     }
 }
 

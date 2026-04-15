@@ -54,16 +54,14 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     _ => serde_json::json!(block
                         .transactions
                         .iter()
-                        .map(|t| serde_json::json!({
-                            "transaction": [t.signature.to_string()],
-                            "meta": {
-                                "err": t.err.as_ref().map(|e| serde_json::json!(e)),
-                                "fee": 0,
-                                "preBalances": [],
-                                "postBalances": [],
-                            },
-                            "version": "legacy",
-                        }))
+                        .map(|t| {
+                            crate::rpc::tx_format::decode_payload(&t.payload, t.err.clone())
+                                .unwrap_or_else(|_| serde_json::json!({
+                                    "transaction": { "signatures": [t.signature.to_string()] },
+                                    "meta": { "err": t.err.as_ref().map(|e| serde_json::json!(e)) },
+                                    "version": "legacy",
+                                }))
+                        })
                         .collect::<Vec<_>>()),
                 };
                 let response = serde_json::json!({

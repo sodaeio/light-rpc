@@ -28,7 +28,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     .and_then(|v| v.get("encoding"))
                     .and_then(|v| v.as_str())
             })
-            .unwrap_or("jsonParsed");
+            .unwrap_or("base64");
         let slot = ctx.reader.cache().processed_slot();
 
         match ctx
@@ -62,7 +62,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     .and_then(|v| v.get("encoding"))
                     .and_then(|v| v.as_str())
             })
-            .unwrap_or("jsonParsed");
+            .unwrap_or("base64");
         let slot = ctx.reader.cache().processed_slot();
 
         match ctx

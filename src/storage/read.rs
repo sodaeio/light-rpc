@@ -500,11 +500,11 @@ impl StorageReader {
         serde_json::json!({
             "pubkey": bs58::encode(&row.pubkey).into_string(),
             "account": {
-                "lamports": 2039280_u64,
+                "lamports": row.lamports.max(0) as u64,
                 "data": data_field,
                 "owner": owner_str,
                 "executable": false,
-                "rentEpoch": 18446744073709551615_u64,
+                "rentEpoch": u64::MAX,
                 "space": 165
             }
         })
@@ -1107,23 +1107,32 @@ impl StorageReader {
             .flatten()
             .map(|r| r.decimals)
             .unwrap_or(0);
-        self.mint_meta_cache
-            .insert(*mint_key, (decimals, self.cache.processed_slot()));
+        self.mint_meta_put(*mint_key, decimals, self.cache.processed_slot());
         decimals
     }
 
     pub fn mint_meta_insert(&self, mint: [u8; 32], decimals: i32, slot: u64) {
+        self.mint_meta_put(mint, decimals, slot);
+    }
+
+    fn mint_meta_put(&self, mint: [u8; 32], decimals: i32, slot: u64) {
+        // Bound the mint meta cache at 200k entries (~5 MB). Past that, drop
+        // half on insert — typical hot set is <10k, cold entries are cheap
+        // to re-fetch from PG.
+        if self.mint_meta_cache.len() >= 200_000 {
+            let victims: Vec<[u8; 32]> = self
+                .mint_meta_cache
+                .iter()
+                .take(100_000)
+                .map(|e| *e.key())
+                .collect();
+            for v in victims {
+                self.mint_meta_cache.remove(&v);
+            }
+        }
         self.mint_meta_cache.insert(mint, (decimals, slot));
     }
 
-    pub fn account_lru_invalidate(&self, pubkey: &[u8; 32]) {
-        let s = shard_of(pubkey[0]);
-        self.account_lru[s].lock().pop(pubkey);
-        let mut enc_shard = self.encoded_account_lru[s].lock();
-        for enc in 0u8..4 {
-            enc_shard.pop(&(*pubkey, enc));
-        }
-    }
 
     fn token_holder_json(pubkey: &[u8], amount: u64, decimals: i32) -> serde_json::Value {
         let ui_amount = if decimals > 0 {

@@ -86,8 +86,10 @@ impl PgStorage {
                 delegated_amount BIGINT NOT NULL DEFAULT 0,
                 slot_updated BIGINT NOT NULL,
                 token_program BYTEA NOT NULL,
+                lamports BIGINT NOT NULL DEFAULT 2039280,
                 extensions JSONB
             )",
+            "ALTER TABLE token_accounts ADD COLUMN IF NOT EXISTS lamports BIGINT NOT NULL DEFAULT 2039280",
             "CREATE INDEX IF NOT EXISTS idx_token_accounts_mint_owner ON token_accounts(mint, owner)",
             "ALTER TABLE token_accounts SET (fillfactor = 85)",
             "ALTER TABLE token_accounts SET (
@@ -358,6 +360,7 @@ impl PgStorage {
         let mut p_delegated_amount: Vec<i64> = Vec::with_capacity(accounts.len());
         let mut p_slot: Vec<i64> = Vec::with_capacity(accounts.len());
         let mut p_program: Vec<Vec<u8>> = Vec::with_capacity(accounts.len());
+        let mut p_lamports: Vec<i64> = Vec::with_capacity(accounts.len());
 
         for a in accounts {
             let acct_mint = if a.data.len() >= 32 {
@@ -398,11 +401,12 @@ impl PgStorage {
             p_delegated_amount.push(delegated_amount as i64);
             p_slot.push(a.slot as i64);
             p_program.push(a.owner.as_ref().to_vec());
+            p_lamports.push(a.lamports as i64);
         }
 
         sqlx::query(
-            "INSERT INTO token_accounts (pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program)
-             SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bool[], $6::bytea[], $7::bigint[], $8::bigint[], $9::bytea[])
+            "INSERT INTO token_accounts (pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program, lamports)
+             SELECT * FROM UNNEST($1::bytea[], $2::bytea[], $3::bytea[], $4::bigint[], $5::bool[], $6::bytea[], $7::bigint[], $8::bigint[], $9::bytea[], $10::bigint[])
              ON CONFLICT (pubkey) DO UPDATE SET
                  mint = EXCLUDED.mint,
                  owner = EXCLUDED.owner,
@@ -410,7 +414,8 @@ impl PgStorage {
                  frozen = EXCLUDED.frozen,
                  delegate = EXCLUDED.delegate,
                  delegated_amount = EXCLUDED.delegated_amount,
-                 slot_updated = EXCLUDED.slot_updated
+                 slot_updated = EXCLUDED.slot_updated,
+                 lamports = EXCLUDED.lamports
              WHERE EXCLUDED.slot_updated >= token_accounts.slot_updated",
         )
         .bind(&p_pubkey)
@@ -422,6 +427,7 @@ impl PgStorage {
         .bind(&p_delegated_amount)
         .bind(&p_slot)
         .bind(&p_program)
+        .bind(&p_lamports)
         .execute(&self.pool)
         .await?;
 
@@ -494,8 +500,8 @@ impl PgStorage {
 
     pub async fn get_token_accounts_by_owner(&self, owner: &[u8]) -> Result<Vec<TokenAccountRow>> {
         let rows: Vec<TokenAccountRow> = sqlx::query_as(
-            "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program
-             FROM token_accounts WHERE owner = $1",
+            "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program, lamports
+             FROM token_accounts WHERE owner = $1 LIMIT 10000",
         )
         .bind(owner)
         .fetch_all(&self.pool)
@@ -505,8 +511,8 @@ impl PgStorage {
 
     pub async fn get_token_accounts_by_mint(&self, mint: &[u8]) -> Result<Vec<TokenAccountRow>> {
         let rows: Vec<TokenAccountRow> = sqlx::query_as(
-            "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program
-             FROM token_accounts WHERE mint = $1",
+            "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program, lamports
+             FROM token_accounts WHERE mint = $1 LIMIT 10000",
         )
         .bind(mint)
         .fetch_all(&self.pool)
@@ -618,7 +624,7 @@ impl PgStorage {
         limit: i64,
     ) -> Result<Vec<TokenAccountRow>> {
         let rows: Vec<TokenAccountRow> = sqlx::query_as(
-            "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program
+            "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program, lamports
              FROM token_accounts WHERE mint = $1 ORDER BY amount DESC LIMIT $2",
         )
         .bind(mint)
@@ -633,8 +639,8 @@ impl PgStorage {
         delegate: &[u8],
     ) -> Result<Vec<TokenAccountRow>> {
         let rows: Vec<TokenAccountRow> = sqlx::query_as(
-            "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program
-             FROM token_accounts WHERE delegate = $1",
+            "SELECT pubkey, mint, owner, amount, frozen, delegate, delegated_amount, slot_updated, token_program, lamports
+             FROM token_accounts WHERE delegate = $1 LIMIT 10000",
         )
         .bind(delegate)
         .fetch_all(&self.pool)
@@ -895,6 +901,7 @@ pub struct TokenAccountRow {
     pub delegated_amount: i64,
     pub slot_updated: i64,
     pub token_program: Vec<u8>,
+    pub lamports: i64,
 }
 
 #[derive(sqlx::FromRow)]

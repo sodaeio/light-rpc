@@ -1,6 +1,8 @@
 //! tx_index storage layout (written by storage::write):
 //!   [u64 slot LE][u32 tx_index LE][i64 block_time LE][u8 err_len][err][proto]
-//! proto is SubscribeUpdateTransactionInfo.
+//! proto is SubscribeUpdateTransactionInfo. err_len caps at 255; longer
+//! error debug strings are truncated at write time — impacts debug display
+//! only, not the proto-decoded err reported in getTransaction.meta.err.
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -17,7 +19,6 @@ pub fn decode_tx_index(bytes: &[u8]) -> Result<Value> {
         return Err(anyhow!("tx_index value too short ({} bytes)", bytes.len()));
     }
     let slot = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let tx_index = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
     let block_time_raw = i64::from_le_bytes(bytes[12..20].try_into().unwrap());
     let err_len = bytes[20] as usize;
 
@@ -32,7 +33,6 @@ pub fn decode_tx_index(bytes: &[u8]) -> Result<Value> {
     };
 
     let info = SubscribeUpdateTransactionInfo::decode(&bytes[payload_start..])?;
-    let _ = tx_index; // tx_index is implicit in the proto `index` field
     Ok(build_rpc_shape(
         slot,
         if block_time_raw == 0 {
@@ -43,6 +43,18 @@ pub fn decode_tx_index(bytes: &[u8]) -> Result<Value> {
         err_str,
         info,
     ))
+}
+
+/// Decode a raw `SubscribeUpdateTransactionInfo` payload (no tx_index header)
+/// into the agave `{transaction, meta, version}` shape used by getBlock.
+pub fn decode_payload(payload: &[u8], err_str: Option<String>) -> Result<Value> {
+    let info = SubscribeUpdateTransactionInfo::decode(payload)?;
+    let mut v = build_rpc_shape(0, None, err_str, info);
+    if let Value::Object(ref mut map) = v {
+        map.remove("slot");
+        map.remove("blockTime");
+    }
+    Ok(v)
 }
 
 fn build_rpc_shape(

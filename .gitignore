@@ -7,8 +7,8 @@ config.yml
 config-prod.yml
 data/
 
-# Ignore all Markdown except README.md. CLAUDE.md, ARCHITECTURE.md,
-# PERFORMANCE.md, DESIGN_DECISIONS.md, MIGRATIONS.md, TESTING.md etc.
-# are local notes that should not be tracked.
+# Local-only docs (CLAUDE.md, ARCHITECTURE.md, PERFORMANCE.md, etc.)
+# live here and are never tracked.
+docs-local/
 *.md
 !README.md

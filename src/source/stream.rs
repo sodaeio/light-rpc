@@ -156,10 +156,14 @@ impl StreamSource {
                     match update.update_oneof {
                         Some(UpdateOneof::Account(account_update)) => {
                             if let Some(account) = account_update.account {
-                                let pubkey = Pubkey::try_from(account.pubkey.as_slice())
-                                    .unwrap_or_default();
-                                let owner = Pubkey::try_from(account.owner.as_slice())
-                                    .unwrap_or_default();
+                                let (Ok(pubkey), Ok(owner)) = (
+                                    Pubkey::try_from(account.pubkey.as_slice()),
+                                    Pubkey::try_from(account.owner.as_slice()),
+                                ) else {
+                                    tracing::warn!(slot = account_update.slot, "malformed account pubkey/owner, skipping");
+                                    metrics::SOURCE_MALFORMED.inc();
+                                    continue;
+                                };
 
                                 let update = AccountUpdate {
                                     pubkey,
@@ -184,8 +188,11 @@ impl StreamSource {
                         Some(UpdateOneof::Transaction(tx_update)) => {
                             if let Some(tx_info) = tx_update.transaction {
                                 let slot = tx_update.slot;
-                                let sig = Signature::try_from(tx_info.signature.as_slice())
-                                    .unwrap_or_default();
+                                let Ok(sig) = Signature::try_from(tx_info.signature.as_slice()) else {
+                                    tracing::warn!(slot, "malformed transaction signature, skipping");
+                                    metrics::SOURCE_MALFORMED.inc();
+                                    continue;
+                                };
 
                                 let acc = accumulators
                                     .entry(slot)
