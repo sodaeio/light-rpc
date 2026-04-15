@@ -67,6 +67,8 @@ figment = { version = "0.10", features = ["yaml", "env"] }
 anyhow = "1.0"
 thiserror = "2.0"
 mimalloc = { version = "0.1", default-features = false }
+socket2 = { version = "0.5", features = ["all"] }
+lru = "0.12"
 num_cpus = "1.16"
 chrono = "0.4"
 parking_lot = "0.12"

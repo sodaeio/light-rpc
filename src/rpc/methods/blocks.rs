@@ -27,6 +27,22 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        // Config fingerprint: (tx_details, include_rewards) fold into a u64.
+        // Common configs are ~10 combinations, so a tiny hash suffices.
+        let cfg_hash: u64 = {
+            let mut h: u64 = include_rewards as u64;
+            for b in tx_details.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(*b as u64);
+            }
+            h
+        };
+
+        if let Some(cached) = ctx.block_cache.lock().get(&(slot, cfg_hash)).cloned() {
+            let val: serde_json::Value = serde_json::from_slice(&cached)
+                .map_err(|e| err(-32603, &e.to_string()))?;
+            return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(val);
+        }
+
         match ctx.reader.get_block(slot) {
             Ok(Some(block)) => {
                 let transactions = match tx_details {
@@ -51,7 +67,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                         }))
                         .collect::<Vec<_>>()),
                 };
-                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                let response = serde_json::json!({
                     "blockhash": block.info.blockhash,
                     "previousBlockhash": null,
                     "parentSlot": block.info.parent_slot,
@@ -59,7 +75,13 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     "blockHeight": block.info.block_height,
                     "rewards": if include_rewards { serde_json::json!([]) } else { serde_json::Value::Null },
                     "transactions": transactions,
-                }))
+                });
+                if let Ok(bytes) = serde_json::to_vec(&response) {
+                    ctx.block_cache
+                        .lock()
+                        .put((slot, cfg_hash), bytes::Bytes::from(bytes));
+                }
+                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(response)
             }
             Ok(None) => Err(err(
                 -32009,

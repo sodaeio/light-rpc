@@ -328,6 +328,24 @@ impl StorageWriter {
 
         // Token accounts → PG (via bounded channel, non-blocking)
         if !ta_updates.is_empty() {
+            // Index owner → token_account for gTFA. Token Account layout has
+            // the owner wallet at bytes [32..64] of account data.
+            let atas: Vec<([u8; 32], [u8; 32])> = ta_updates
+                .iter()
+                .filter_map(|u| {
+                    if u.data.len() < 64 {
+                        return None;
+                    }
+                    let mut owner = [0u8; 32];
+                    owner.copy_from_slice(&u.data[32..64]);
+                    Some((owner, u.pubkey.to_bytes()))
+                })
+                .collect();
+            if !atas.is_empty() {
+                if let Err(e) = self.rocks.put_owner_atas_batch(&atas) {
+                    error!(error = %e, "failed to write owner_atas");
+                }
+            }
             let owned: Vec<AccountUpdate> = ta_updates.into_iter().cloned().collect();
             let _ = self.pg_tx.try_send(PgWriteJob::TokenAccounts(owned));
         }

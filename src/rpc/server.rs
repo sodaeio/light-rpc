@@ -33,7 +33,10 @@ pub struct RpcContext {
     pub upstream: Option<UpstreamForwarder>,
     pub gpa_blocked: std::collections::HashSet<[u8; 32]>,
     pub gpa_max_accounts: usize,
+    pub block_cache: BlockResponseCache,
 }
+
+pub type BlockResponseCache = Arc<parking_lot::Mutex<lru::LruCache<(u64, u64), bytes::Bytes>>>;
 
 type RpcState = Arc<RpcModule<RpcContext>>;
 
@@ -71,11 +74,15 @@ impl RpcServer {
 
     pub async fn run(self) -> Result<()> {
         let gpa_blocked = Self::build_gpa_blocklist(&self.config);
+        let block_cache = Arc::new(parking_lot::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(512).unwrap(),
+        )));
         let context = RpcContext {
             reader: Arc::clone(&self.reader),
             upstream: self.upstream,
             gpa_blocked,
             gpa_max_accounts: self.config.gpa_max_accounts,
+            block_cache,
         };
 
         let module = methods::build_rpc_module(context)?;
@@ -106,19 +113,52 @@ impl RpcServer {
             .parse()
             .context("parsing rpc endpoint address")?;
 
-        info!(%addr, "rpc server starting");
+        // One listener per worker via SO_REUSEPORT. Kernel hashes inbound
+        // connections by 5-tuple so cross-worker accept-queue contention is
+        // gone. Matches the scaling pattern used by nginx/envoy.
+        let n_listeners = num_cpus::get().clamp(1, 32);
+        info!(%addr, listeners = n_listeners, "rpc server starting");
 
-        let socket = tokio::net::TcpSocket::new_v4()?;
-        socket.set_reuseaddr(true)?;
-        socket.set_nodelay(true)?;
-        socket.bind(addr)?;
-        let listener = socket.listen(8192)?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        let mut handles = Vec::with_capacity(n_listeners);
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let sig_shutdown = std::sync::Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            sig_shutdown.notify_waiters();
+        });
 
+        for i in 0..n_listeners {
+            let listener = bind_reuseport(addr)?;
+            let svc = app.clone();
+            let shutdown = std::sync::Arc::clone(&shutdown);
+            handles.push(tokio::spawn(async move {
+                let _ = axum::serve(listener, svc)
+                    .with_graceful_shutdown(async move { shutdown.notified().await })
+                    .await;
+                tracing::info!(listener = i, "rpc listener stopped");
+            }));
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
         Ok(())
     }
+}
+
+fn bind_reuseport(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    let sock = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.set_nodelay(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(32768)?;
+    Ok(tokio::net::TcpListener::from_std(sock.into())?)
 }
 
 async fn handle_jsonrpc(

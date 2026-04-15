@@ -1777,7 +1777,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2290,6 +2290,7 @@ dependencies = [
  "jsonrpsee",
  "jsonrpsee-core",
  "jsonrpsee-types",
+ "lru",
  "lz4",
  "mimalloc",
  "num_cpus",
@@ -2304,6 +2305,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "serde_yaml",
+ "socket2 0.5.10",
  "solana-pubkey 4.2.0",
  "solana-signature",
  "solana-transaction-error",
@@ -2343,6 +2345,15 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "lru"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
+]
 
 [[package]]
 name = "lru-slab"
@@ -3209,7 +3220,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.2",
  "rustls",
- "socket2",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3248,7 +3259,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -3507,7 +3518,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "socket2",
+ "socket2 0.6.3",
  "solana-clock",
  "solana-pubkey 3.0.0",
  "solana-signature",
@@ -4011,6 +4022,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5671,7 +5692,7 @@ dependencies = [
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.3",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
@@ -5814,7 +5835,7 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "rustls-native-certs",
- "socket2",
+ "socket2 0.6.3",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

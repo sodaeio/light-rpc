@@ -15,6 +15,7 @@ const CF_TX_INDEX: &str = "tx_index";
 const CF_SFA_INDEX: &str = "sfa_index";
 const CF_ACCOUNTS: &str = "accounts";
 const CF_PROGRAM_INDEX: &str = "program_index";
+const CF_OWNER_ATAS: &str = "owner_atas";
 
 const ALL_CFS: &[&str] = &[
     CF_SLOT_INDEX,
@@ -22,6 +23,7 @@ const ALL_CFS: &[&str] = &[
     CF_SFA_INDEX,
     CF_ACCOUNTS,
     CF_PROGRAM_INDEX,
+    CF_OWNER_ATAS,
 ];
 
 fn apply_cf_compaction_tuning(opts: &mut Options) {
@@ -113,6 +115,7 @@ impl UnifiedRocksDb {
             Self::sfa_index_cf_opts(&cache),
             Self::accounts_cf_opts(&cache),
             Self::program_index_cf_opts(&cache),
+            Self::owner_atas_cf_opts(&cache),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)
@@ -169,6 +172,20 @@ impl UnifiedRocksDb {
         let block_opts = build_block_opts(cache, 4 * 1024, true, true);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_PROGRAM_INDEX, opts)
+    }
+
+    fn owner_atas_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
+        // Key [owner(32) | token_account_pubkey(32)] → empty. Prefix scan
+        // by owner to list the owner's token accounts. Same shape as
+        // program_index but keyed on token-account owner.
+        let mut opts = Options::default();
+        opts.set_compression_type(DBCompressionType::Lz4);
+        opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        opts.set_memtable_prefix_bloom_ratio(0.1);
+        apply_cf_compaction_tuning_with(&mut opts, 1);
+        let block_opts = build_block_opts(cache, 4 * 1024, true, true);
+        opts.set_block_based_table_factory(&block_opts);
+        ColumnFamilyDescriptor::new(CF_OWNER_ATAS, opts)
     }
 
     fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
@@ -279,12 +296,57 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
+    /// Record that `pubkey` is a token account owned by `owner`.
+    pub fn put_owner_ata(&self, owner: &[u8; 32], pubkey: &[u8; 32]) -> Result<()> {
+        let mut key = Vec::with_capacity(64);
+        key.extend_from_slice(owner);
+        key.extend_from_slice(pubkey);
+        self.db.put_cf(&self.cf(CF_OWNER_ATAS), &key, [])?;
+        Ok(())
+    }
+
+    pub fn put_owner_atas_batch(&self, entries: &[([u8; 32], [u8; 32])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let cf = self.cf(CF_OWNER_ATAS);
+        let mut batch = WriteBatch::default();
+        for (owner, pubkey) in entries {
+            let mut key = [0u8; 64];
+            key[..32].copy_from_slice(owner);
+            key[32..].copy_from_slice(pubkey);
+            batch.put_cf(&cf, key, []);
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// List token account pubkeys owned by `owner` via prefix scan.
+    pub fn get_owner_atas(&self, owner: &[u8; 32], cap: usize) -> Result<Vec<[u8; 32]>> {
+        let cf = self.cf(CF_OWNER_ATAS);
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek(owner);
+        let mut out = Vec::new();
+        while iter.valid() && out.len() < cap {
+            if let Some(key) = iter.key() {
+                if key.len() != 64 || &key[..32] != owner {
+                    break;
+                }
+                out.push(key[32..64].try_into().unwrap());
+            }
+            iter.next();
+        }
+        Ok(out)
+    }
+
     /// Get all accounts owned by a program via prefix scan.
     pub fn get_program_accounts(&self, program_id: &[u8; 32]) -> Result<Vec<([u8; 32], Vec<u8>)>> {
         let cf_prog = self.cf(CF_PROGRAM_INDEX);
         let cf_acct = self.cf(CF_ACCOUNTS);
 
-        let mut iter = self.db.raw_iterator_cf(&cf_prog);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_readahead_size(2 * 1024 * 1024);
+        let mut iter = self.db.raw_iterator_cf_opt(&cf_prog, read_opts);
         iter.seek(program_id);
 
         let mut pubkeys: Vec<[u8; 32]> = Vec::new();

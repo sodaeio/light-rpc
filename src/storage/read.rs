@@ -547,40 +547,68 @@ impl StorageReader {
         Ok(results)
     }
 
+    /// gTFA served entirely from RocksDB:
+    ///   1. prefix-scan owner_atas → token account pubkeys
+    ///   2. iter_sfa each address (owner + ATAs) with a per-iter cap of `limit`
+    ///   3. sort-merge by slot DESC, truncate to `limit`
+    ///   4. hydrate each signature via tx_index
+    const GTFA_ATA_CAP: usize = 2048;
+
     pub async fn get_transactions_for_address(
         &self,
         owner: &[u8],
         before_slot: Option<Slot>,
         limit: usize,
     ) -> Result<Vec<serde_json::Value>> {
-        let rows = self
-            .pg
-            .get_transactions_for_owner_with_atas(owner, before_slot, limit as i64)
-            .await?;
+        let owner_key: [u8; 32] = match owner.try_into() {
+            Ok(k) => k,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let atas = self.rocks.get_owner_atas(&owner_key, Self::GTFA_ATA_CAP)?;
+        let addresses: Vec<[u8; 32]> =
+            std::iter::once(owner_key).chain(atas).collect();
+
+        // Collect per-address signature lists. Each call is bounded by `limit`.
+        let mut all: Vec<(Slot, SignatureEntry)> =
+            Vec::with_capacity(addresses.len() * limit.min(100));
+        for addr in &addresses {
+            let pk = solana_pubkey::Pubkey::new_from_array(*addr);
+            let entries = self.rocks.iter_sfa(&pk, before_slot, limit)?;
+            for (slot, data) in entries {
+                if let Ok(sigs) = serde_json::from_slice::<Vec<SignatureEntry>>(&data) {
+                    for sig in sigs {
+                        all.push((slot, sig));
+                    }
+                }
+            }
+        }
+
+        all.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        all.truncate(limit);
+
         let finalized = self.cache.finalized_slot();
         let confirmed = self.cache.confirmed_slot();
-        let mut results = Vec::with_capacity(rows.len());
-        for row in rows {
-            let sig_bytes: [u8; 64] = match row.signature.as_slice().try_into() {
+        let mut results = Vec::with_capacity(all.len());
+        for (slot, sig) in all {
+            let sig_bytes: [u8; 64] = match sig.signature.as_ref().try_into() {
                 Ok(b) => b,
                 Err(_) => continue,
             };
             let tx = self
                 .get_transaction(&sig_bytes)?
                 .unwrap_or(serde_json::Value::Null);
-            let slot_u = row.slot as u64;
-            let status = if slot_u <= finalized {
+            let status = if slot <= finalized {
                 "finalized"
-            } else if slot_u <= confirmed {
+            } else if slot <= confirmed {
                 "confirmed"
             } else {
                 "processed"
             };
             results.push(serde_json::json!({
-                "signature": bs58::encode(&row.signature).into_string(),
-                "slot": row.slot,
-                "blockTime": row.block_time,
-                "err": row.err,
+                "signature": sig.signature.to_string(),
+                "slot": slot,
+                "err": sig.err,
                 "confirmationStatus": status,
                 "transaction": tx,
             }));
