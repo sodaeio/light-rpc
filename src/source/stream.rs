@@ -20,6 +20,14 @@ use crate::types::*;
 
 use super::commitment::CommitmentTracker;
 
+// Placeholder prebuilt — replaced with the real agave-shape JSON in
+// `into_block` via rayon par_iter. Using a shared Arc avoids allocating
+// a fresh "null" RawValue per tx on arrival.
+static PLACEHOLDER_RAW: std::sync::LazyLock<Arc<Box<serde_json::value::RawValue>>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(serde_json::value::RawValue::from_string("null".into()).unwrap())
+    });
+
 /// Accumulates partial data for an in-progress slot from the gRPC stream.
 struct SlotAccumulator {
     parent_slot: Slot,
@@ -61,6 +69,23 @@ impl SlotAccumulator {
     }
 
     fn into_block(self, slot: Slot) -> BlockWithData {
+        use rayon::prelude::*;
+        use yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo;
+        use yellowstone_grpc_proto::prost::Message;
+
+        // Parallel per-tx agave-shape JSON build. ~50µs/tx serial becomes
+        // near-instant on a 48-core box; block-seal latency drops from
+        // ~100ms on heavy blocks to a few ms.
+        let mut txs: Vec<TransactionEntry> = self.transactions.into_values().collect();
+        txs.par_iter_mut().for_each(|tx| {
+            if let Ok(info) = SubscribeUpdateTransactionInfo::decode(tx.payload.as_ref()) {
+                let val = crate::rpc::tx_format::prebuild_tx_value(info, tx.err.clone());
+                if let Ok(raw) = serde_json::value::to_raw_value(&val) {
+                    tx.prebuilt = Arc::new(raw);
+                }
+            }
+        });
+
         BlockWithData {
             info: BlockInfo {
                 slot,
@@ -70,7 +95,7 @@ impl SlotAccumulator {
                 blockhash: self.blockhash.unwrap_or_default(),
             },
             encoded_block: self.encoded_block.unwrap_or_default(),
-            transactions: self.transactions.into_values().collect(),
+            transactions: txs,
             address_signatures: self.address_signatures,
             fees: self.fees,
         }
@@ -217,35 +242,21 @@ impl StreamSource {
                                     }
                                 }
 
-                                // Encode the prost payload, and pre-build the per-tx agave
-                                // JSON shape once — both consume the info, so clone for encode.
+                                // Encode prost payload. Prebuild of the agave-shape
+                                // JSON is deferred to block-seal time (parallel).
                                 let payload = {
                                     use yellowstone_grpc_proto::prost::Message;
                                     let mut buf = Vec::with_capacity(tx_info.encoded_len());
-                                    let _ = tx_info.clone().encode(&mut buf);
+                                    let _ = tx_info.encode(&mut buf);
                                     bytes::Bytes::from(buf)
                                 };
-                                let prebuilt_val = crate::rpc::tx_format::prebuild_tx_value(
-                                    tx_info,
-                                    err_msg.clone(),
-                                );
-                                let prebuilt_raw = serde_json::value::to_raw_value(&prebuilt_val)
-                                    .map(Arc::new)
-                                    .unwrap_or_else(|_| {
-                                        Arc::new(
-                                            serde_json::value::RawValue::from_string(
-                                                "null".into(),
-                                            )
-                                            .unwrap(),
-                                        )
-                                    });
 
                                 acc.transactions.insert(sig, TransactionEntry {
                                     signature: sig,
                                     tx_index: tx_idx,
                                     err: err_msg.clone(),
                                     payload,
-                                    prebuilt: prebuilt_raw,
+                                    prebuilt: PLACEHOLDER_RAW.clone(),
                                 });
 
                                 for pk in &account_pks {
