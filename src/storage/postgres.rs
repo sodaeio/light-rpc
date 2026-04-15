@@ -104,23 +104,24 @@ impl PgStorage {
                 extensions JSONB
             )",
             "CREATE INDEX IF NOT EXISTS idx_token_accounts_mint_owner ON token_accounts(mint, owner)",
-            // Owner-only index serves getTokenAccountsByOwner without
-            // enumerating mints. Separate from (mint, owner) since Postgres
-            // doesn't use the second col of a multi-col index for leading
-            // filter.
-            "CREATE INDEX IF NOT EXISTS idx_token_accounts_owner ON token_accounts(owner) INCLUDE (mint, amount, slot_updated)",
-            // token_accounts gets frequent UPDATEs on balance. FILLFACTOR 85
-            // leaves 15% free space in each page so HOT updates stay in-page
-            // (no index churn). Measurable: cuts index bloat ~60% on hot mints.
+            // FILLFACTOR and autovacuum tuning are metadata-only ALTERs —
+            // cheap, safe to run at startup. They change future behavior
+            // but don't rewrite existing pages.
+            // FILLFACTOR 85 leaves 15% free space per page so balance
+            // UPDATEs stay HOT (no index churn). Cuts bloat ~60%.
             "ALTER TABLE token_accounts SET (fillfactor = 85)",
-            // Aggressive autovacuum — 615M-row tables with default settings
-            // accumulate dead tuples faster than vacuum can clean. These
-            // thresholds trigger when 5% of rows change vs default 20%.
+            // Aggressive autovacuum for 615M-row table. Triggers at 5% dead
+            // tuples vs default 20%; lower cost delay lets vacuum keep pace
+            // with write rate instead of falling behind.
             "ALTER TABLE token_accounts SET (
                 autovacuum_vacuum_scale_factor = 0.05,
                 autovacuum_analyze_scale_factor = 0.02,
                 autovacuum_vacuum_cost_delay = 10
             )",
+            // NOTE: idx_token_accounts_owner is a manual operation on large
+            // deployments — see MIGRATIONS.md. Building a covering index on
+            // 600M+ rows can take 30-60 minutes and must be done with
+            // CREATE INDEX CONCURRENTLY outside of a migration transaction.
 
         ];
 
@@ -132,8 +133,54 @@ impl PgStorage {
         }
 
         self.migrate_address_transactions_partitioned().await?;
+        self.bootstrap_address_partitions().await?;
 
         info!("postgres migrations complete");
+        Ok(())
+    }
+
+    /// Create an initial set of partitions covering the expected write range
+    /// so the writer doesn't fail with "no partition found" on the first
+    /// block before the retention loop's hourly tick runs.
+    ///
+    /// Seeds from the highest known slot (legacy table or slot_metas),
+    /// falling back to a reasonable mainnet floor if neither has data yet.
+    async fn bootstrap_address_partitions(&self) -> Result<()> {
+        // Use slot_metas only — it has idx_slot_desc so this is a 1-row
+        // index lookup. Never query MAX(slot) on address_transactions_legacy:
+        // no index on slot there, the seq scan takes minutes on 2TB tables.
+        let latest: Option<i64> = sqlx::query_scalar(
+            "SELECT slot FROM slot_metas ORDER BY slot DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+
+        // Fallback: mainnet was past slot 413M by April 2026.
+        let seed_slot = latest.unwrap_or(413_000_000).max(0) as u64;
+
+        // Cover a window around the seed: 2 back (for stragglers / backfills)
+        // and 4 forward (covers ~4 weeks of live ingest before retention loop
+        // needs to add more).
+        let current_partition = (seed_slot as i64) / Self::SLOTS_PER_PARTITION;
+        let start = (current_partition - 2).max(0);
+        for p in start..=current_partition + 4 {
+            let lower = p * Self::SLOTS_PER_PARTITION;
+            let upper = (p + 1) * Self::SLOTS_PER_PARTITION;
+            let name = format!("address_transactions_p{p:07}");
+            let sql = format!(
+                "CREATE TABLE IF NOT EXISTS {name}
+                 PARTITION OF address_transactions
+                 FOR VALUES FROM ({lower}) TO ({upper})"
+            );
+            sqlx::query(&sql).execute(&self.pool).await?;
+        }
+
+        info!(
+            seed_slot,
+            partitions_created = (current_partition + 4 - start + 1),
+            "bootstrapped address_transactions partitions"
+        );
         Ok(())
     }
 
@@ -568,23 +615,48 @@ impl PgStorage {
         Ok(rows)
     }
 
+    /// Cap the number of ATAs expanded into the query so a CEX-custody wallet
+    /// (millions of ATAs) doesn't turn into a multi-minute timeout. Real user
+    /// wallets never approach this.
+    const GTFA_ATA_CAP: i64 = 2048;
+
     pub async fn get_transactions_for_owner_with_atas(
         &self,
         owner: &[u8],
         before_slot: Option<Slot>,
         limit: i64,
     ) -> Result<Vec<AddressTransactionRow>> {
+        // Step 1: resolve ATAs up-front as a bounded Vec. Avoids the
+        // OR/IN(subquery) pattern that the Postgres planner refuses to
+        // push through the (address, slot) btree. Capping at GTFA_ATA_CAP
+        // keeps query latency predictable regardless of whale input.
+        let ata_pubkeys: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT pubkey FROM token_accounts
+             WHERE owner = $1
+             LIMIT $2",
+        )
+        .bind(owner)
+        .bind(Self::GTFA_ATA_CAP)
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Owner itself is always included in the address set.
+        let mut addrs: Vec<Vec<u8>> = Vec::with_capacity(ata_pubkeys.len() + 1);
+        addrs.push(owner.to_vec());
+        addrs.extend(ata_pubkeys);
+
+        // Step 2: single indexed lookup over the materialized address set.
+        // `= ANY($1)` lets the planner iterate and use idx_addr_txn_address_slot
+        // for each address independently, then merge-sort the top-N globally.
         let rows: Vec<AddressTransactionRow> = if let Some(before) = before_slot {
             sqlx::query_as(
                 "SELECT address, signature, slot, tx_index, block_time, err
                  FROM address_transactions
-                 WHERE (address = $1
-                        OR address IN (SELECT pubkey FROM token_accounts WHERE owner = $1))
-                   AND slot < $2
+                 WHERE address = ANY($1::bytea[]) AND slot < $2
                  ORDER BY slot DESC, tx_index DESC
                  LIMIT $3",
             )
-            .bind(owner)
+            .bind(&addrs)
             .bind(before as i64)
             .bind(limit)
             .fetch_all(&self.pool)
@@ -593,12 +665,11 @@ impl PgStorage {
             sqlx::query_as(
                 "SELECT address, signature, slot, tx_index, block_time, err
                  FROM address_transactions
-                 WHERE address = $1
-                    OR address IN (SELECT pubkey FROM token_accounts WHERE owner = $1)
+                 WHERE address = ANY($1::bytea[])
                  ORDER BY slot DESC, tx_index DESC
                  LIMIT $2",
             )
-            .bind(owner)
+            .bind(&addrs)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
