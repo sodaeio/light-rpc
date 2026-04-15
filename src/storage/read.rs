@@ -17,13 +17,13 @@ use super::rocks::UnifiedRocksDb;
 
 pub struct MemoryCache {
     blocks: RwLock<BTreeMap<Slot, Arc<BlockWithData>>>,
-    recent_blockhashes: RwLock<BTreeMap<Slot, Arc<str>>>,
+    /// arc_swap of an immutable BTreeMap. Reads are wait-free pointer loads.
+    /// Writers RCU-clone the map, mutate, and atomically swap.
+    recent_blockhashes: arc_swap::ArcSwap<BTreeMap<Slot, Arc<str>>>,
     processed_slot: AtomicU64,
     confirmed_slot: AtomicU64,
     finalized_slot: AtomicU64,
     /// Unix timestamp (seconds) of the most recent finalized-slot update.
-    /// Drives the /readyz liveness check: if no finalized update for N
-    /// seconds the ingest pipeline is considered stalled.
     finalized_slot_updated_at: AtomicU64,
 }
 
@@ -31,7 +31,7 @@ impl MemoryCache {
     pub fn new() -> Self {
         Self {
             blocks: RwLock::new(BTreeMap::new()),
-            recent_blockhashes: RwLock::new(BTreeMap::new()),
+            recent_blockhashes: arc_swap::ArcSwap::from_pointee(BTreeMap::new()),
             processed_slot: AtomicU64::new(0),
             confirmed_slot: AtomicU64::new(0),
             finalized_slot: AtomicU64::new(0),
@@ -66,7 +66,11 @@ impl MemoryCache {
     pub fn insert_block(&self, slot: Slot, block: Arc<BlockWithData>) {
         let blockhash: Arc<str> = Arc::from(block.info.blockhash.as_str());
         self.blocks.write().insert(slot, block);
-        self.recent_blockhashes.write().insert(slot, blockhash);
+        self.recent_blockhashes.rcu(|m| {
+            let mut next = (**m).clone();
+            next.insert(slot, blockhash.clone());
+            next
+        });
         let current = self.processed_slot.load(Ordering::Relaxed);
         if slot > current {
             self.processed_slot.store(slot, Ordering::Relaxed);
@@ -79,12 +83,12 @@ impl MemoryCache {
     }
 
     pub fn get_blockhash(&self, slot: Slot) -> Option<Arc<str>> {
-        self.recent_blockhashes.read().get(&slot).cloned()
+        self.recent_blockhashes.load().get(&slot).cloned()
     }
 
     pub fn is_blockhash_valid(&self, blockhash: &str) -> bool {
         self.recent_blockhashes
-            .read()
+            .load()
             .values()
             .any(|h| h.as_ref() == blockhash)
     }
@@ -112,12 +116,14 @@ impl MemoryCache {
     fn gc(&self, finalized: Slot) {
         let cutoff = finalized.saturating_sub(64);
         self.blocks.write().retain(|s, _| *s >= cutoff);
-        let mut hashes = self.recent_blockhashes.write();
-        hashes.retain(|s, _| *s >= cutoff);
-        while hashes.len() > 512 {
-            hashes.pop_first();
-        }
-        drop(hashes);
+        self.recent_blockhashes.rcu(|m| {
+            let mut next = (**m).clone();
+            next.retain(|s, _| *s >= cutoff);
+            while next.len() > 512 {
+                next.pop_first();
+            }
+            next
+        });
         metrics::MEMORY_CACHED_BLOCKS.set(self.blocks.read().len() as i64);
     }
 }
@@ -138,6 +144,17 @@ pub struct StorageReader {
     rocks: UnifiedRocksDb,
     files: Arc<BlockFileStorage>,
     pg: PgStorage,
+    /// Signature → decoded RPC-shape JSON. Confirmed txs never change so
+    /// entries live until LRU evicts them.
+    tx_cache: parking_lot::Mutex<lru::LruCache<[u8; 64], Arc<serde_json::Value>>>,
+    /// Mint pubkey → (decimals, slot_updated). Saves a PG round-trip on
+    /// every getTokenLargestAccounts / getTokenSupply for hot mints.
+    mint_meta_cache: dashmap::DashMap<[u8; 32], (i32, u64)>,
+    /// pubkey → deserialized account. Invalidated by the writer on account
+    /// updates through WriteToReadMessage::AccountUpdated.
+    account_lru: parking_lot::Mutex<
+        lru::LruCache<[u8; 32], Arc<super::accounts::StoredAccount>>,
+    >,
 }
 
 impl StorageReader {
@@ -152,6 +169,13 @@ impl StorageReader {
             rocks,
             files,
             pg,
+            tx_cache: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(50_000).unwrap(),
+            )),
+            mint_meta_cache: dashmap::DashMap::new(),
+            account_lru: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(100_000).unwrap(),
+            )),
         }
     }
 
@@ -185,14 +209,51 @@ impl StorageReader {
         }
     }
 
+    pub async fn run_reader_invalidator(
+        self: Arc<Self>,
+        mut rx: broadcast::Receiver<WriteToReadMessage>,
+    ) {
+        info!("reader invalidator started");
+        loop {
+            match rx.recv().await {
+                Ok(WriteToReadMessage::AccountsUpdated { pubkeys }) => {
+                    let mut lru = self.account_lru.lock();
+                    for pk in &pubkeys {
+                        lru.pop(pk);
+                    }
+                }
+                Ok(WriteToReadMessage::MintUpdated {
+                    mint,
+                    decimals,
+                    slot,
+                }) => {
+                    self.mint_meta_insert(mint, decimals, slot);
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "reader invalidator lagged")
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+
     // -- Private helpers (RocksDB point lookups) --
 
     fn rocks_get_account(&self, pubkey: &[u8; 32]) -> Option<StoredAccount> {
-        self.rocks
+        if let Some(arc) = self.account_lru.lock().get(pubkey).cloned() {
+            return Some((*arc).clone());
+        }
+        let stored = self
+            .rocks
             .get_account(pubkey)
             .ok()
             .flatten()
-            .and_then(|data| StoredAccount::deserialize(&data))
+            .and_then(|data| StoredAccount::deserialize(&data))?;
+        self.account_lru
+            .lock()
+            .put(*pubkey, Arc::new(stored.clone()));
+        Some(stored)
     }
 
     fn encode_account_data(data: &[u8], encoding: &str) -> serde_json::Value {
@@ -518,10 +579,50 @@ impl StorageReader {
     }
 
     pub fn get_transaction(&self, signature: &[u8; 64]) -> Result<Option<serde_json::Value>> {
+        if let Some(cached) = self.tx_cache.lock().get(signature).cloned() {
+            return Ok(Some((*cached).clone()));
+        }
         if let Some(data) = self.rocks.get_tx_index(signature)? {
-            return Ok(Some(crate::rpc::tx_format::decode_tx_index(&data)?));
+            let decoded = crate::rpc::tx_format::decode_tx_index(&data)?;
+            self.tx_cache
+                .lock()
+                .put(*signature, Arc::new(decoded.clone()));
+            return Ok(Some(decoded));
         }
         Ok(None)
+    }
+
+    pub fn get_transactions_batch(
+        &self,
+        signatures: &[[u8; 64]],
+    ) -> Result<Vec<Option<serde_json::Value>>> {
+        let mut results: Vec<Option<serde_json::Value>> = Vec::with_capacity(signatures.len());
+        let mut missing: Vec<(usize, [u8; 64])> = Vec::new();
+        {
+            let mut cache = self.tx_cache.lock();
+            for (i, sig) in signatures.iter().enumerate() {
+                if let Some(v) = cache.get(sig) {
+                    results.push(Some((**v).clone()));
+                } else {
+                    results.push(None);
+                    missing.push((i, *sig));
+                }
+            }
+        }
+        if missing.is_empty() {
+            return Ok(results);
+        }
+        let miss_keys: Vec<[u8; 64]> = missing.iter().map(|(_, s)| *s).collect();
+        let raw = self.rocks.get_tx_index_batch(&miss_keys)?;
+        let mut cache = self.tx_cache.lock();
+        for ((idx, sig), data) in missing.into_iter().zip(raw) {
+            if let Some(bytes) = data {
+                let decoded = crate::rpc::tx_format::decode_tx_index(&bytes)?;
+                cache.put(sig, Arc::new(decoded.clone()));
+                results[idx] = Some(decoded);
+            }
+        }
+        Ok(results)
     }
 
     pub fn get_signatures_for_address(
@@ -813,30 +914,66 @@ impl StorageReader {
         mint: &[u8],
         limit: i64,
     ) -> Result<Vec<serde_json::Value>> {
-        // Get decimals from mint for proper UI formatting
-        let decimals = if let Some(mint_row) = self.pg.get_token_mint(mint).await? {
-            mint_row.decimals
-        } else {
-            0
+        let mint_key: [u8; 32] = match mint.try_into() {
+            Ok(k) => k,
+            Err(_) => return Ok(Vec::new()),
         };
-        let rows = self.pg.get_token_largest_accounts(mint, limit).await?;
-        Ok(rows
+        let decimals = self.mint_decimals_cached(&mint_key, mint).await;
+        let mut holders = self.rocks.get_mint_top_holders(&mint_key)?;
+        // Empty top-holders means we haven't seen any token account writes for
+        // this mint yet — fall back to PG until ingest backfills.
+        if holders.is_empty() {
+            let rows = self.pg.get_token_largest_accounts(mint, limit).await?;
+            return Ok(rows
+                .iter()
+                .map(|row| Self::token_holder_json(&row.pubkey, row.amount as u64, decimals))
+                .collect());
+        }
+        holders.truncate(limit as usize);
+        Ok(holders
             .iter()
-            .map(|row| {
-                let ui_amount = if decimals > 0 {
-                    row.amount as f64 / 10f64.powi(decimals)
-                } else {
-                    row.amount as f64
-                };
-                serde_json::json!({
-                    "address": bs58::encode(&row.pubkey).into_string(),
-                    "amount": row.amount.to_string(),
-                    "decimals": decimals,
-                    "uiAmount": ui_amount,
-                    "uiAmountString": format!("{ui_amount}"),
-                })
-            })
+            .map(|(amount, pk)| Self::token_holder_json(pk, *amount, decimals))
             .collect())
+    }
+
+    async fn mint_decimals_cached(&self, mint_key: &[u8; 32], mint: &[u8]) -> i32 {
+        if let Some(entry) = self.mint_meta_cache.get(mint_key) {
+            return entry.0;
+        }
+        let decimals = self
+            .pg
+            .get_token_mint(mint)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.decimals)
+            .unwrap_or(0);
+        self.mint_meta_cache
+            .insert(*mint_key, (decimals, self.cache.processed_slot()));
+        decimals
+    }
+
+    pub fn mint_meta_insert(&self, mint: [u8; 32], decimals: i32, slot: u64) {
+        self.mint_meta_cache.insert(mint, (decimals, slot));
+    }
+
+    pub fn account_lru_invalidate(&self, pubkey: &[u8; 32]) {
+        self.account_lru.lock().pop(pubkey);
+    }
+
+    fn token_holder_json(pubkey: &[u8], amount: u64, decimals: i32) -> serde_json::Value {
+        let ui_amount = if decimals > 0 {
+            amount as f64 / 10f64.powi(decimals)
+        } else {
+            amount as f64
+        };
+        serde_json::json!({
+            "address": bs58::encode(pubkey).into_string(),
+            "amount": amount.to_string(),
+            "decimals": decimals,
+            "uiAmount": ui_amount,
+            "uiAmountString": format!("{ui_amount}"),
+        })
     }
 
     // -- Public API: DAS Assets (PostgreSQL) --

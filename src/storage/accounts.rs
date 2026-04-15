@@ -2,7 +2,7 @@ use super::rocks::{StoredAccountEntry, UnifiedRocksDb};
 use crate::types::*;
 
 /// Serialized account data stored in RocksDB.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredAccount {
     pub owner: [u8; 32],
     pub lamports: u64,

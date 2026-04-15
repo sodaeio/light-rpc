@@ -319,34 +319,65 @@ impl StorageWriter {
                 Ok(count) => debug!(count, "wrote program accounts to rocksdb"),
                 Err(e) => error!(error = %e, "failed to write program accounts"),
             }
+            let pubkeys: Vec<[u8; 32]> = prog_refs.iter().map(|u| u.pubkey.to_bytes()).collect();
+            let _ = self
+                .broadcast_tx
+                .send(WriteToReadMessage::AccountsUpdated { pubkeys });
         }
 
         // Token mints → PG (via bounded channel, non-blocking)
         if !mint_updates.is_empty() {
+            for m in &mint_updates {
+                if m.data.len() >= 45 {
+                    let _ = self.broadcast_tx.send(WriteToReadMessage::MintUpdated {
+                        mint: m.pubkey.to_bytes(),
+                        decimals: m.data[44] as i32,
+                        slot: m.slot,
+                    });
+                }
+            }
             let owned: Vec<AccountUpdate> = mint_updates.into_iter().cloned().collect();
             let _ = self.pg_tx.try_send(PgWriteJob::TokenMints(owned));
         }
 
         // Token accounts → PG (via bounded channel, non-blocking)
         if !ta_updates.is_empty() {
-            // Index owner → token_account for gTFA. Token Account layout has
-            // the owner wallet at bytes [32..64] of account data.
-            let atas: Vec<([u8; 32], [u8; 32])> = ta_updates
-                .iter()
-                .filter_map(|u| {
-                    if u.data.len() < 64 {
-                        return None;
-                    }
-                    let mut owner = [0u8; 32];
-                    owner.copy_from_slice(&u.data[32..64]);
-                    Some((owner, u.pubkey.to_bytes()))
-                })
-                .collect();
+            // Index owner → token_account for gTFA. SPL Token Account layout
+            // puts the owner wallet at bytes [32..64] of account data and the
+            // amount at [64..72] LE.
+            let mut atas: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(ta_updates.len());
+            let mut by_mint: std::collections::HashMap<[u8; 32], Vec<(u64, [u8; 32])>> =
+                std::collections::HashMap::new();
+            for u in &ta_updates {
+                if u.data.len() < 72 {
+                    continue;
+                }
+                let mut mint = [0u8; 32];
+                mint.copy_from_slice(&u.data[0..32]);
+                let mut owner = [0u8; 32];
+                owner.copy_from_slice(&u.data[32..64]);
+                let amount = u64::from_le_bytes(u.data[64..72].try_into().unwrap());
+                atas.push((owner, u.pubkey.to_bytes()));
+                by_mint
+                    .entry(mint)
+                    .or_default()
+                    .push((amount, u.pubkey.to_bytes()));
+            }
             if !atas.is_empty() {
                 if let Err(e) = self.rocks.put_owner_atas_batch(&atas) {
                     error!(error = %e, "failed to write owner_atas");
                 }
             }
+            for (mint, updates) in by_mint {
+                if let Err(e) = self.rocks.update_mint_top_holders(&mint, &updates) {
+                    error!(error = %e, "failed to update mint_top_holders");
+                }
+            }
+            let pubkeys: Vec<[u8; 32]> =
+                ta_updates.iter().map(|u| u.pubkey.to_bytes()).collect();
+            let _ = self
+                .broadcast_tx
+                .send(WriteToReadMessage::AccountsUpdated { pubkeys });
             let owned: Vec<AccountUpdate> = ta_updates.into_iter().cloned().collect();
             let _ = self.pg_tx.try_send(PgWriteJob::TokenAccounts(owned));
         }

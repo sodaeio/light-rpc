@@ -24,16 +24,24 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .get(1)
             .and_then(|v| v.get("encoding"))
             .and_then(|v| v.as_str())
-            .unwrap_or("base64");
+            .unwrap_or("base64")
+            .to_string();
         let slot = ctx.reader.cache().processed_slot();
 
-        match ctx.reader.get_account_info(&pubkey_bytes, encoding).await {
-            Ok(Some(account)) => {
-                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(slot, account))
-            }
-            Ok(None) => Ok(rpc_response(slot, serde_json::Value::Null)),
-            Err(e) => Err(err(-32603, &e.to_string())),
-        }
+        let reader = std::sync::Arc::clone(&ctx.reader);
+        let key = (pubkey_bytes, encoding.clone());
+        let arc = ctx
+            .gai_coalescer
+            .run(key, move || async move {
+                reader
+                    .get_account_info(&pubkey_bytes, &encoding)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(serde_json::Value::Null)
+            })
+            .await;
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(slot, (*arc).clone()))
     })?;
 
     module.register_async_method("getMultipleAccounts", |params, ctx, _| async move {

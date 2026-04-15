@@ -163,4 +163,12 @@ pub enum WriteToReadMessage {
     BlockDead {
         slot: Slot,
     },
+    AccountsUpdated {
+        pubkeys: Vec<[u8; 32]>,
+    },
+    MintUpdated {
+        mint: [u8; 32],
+        decimals: i32,
+        slot: Slot,
+    },
 }

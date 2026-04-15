@@ -34,6 +34,10 @@ pub struct RpcContext {
     pub gpa_blocked: std::collections::HashSet<[u8; 32]>,
     pub gpa_max_accounts: usize,
     pub block_cache: BlockResponseCache,
+    pub gai_coalescer:
+        Arc<crate::rpc::coalesce::Coalescer<([u8; 32], String), serde_json::Value>>,
+    pub gtla_coalescer:
+        Arc<crate::rpc::coalesce::Coalescer<[u8; 32], Vec<serde_json::Value>>>,
 }
 
 pub const BLOCK_CACHE_SHARDS: usize = 16;
@@ -92,6 +96,8 @@ impl RpcServer {
             gpa_blocked,
             gpa_max_accounts: self.config.gpa_max_accounts,
             block_cache,
+            gai_coalescer: Arc::new(crate::rpc::coalesce::Coalescer::new()),
+            gtla_coalescer: Arc::new(crate::rpc::coalesce::Coalescer::new()),
         };
 
         let module = methods::build_rpc_module(context)?;

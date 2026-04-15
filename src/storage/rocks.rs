@@ -16,6 +16,7 @@ const CF_SFA_INDEX: &str = "sfa_index";
 const CF_ACCOUNTS: &str = "accounts";
 const CF_PROGRAM_INDEX: &str = "program_index";
 const CF_OWNER_ATAS: &str = "owner_atas";
+const CF_MINT_TOP_HOLDERS: &str = "mint_top_holders";
 
 const ALL_CFS: &[&str] = &[
     CF_SLOT_INDEX,
@@ -24,7 +25,10 @@ const ALL_CFS: &[&str] = &[
     CF_ACCOUNTS,
     CF_PROGRAM_INDEX,
     CF_OWNER_ATAS,
+    CF_MINT_TOP_HOLDERS,
 ];
+
+pub const MINT_TOP_HOLDERS_K: usize = 100;
 
 fn apply_cf_compaction_tuning(opts: &mut Options) {
     apply_cf_compaction_tuning_with(opts, 2);
@@ -116,6 +120,7 @@ impl UnifiedRocksDb {
             Self::accounts_cf_opts(&cache),
             Self::program_index_cf_opts(&cache),
             Self::owner_atas_cf_opts(&cache),
+            Self::mint_top_holders_cf_opts(&cache),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)
@@ -188,6 +193,17 @@ impl UnifiedRocksDb {
         ColumnFamilyDescriptor::new(CF_OWNER_ATAS, opts)
     }
 
+    fn mint_top_holders_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
+        // Key mint(32) → bincode Vec<(amount u64, pubkey [u8;32])> sorted DESC,
+        // capped at MINT_TOP_HOLDERS_K. Point lookup CF.
+        let mut opts = Options::default();
+        opts.set_compression_type(DBCompressionType::Lz4);
+        apply_cf_compaction_tuning_with(&mut opts, 1);
+        let block_opts = build_block_opts(cache, 4 * 1024, true, false);
+        opts.set_block_based_table_factory(&block_opts);
+        ColumnFamilyDescriptor::new(CF_MINT_TOP_HOLDERS, opts)
+    }
+
     fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
         self.db.cf_handle(name).expect("column family must exist")
     }
@@ -213,6 +229,18 @@ impl UnifiedRocksDb {
 
     pub fn get_tx_index(&self, signature: &[u8; 64]) -> Result<Option<Vec<u8>>> {
         Ok(self.db.get_cf(&self.cf(CF_TX_INDEX), signature)?)
+    }
+
+    pub fn get_tx_index_batch(&self, signatures: &[[u8; 64]]) -> Result<Vec<Option<Vec<u8>>>> {
+        let cf = self.cf(CF_TX_INDEX);
+        let keys: Vec<(&Arc<BoundColumnFamily<'_>>, &[u8; 64])> =
+            signatures.iter().map(|s| (&cf, s)).collect();
+        Ok(self
+            .db
+            .multi_get_cf(keys)
+            .into_iter()
+            .map(|r| r.ok().flatten())
+            .collect())
     }
 
     /// Write address → signature entries for a slot.
@@ -321,6 +349,43 @@ impl UnifiedRocksDb {
             batch.put_cf(&cf, key, []);
         }
         self.db.write(batch)?;
+        Ok(())
+    }
+
+    pub fn get_mint_top_holders(&self, mint: &[u8; 32]) -> Result<Vec<(u64, [u8; 32])>> {
+        match self.db.get_cf(&self.cf(CF_MINT_TOP_HOLDERS), mint)? {
+            Some(bytes) => Ok(bincode::deserialize(&bytes).unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Merge `updates` into the per-mint top-K, persist if changed.
+    /// `updates` is `(amount, token_account_pubkey)` for each freshly-written
+    /// token account belonging to `mint`.
+    pub fn update_mint_top_holders(
+        &self,
+        mint: &[u8; 32],
+        updates: &[(u64, [u8; 32])],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let cf = self.cf(CF_MINT_TOP_HOLDERS);
+        let mut current: Vec<(u64, [u8; 32])> = match self.db.get_cf(&cf, mint)? {
+            Some(bytes) => bincode::deserialize(&bytes).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        // Replace existing entries for the same pubkeys, then add new ones.
+        for (amount, pk) in updates {
+            current.retain(|(_, existing)| existing != pk);
+            if *amount > 0 {
+                current.push((*amount, *pk));
+            }
+        }
+        current.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        current.truncate(MINT_TOP_HOLDERS_K);
+        let encoded = bincode::serialize(&current)?;
+        self.db.put_cf(&cf, mint, encoded)?;
         Ok(())
     }
 

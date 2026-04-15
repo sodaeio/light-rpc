@@ -1,6 +1,6 @@
 [package]
 name = "light-indexer"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 publish = false
 
@@ -69,6 +69,8 @@ thiserror = "2.0"
 mimalloc = { version = "0.1", default-features = false }
 socket2 = { version = "0.5", features = ["all"] }
 lru = "0.12"
+arc-swap = "1.7"
+dashmap = "6.1"
 num_cpus = "1.16"
 chrono = "0.4"
 parking_lot = "0.12"

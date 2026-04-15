@@ -115,6 +115,7 @@ async fn run(config: Config) -> Result<()> {
     tokio::spawn(async move { pg_writer_loop(pg_writer, pg_rx).await });
 
     let cache_rx = broadcast_tx.subscribe();
+    let invalidator_rx = broadcast_tx.subscribe();
     let cache_ref = Arc::clone(&memory_cache);
     tokio::spawn(async move { StorageReader::run_cache_updater(cache_ref, cache_rx).await });
 
@@ -160,6 +161,10 @@ async fn run(config: Config) -> Result<()> {
     });
 
     let reader = Arc::new(StorageReader::new(memory_cache, rocks, files, pg));
+    let invalidator_reader = Arc::clone(&reader);
+    tokio::spawn(async move {
+        invalidator_reader.run_reader_invalidator(invalidator_rx).await;
+    });
     let upstream = config.rpc.upstream.as_ref().map(|endpoint| {
         UpstreamForwarder::new(endpoint.clone(), config.rpc.forwarded_methods.clone())
     });

@@ -30,6 +30,25 @@ SELECT indexrelid::regclass, indisvalid, pg_size_pretty(pg_relation_size(indexre
 FROM pg_index WHERE indexrelid = 'idx_token_accounts_owner'::regclass;
 ```
 
+## Manual: partial index on `asset(owner)` for DAS
+
+`getAssetsByOwner` is bound by a sequential scan of `asset` joined with
+`asset_data`. On large deployments add a partial index that only covers
+non-burnt assets (the only ones DAS queries surface):
+
+```bash
+psql "postgres://solanadb:solanapwd@localhost:5432/solanadb" <<'SQL'
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_asset_owner_burnt
+    ON asset(owner)
+    WHERE burnt = false;
+SQL
+```
+
+Same constraints as the other manual ops — must be `CONCURRENTLY` outside
+a transaction. Expect 30-60 minutes on a multi-million-row asset table.
+
 ## Manual: drop legacy `address_transactions_legacy`
 
 After the partitioning migration has been running 30+ days (your retention window), the legacy non-partitioned table holds nothing newer than the retention cutoff. Drop it to reclaim disk:
