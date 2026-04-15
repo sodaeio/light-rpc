@@ -201,44 +201,65 @@ impl StreamSource {
                                 let err_msg = tx_info.meta.as_ref()
                                     .and_then(|m| m.err.as_ref())
                                     .map(|e| format!("{:?}", e));
+                                let fee = tx_info.meta.as_ref().map(|m| m.fee).unwrap_or(0);
+                                let tx_idx = tx_info.index as u32;
 
-                                // Use yellowstone's prost export (ours is a different version).
+                                // Harvest address keys before the proto is consumed by encode().
+                                let mut account_pks: Vec<Pubkey> = Vec::new();
+                                if let Some(tx_msg) = &tx_info.transaction {
+                                    if let Some(msg) = &tx_msg.message {
+                                        account_pks.reserve(msg.account_keys.len());
+                                        for key in &msg.account_keys {
+                                            if let Ok(pk) = Pubkey::try_from(key.as_slice()) {
+                                                account_pks.push(pk);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Encode the prost payload, and pre-build the per-tx agave
+                                // JSON shape once — both consume the info, so clone for encode.
                                 let payload = {
                                     use yellowstone_grpc_proto::prost::Message;
                                     let mut buf = Vec::with_capacity(tx_info.encoded_len());
-                                    let _ = tx_info.encode(&mut buf);
+                                    let _ = tx_info.clone().encode(&mut buf);
                                     bytes::Bytes::from(buf)
                                 };
-                                let tx_idx = tx_info.index as u32;
+                                let prebuilt_val = crate::rpc::tx_format::prebuild_tx_value(
+                                    tx_info,
+                                    err_msg.clone(),
+                                );
+                                let prebuilt_raw = serde_json::value::to_raw_value(&prebuilt_val)
+                                    .map(Arc::new)
+                                    .unwrap_or_else(|_| {
+                                        Arc::new(
+                                            serde_json::value::RawValue::from_string(
+                                                "null".into(),
+                                            )
+                                            .unwrap(),
+                                        )
+                                    });
 
                                 acc.transactions.insert(sig, TransactionEntry {
                                     signature: sig,
                                     tx_index: tx_idx,
                                     err: err_msg.clone(),
                                     payload,
+                                    prebuilt: prebuilt_raw,
                                 });
 
-                                // Index address → signature for getSignaturesForAddress
-                                if let Some(tx_msg) = &tx_info.transaction {
-                                    if let Some(msg) = &tx_msg.message {
-                                        for key in &msg.account_keys {
-                                            if let Ok(pk) = Pubkey::try_from(key.as_slice()) {
-                                                acc.address_signatures
-                                                    .entry(pk)
-                                                    .or_default()
-                                                    .push(SignatureEntry {
-                                                        signature: sig,
-                                                        err: err_msg.clone(),
-                                                        memo: None,
-                                                    });
-                                            }
-                                        }
-                                    }
+                                for pk in &account_pks {
+                                    acc.address_signatures
+                                        .entry(*pk)
+                                        .or_default()
+                                        .push(SignatureEntry {
+                                            signature: sig,
+                                            err: err_msg.clone(),
+                                            memo: None,
+                                        });
                                 }
 
-                                if let Some(meta) = &tx_info.meta {
-                                    acc.fees.push(meta.fee);
-                                }
+                                acc.fees.push(fee);
 
                                 txs_count += 1;
                                 metrics::INGESTED_TRANSACTIONS.inc();

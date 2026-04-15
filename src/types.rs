@@ -81,6 +81,9 @@ pub struct TransactionEntry {
     pub err: Option<String>,
     /// prost-encoded SubscribeUpdateTransactionInfo.
     pub payload: bytes::Bytes,
+    /// Agave-shape JSON, pre-built at ingest. Hot-path getTransaction and
+    /// getBlock(full) clone this Arc rather than re-decoding the prost payload.
+    pub prebuilt: Arc<Box<serde_json::value::RawValue>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

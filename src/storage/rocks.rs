@@ -83,15 +83,18 @@ impl UnifiedRocksDb {
         let path = Path::new(&config.path);
         std::fs::create_dir_all(path).context("creating rocksdb directory")?;
 
-        // Shared block cache across all CFs — bounds total memory usage.
-        // Without this, each CF allocates its own unbounded cache.
-        let cache = Cache::new_lru_cache(1024 * 1024 * 1024); // 1 GiB shared
+        // Shared block cache across all CFs. 32 GiB: hot blocks + indexes
+        // stay hot in RAM on our 377 GiB host.
+        let cache = Cache::new_lru_cache(32 * 1024 * 1024 * 1024);
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        db_opts.set_write_buffer_size(64 * 1024 * 1024);
-        db_opts.set_max_write_buffer_number(2);
+        // Write buffer tuning: 128 MB × 4. Larger than the original 64×2
+        // for burst ingest headroom, but not 256×8 — bigger memtables
+        // slow range scans (measured gSFA regression at that size).
+        db_opts.set_write_buffer_size(128 * 1024 * 1024);
+        db_opts.set_max_write_buffer_number(4);
         db_opts.set_max_open_files(config.max_open_files);
         db_opts.set_allow_concurrent_memtable_write(true);
         let parallelism = std::thread::available_parallelism()
@@ -103,6 +106,11 @@ impl UnifiedRocksDb {
 
         // 200 MB/s — tune up on enterprise SSDs.
         db_opts.set_ratelimiter(200 * 1024 * 1024, 100_000, 10);
+
+        // Direct I/O for flush+compaction was measured neutral on our NVMe;
+        // leaving off so the kernel page cache keeps helping sfa_index
+        // prefix-scan read-ahead. Revisit when dedicated I/O threads land.
+        // db_opts.set_use_direct_io_for_flush_and_compaction(true);
 
         db_opts.enable_statistics();
         db_opts.set_stats_dump_period_sec(600);

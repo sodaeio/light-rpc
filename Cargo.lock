@@ -2329,6 +2329,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "itoa",
  "jsonrpsee",
  "jsonrpsee-core",
  "jsonrpsee-types",

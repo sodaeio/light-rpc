@@ -21,9 +21,16 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .try_into()
             .map_err(|_| err(-32602, "Invalid signature length"))?;
 
+        // Hot path: memory-cached prebuilt (last ~64 slots). Splices slot +
+        // blockTime into the stored per-tx RawValue at response time.
+        if let Some(raw) = ctx.reader.get_transaction_prebuilt(&sig_bytes) {
+            return Ok::<Box<serde_json::value::RawValue>, jsonrpsee::types::ErrorObjectOwned>(raw);
+        }
+
+        let null_raw = || serde_json::value::RawValue::from_string("null".into()).unwrap();
         match ctx.reader.get_transaction(&sig_bytes) {
-            Ok(Some(info)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(info),
-            Ok(None) => Ok(serde_json::Value::Null),
+            Ok(Some(info)) => Ok(serde_json::value::to_raw_value(&info).unwrap_or_else(|_| null_raw())),
+            Ok(None) => Ok(null_raw()),
             Err(e) => Err(err(-32603, &e.to_string())),
         }
     })?;

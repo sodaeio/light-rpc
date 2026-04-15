@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use jsonrpsee::types::Params;
 use jsonrpsee::RpcModule;
@@ -8,6 +10,76 @@ use crate::types::*;
 
 fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObject::owned(code, msg.to_string(), None::<()>)
+}
+
+/// Build the getBlock response as raw JSON bytes and insert into the shard
+/// cache. Returns None when the slot is missing. Called exactly once per
+/// (slot, cfg_hash) under the block coalescer.
+fn build_block_raw(
+    reader: &crate::storage::read::StorageReader,
+    slot: Slot,
+    cfg_hash: u64,
+    tx_details: &str,
+    include_rewards: bool,
+    shard: usize,
+    block_cache: &crate::rpc::server::BlockResponseCache,
+) -> Option<crate::rpc::server::BlockCacheEntry> {
+    let block = reader.get_block(slot).ok().flatten()?;
+
+    let per_tx = if tx_details == "full" { 1536 } else { 96 };
+    let mut body = String::with_capacity(32 + block.transactions.len() * per_tx);
+    body.push_str(r#"{"blockhash":""#);
+    body.push_str(&block.info.blockhash);
+    body.push_str(r#"","previousBlockhash":null,"parentSlot":"#);
+    body.push_str(&block.info.parent_slot.to_string());
+    body.push_str(r#","blockTime":"#);
+    match block.info.block_time {
+        Some(t) => body.push_str(&t.to_string()),
+        None => body.push_str("null"),
+    }
+    body.push_str(r#","blockHeight":"#);
+    match block.info.block_height {
+        Some(h) => body.push_str(&h.to_string()),
+        None => body.push_str("null"),
+    }
+    body.push_str(r#","rewards":"#);
+    body.push_str(if include_rewards { "[]" } else { "null" });
+    match tx_details {
+        "none" => {
+            body.push_str(r#","transactions":[]"#);
+        }
+        "signatures" => {
+            body.push_str(r#","signatures":["#);
+            for (i, t) in block.transactions.iter().enumerate() {
+                if i > 0 {
+                    body.push(',');
+                }
+                body.push('"');
+                body.push_str(&t.signature.to_string());
+                body.push('"');
+            }
+            body.push(']');
+        }
+        _ => {
+            body.push_str(r#","transactions":["#);
+            for (i, t) in block.transactions.iter().enumerate() {
+                if i > 0 {
+                    body.push(',');
+                }
+                body.push_str(t.prebuilt.get());
+            }
+            body.push(']');
+        }
+    }
+    body.push('}');
+
+    let raw: Box<serde_json::value::RawValue> = serde_json::value::RawValue::from_string(body)
+        .ok()?;
+    let entry: crate::rpc::server::BlockCacheEntry = Arc::new(raw);
+    block_cache[shard]
+        .lock()
+        .put((slot, cfg_hash), entry.clone());
+    Some(entry)
 }
 
 pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
@@ -39,51 +111,30 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
         let shard = crate::rpc::server::block_cache_shard(slot, cfg_hash);
         if let Some(cached) = ctx.block_cache[shard].lock().get(&(slot, cfg_hash)).cloned() {
-            return Ok::<_, jsonrpsee::types::ErrorObjectOwned>((*cached).clone());
+            return Ok::<crate::rpc::server::BlockCacheEntry, jsonrpsee::types::ErrorObjectOwned>(cached);
         }
 
-        match ctx.reader.get_block(slot) {
-            Ok(Some(block)) => {
-                let transactions = match tx_details {
-                    "none" => serde_json::Value::Array(Vec::new()),
-                    "signatures" => serde_json::json!(block
-                        .transactions
-                        .iter()
-                        .map(|t| t.signature.to_string())
-                        .collect::<Vec<_>>()),
-                    _ => serde_json::json!(block
-                        .transactions
-                        .iter()
-                        .map(|t| {
-                            crate::rpc::tx_format::decode_payload(&t.payload, t.err.clone())
-                                .unwrap_or_else(|_| serde_json::json!({
-                                    "transaction": { "signatures": [t.signature.to_string()] },
-                                    "meta": { "err": t.err.as_ref().map(|e| serde_json::json!(e)) },
-                                    "version": "legacy",
-                                }))
-                        })
-                        .collect::<Vec<_>>()),
-                };
-                let response = serde_json::json!({
-                    "blockhash": block.info.blockhash,
-                    "previousBlockhash": null,
-                    "parentSlot": block.info.parent_slot,
-                    "blockTime": block.info.block_time,
-                    "blockHeight": block.info.block_height,
-                    "rewards": if include_rewards { serde_json::json!([]) } else { serde_json::Value::Null },
-                    "transactions": transactions,
-                });
-                let arc = std::sync::Arc::new(response);
-                ctx.block_cache[shard]
-                    .lock()
-                    .put((slot, cfg_hash), arc.clone());
-                Ok::<_, jsonrpsee::types::ErrorObjectOwned>((*arc).clone())
-            }
-            Ok(None) => Err(err(
-                -32009,
-                "Slot was skipped, or missing in long-term storage",
-            )),
-            Err(e) => Err(err(-32603, &e.to_string())),
+        // Singleflight on (slot, cfg_hash) — N concurrent first-time callers
+        // share one build pass.
+        let reader = std::sync::Arc::clone(&ctx.reader);
+        let block_cache = std::sync::Arc::clone(&ctx.block_cache);
+        let tx_details_owned = tx_details.to_string();
+        let built = ctx.block_coalescer
+            .run((slot, cfg_hash), move || async move {
+                build_block_raw(
+                    &reader,
+                    slot,
+                    cfg_hash,
+                    &tx_details_owned,
+                    include_rewards,
+                    shard,
+                    &block_cache,
+                )
+            })
+            .await;
+        match (*built).clone() {
+            Some(entry) => Ok::<crate::rpc::server::BlockCacheEntry, jsonrpsee::types::ErrorObjectOwned>(entry),
+            None => Err(err(-32009, "Slot was skipped, or missing in long-term storage")),
         }
     })?;
 
@@ -140,19 +191,25 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .first()
             .and_then(|v| v.as_u64())
             .ok_or_else(|| err(-32602, "Invalid slot"))?;
-        match ctx.reader.get_block(slot) {
-            Ok(Some(block)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(
-                block.info.block_time
-            )),
-            _ => Ok(serde_json::Value::Null),
+        match ctx.reader.get_block_time(slot) {
+            Ok(Some(t)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(t)),
+            Ok(None) => Ok(serde_json::Value::Null),
+            Err(e) => Err(err(-32603, &e.to_string())),
         }
     })?;
 
-    static VERSION: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
-        serde_json::json!({ "solana-core": "2.2.4", "feature-set": 0 })
-    });
+    // Pre-encoded static JSON — jsonrpsee emits verbatim.
+    static VERSION_RAW: std::sync::LazyLock<Box<serde_json::value::RawValue>> =
+        std::sync::LazyLock::new(|| {
+            serde_json::value::RawValue::from_string(
+                r#"{"solana-core":"2.2.4","feature-set":0}"#.to_string(),
+            )
+            .unwrap()
+        });
     module.register_async_method("getVersion", |_, _, _| async move {
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(VERSION.clone())
+        Ok::<Box<serde_json::value::RawValue>, jsonrpsee::types::ErrorObjectOwned>(
+            VERSION_RAW.clone(),
+        )
     })?;
 
     Ok(())

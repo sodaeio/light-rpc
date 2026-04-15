@@ -57,6 +57,29 @@ pub fn decode_payload(payload: &[u8], err_str: Option<String>) -> Result<Value> 
     Ok(v)
 }
 
+/// Build the per-tx agave shape (`{transaction, meta, version}`) directly
+/// from a parsed proto — no re-decode. Used at ingest to attach a pre-built
+/// `Arc<Box<RawValue>>` to every `TransactionEntry`.
+pub fn prebuild_tx_value(info: SubscribeUpdateTransactionInfo, err_str: Option<String>) -> Value {
+    let mut v = build_rpc_shape(0, None, err_str, info);
+    if let Value::Object(ref mut map) = v {
+        map.remove("slot");
+        map.remove("blockTime");
+    }
+    v
+}
+
+/// Build the getTransaction-shape JSON (with slot + blockTime) directly
+/// from a parsed proto. Used by getTransaction lookups on memory-cached txs.
+pub fn prebuild_gettx_value(
+    info: SubscribeUpdateTransactionInfo,
+    slot: u64,
+    block_time: Option<i64>,
+    err_str: Option<String>,
+) -> Value {
+    build_rpc_shape(slot, block_time, err_str, info)
+}
+
 fn build_rpc_shape(
     slot: u64,
     block_time: Option<i64>,

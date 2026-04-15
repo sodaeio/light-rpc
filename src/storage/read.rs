@@ -27,6 +27,9 @@ pub struct MemoryCache {
     /// arc_swap of an immutable BTreeMap. Reads are wait-free pointer loads.
     /// Writers RCU-clone the map, mutate, and atomically swap.
     recent_blockhashes: arc_swap::ArcSwap<BTreeMap<Slot, Arc<str>>>,
+    /// signature → (slot, tx index within block). Lets getTransaction hit the
+    /// memory-cached block's pre-built RawValue without touching RocksDB.
+    sig_index: dashmap::DashMap<[u8; 64], (Slot, u32)>,
     processed_slot: AtomicU64,
     confirmed_slot: AtomicU64,
     finalized_slot: AtomicU64,
@@ -39,11 +42,16 @@ impl MemoryCache {
         Self {
             blocks: RwLock::new(BTreeMap::new()),
             recent_blockhashes: arc_swap::ArcSwap::from_pointee(BTreeMap::new()),
+            sig_index: dashmap::DashMap::with_capacity(128 * 4096),
             processed_slot: AtomicU64::new(0),
             confirmed_slot: AtomicU64::new(0),
             finalized_slot: AtomicU64::new(0),
             finalized_slot_updated_at: AtomicU64::new(0),
         }
+    }
+
+    pub fn lookup_sig(&self, sig: &[u8; 64]) -> Option<(Slot, u32)> {
+        self.sig_index.get(sig).map(|e| *e.value())
     }
 
     pub fn finalized_slot_age_secs(&self) -> u64 {
@@ -72,6 +80,13 @@ impl MemoryCache {
 
     pub fn insert_block(&self, slot: Slot, block: Arc<BlockWithData>) {
         let blockhash: Arc<str> = Arc::from(block.info.blockhash.as_str());
+        for (idx, tx) in block.transactions.iter().enumerate() {
+            let sig_bytes: [u8; 64] = match tx.signature.as_ref().try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            self.sig_index.insert(sig_bytes, (slot, idx as u32));
+        }
         self.blocks.write().insert(slot, block);
         self.recent_blockhashes.rcu(|m| {
             let mut next = (**m).clone();
@@ -91,6 +106,16 @@ impl MemoryCache {
 
     pub fn get_blockhash(&self, slot: Slot) -> Option<Arc<str>> {
         self.recent_blockhashes.load().get(&slot).cloned()
+    }
+
+    /// Most recent blockhash at or below `slot`. Needed by getLatestBlockhash
+    /// when the commitment slot was skipped (no block produced that slot).
+    pub fn get_blockhash_at_or_below(&self, slot: Slot) -> Option<(Arc<str>, Slot)> {
+        self.recent_blockhashes
+            .load()
+            .range(..=slot)
+            .next_back()
+            .map(|(s, h)| (h.clone(), *s))
     }
 
     pub fn is_blockhash_valid(&self, blockhash: &str) -> bool {
@@ -122,7 +147,26 @@ impl MemoryCache {
 
     fn gc(&self, finalized: Slot) {
         let cutoff = finalized.saturating_sub(64);
-        self.blocks.write().retain(|s, _| *s >= cutoff);
+        let evicted: Vec<Arc<BlockWithData>> = {
+            let mut blocks = self.blocks.write();
+            let mut drop_keys: Vec<Slot> = Vec::new();
+            for k in blocks.keys() {
+                if *k < cutoff {
+                    drop_keys.push(*k);
+                }
+            }
+            drop_keys
+                .into_iter()
+                .filter_map(|k| blocks.remove(&k))
+                .collect()
+        };
+        for block in evicted {
+            for tx in &block.transactions {
+                if let Ok(sig_bytes) = <&[u8; 64]>::try_from(tx.signature.as_ref()) {
+                    self.sig_index.remove(sig_bytes);
+                }
+            }
+        }
         self.recent_blockhashes.rcu(|m| {
             let mut next = (**m).clone();
             next.retain(|s, _| *s >= cutoff);
@@ -177,7 +221,7 @@ impl StorageReader {
             tx_cache: (0..LRU_SHARDS)
                 .map(|_| {
                     parking_lot::Mutex::new(lru::LruCache::new(
-                        std::num::NonZeroUsize::new(50_000 / LRU_SHARDS).unwrap(),
+                        std::num::NonZeroUsize::new(500_000 / LRU_SHARDS).unwrap(),
                     ))
                 })
                 .collect(),
@@ -185,14 +229,14 @@ impl StorageReader {
             account_lru: (0..LRU_SHARDS)
                 .map(|_| {
                     parking_lot::Mutex::new(lru::LruCache::new(
-                        std::num::NonZeroUsize::new(100_000 / LRU_SHARDS).unwrap(),
+                        std::num::NonZeroUsize::new(1_000_000 / LRU_SHARDS).unwrap(),
                     ))
                 })
                 .collect(),
             encoded_account_lru: (0..LRU_SHARDS)
                 .map(|_| {
                     parking_lot::Mutex::new(lru::LruCache::new(
-                        std::num::NonZeroUsize::new(64_000 / LRU_SHARDS).unwrap(),
+                        std::num::NonZeroUsize::new(500_000 / LRU_SHARDS).unwrap(),
                     ))
                 })
                 .collect(),
@@ -572,6 +616,19 @@ impl StorageReader {
         }
     }
 
+    /// Cheap path for getBlockTime: hit memory first, else read `slot_index`
+    /// CF directly — no block file load, no tx decode.
+    pub fn get_block_time(&self, slot: Slot) -> Result<Option<UnixTimestamp>> {
+        if let Some(block) = self.cache.get_block(slot) {
+            return Ok(block.info.block_time);
+        }
+        if let Some(data) = self.rocks.get_slot_index(slot)? {
+            let info: serde_json::Value = serde_json::from_slice(&data)?;
+            return Ok(info.get("block_time").and_then(|v| v.as_i64()));
+        }
+        Ok(None)
+    }
+
     pub fn get_block(&self, slot: Slot) -> Result<Option<Arc<BlockWithData>>> {
         if let Some(block) = self.cache.get_block(slot) {
             return Ok(Some(block));
@@ -613,7 +670,14 @@ impl StorageReader {
 
     pub fn get_latest_blockhash(&self, commitment: Commitment) -> Option<(Arc<str>, Slot)> {
         let slot = self.get_slot(commitment);
-        self.cache.get_blockhash(slot).map(|h| (h, slot))
+        // Exact match first.
+        if let Some(h) = self.cache.get_blockhash(slot) {
+            return Some((h, slot));
+        }
+        // Fall back to the most recent blockhash at or below `slot` — handles
+        // the common case where the commitment slot was skipped and no block
+        // was produced. Without this, gLBH spuriously errors on skips.
+        self.cache.get_blockhash_at_or_below(slot)
     }
 
     pub fn is_blockhash_valid(&self, blockhash: &str) -> bool {
@@ -633,6 +697,35 @@ impl StorageReader {
             return Ok(Some(decoded));
         }
         Ok(None)
+    }
+
+    /// Hot-path getTransaction via the memory-cached pre-built RawValue.
+    /// Splices `slot` + `blockTime` into the block-shape prebuilt bytes at
+    /// response time — no re-decode, no Value tree allocation.
+    pub fn get_transaction_prebuilt(
+        &self,
+        signature: &[u8; 64],
+    ) -> Option<Box<serde_json::value::RawValue>> {
+        let (slot, idx) = self.cache.lookup_sig(signature)?;
+        let block = self.cache.get_block(slot)?;
+        let tx = block.transactions.get(idx as usize)?;
+        let prebuilt_bytes = tx.prebuilt.get();
+        if !prebuilt_bytes.starts_with('{') {
+            return None;
+        }
+        let bt = block
+            .info
+            .block_time
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let mut out = String::with_capacity(prebuilt_bytes.len() + 48);
+        out.push_str(r#"{"slot":"#);
+        out.push_str(&slot.to_string());
+        out.push_str(r#","blockTime":"#);
+        out.push_str(&bt);
+        out.push(',');
+        out.push_str(&prebuilt_bytes[1..]);
+        serde_json::value::RawValue::from_string(out).ok()
     }
 
     pub fn get_transactions_batch(

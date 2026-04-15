@@ -38,10 +38,13 @@ pub struct RpcContext {
         Arc<crate::rpc::coalesce::Coalescer<([u8; 32], String), serde_json::Value>>,
     pub gtla_coalescer:
         Arc<crate::rpc::coalesce::Coalescer<[u8; 32], Vec<serde_json::Value>>>,
+    pub block_coalescer:
+        Arc<crate::rpc::coalesce::Coalescer<(u64, u64), Option<BlockCacheEntry>>>,
 }
 
 pub const BLOCK_CACHE_SHARDS: usize = 16;
-pub type BlockCacheShard = parking_lot::Mutex<lru::LruCache<(u64, u64), Arc<serde_json::Value>>>;
+pub type BlockCacheEntry = Arc<Box<serde_json::value::RawValue>>;
+pub type BlockCacheShard = parking_lot::Mutex<lru::LruCache<(u64, u64), BlockCacheEntry>>;
 pub type BlockResponseCache = Arc<[BlockCacheShard; BLOCK_CACHE_SHARDS]>;
 
 #[inline]
@@ -98,6 +101,7 @@ impl RpcServer {
             block_cache,
             gai_coalescer: Arc::new(crate::rpc::coalesce::Coalescer::new()),
             gtla_coalescer: Arc::new(crate::rpc::coalesce::Coalescer::new()),
+            block_coalescer: Arc::new(crate::rpc::coalesce::Coalescer::new()),
         };
 
         let module = methods::build_rpc_module(context)?;
