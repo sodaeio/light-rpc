@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::RocksDbConfig;
+use crate::metrics;
 use crate::types::*;
 
 /// Column family names for all indexed data.
@@ -19,6 +20,26 @@ const CF_SFA_INDEX: &str = "sfa_index";
 /// Account pipeline CFs (state queries):
 const CF_ACCOUNTS: &str = "accounts";
 const CF_PROGRAM_INDEX: &str = "program_index";
+
+const ALL_CFS: &[&str] = &[
+    CF_SLOT_INDEX,
+    CF_TX_INDEX,
+    CF_SFA_INDEX,
+    CF_ACCOUNTS,
+    CF_PROGRAM_INDEX,
+];
+
+/// Apply shared compaction tuning to a CF's options.
+/// Without this, RocksDB uses defaults (L0 trigger=4, unbounded level sizes)
+/// which falls behind under high ingest and piles up thousands of L0 SSTs.
+fn apply_cf_compaction_tuning(opts: &mut Options) {
+    opts.set_level_zero_file_num_compaction_trigger(2);
+    opts.set_level_zero_slowdown_writes_trigger(20);
+    opts.set_level_zero_stop_writes_trigger(36);
+    opts.set_target_file_size_base(64 * 1024 * 1024);
+    opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
+    opts.set_max_bytes_for_level_multiplier(10.0);
+}
 
 type DB = DBWithThreadMode<MultiThreaded>;
 
@@ -47,7 +68,9 @@ impl UnifiedRocksDb {
             .map(|n| n.get() as i32)
             .unwrap_or(4);
         db_opts.increase_parallelism(parallelism);
-        db_opts.set_max_background_jobs(4);
+        db_opts.set_max_background_jobs(parallelism.max(4));
+        // Force L0 to drain even during low-write periods; prevents silent accumulation.
+        db_opts.set_periodic_compaction_seconds(3600);
 
         if config.enable_pipelined_writes {
             db_opts.set_enable_pipelined_write(true);
@@ -70,6 +93,7 @@ impl UnifiedRocksDb {
     fn slot_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        apply_cf_compaction_tuning(&mut opts);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(cache);
         opts.set_block_based_table_factory(&block_opts);
@@ -79,6 +103,7 @@ impl UnifiedRocksDb {
     fn tx_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        apply_cf_compaction_tuning(&mut opts);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(cache);
         block_opts.set_bloom_filter(10.0, false);
@@ -90,6 +115,7 @@ impl UnifiedRocksDb {
         let mut opts = Options::default();
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        apply_cf_compaction_tuning(&mut opts);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(cache);
         block_opts.set_bloom_filter(10.0, false);
@@ -101,6 +127,7 @@ impl UnifiedRocksDb {
         let mut opts = Options::default();
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        apply_cf_compaction_tuning(&mut opts);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(cache);
         block_opts.set_bloom_filter(10.0, false);
@@ -112,6 +139,7 @@ impl UnifiedRocksDb {
         let mut opts = Options::default();
         opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        apply_cf_compaction_tuning(&mut opts);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(cache);
         block_opts.set_bloom_filter(10.0, false);
@@ -258,6 +286,56 @@ impl UnifiedRocksDb {
 
     pub fn inner(&self) -> &Arc<DB> {
         &self.db
+    }
+
+    /// Force a full-range compaction on every CF. Blocking and expensive —
+    /// use once after recovery or on a scheduled maintenance window to drain
+    /// an accumulated L0 backlog. Safe to call while serving reads.
+    pub fn compact_all(&self) -> Result<()> {
+        for name in ALL_CFS {
+            let cf = self.cf(name);
+            self.db
+                .compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+        }
+        Ok(())
+    }
+
+    /// Refresh Prometheus gauges for per-CF SST counts, L0 file counts, and
+    /// estimated live data size. Call on a timer (e.g. every 60s) from main.
+    pub fn update_metrics(&self) {
+        for name in ALL_CFS {
+            let cf = self.cf(name);
+            let sst = self
+                .db
+                .property_int_value_cf(&cf, "rocksdb.num-files-at-level0")
+                .ok()
+                .flatten()
+                .unwrap_or(0) as i64;
+            metrics::ROCKSDB_L0_FILES
+                .with_label_values(&[name])
+                .set(sst);
+
+            if let Ok(Some(total)) = self
+                .db
+                .property_int_value_cf(&cf, "rocksdb.total-sst-files-size")
+            {
+                metrics::ROCKSDB_LIVE_DATA_SIZE
+                    .with_label_values(&[name])
+                    .set(total as i64);
+            }
+
+            // num-live-sst-files is tracked via total across all levels.
+            let mut total_sst = 0i64;
+            for level in 0..7 {
+                let prop = format!("rocksdb.num-files-at-level{level}");
+                if let Ok(Some(n)) = self.db.property_int_value_cf(&cf, &prop) {
+                    total_sst += n as i64;
+                }
+            }
+            metrics::ROCKSDB_SST_COUNT
+                .with_label_values(&[name])
+                .set(total_sst);
+        }
     }
 }
 

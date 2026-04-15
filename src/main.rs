@@ -89,6 +89,15 @@ async fn run(config: Config) -> Result<()> {
         }
     });
 
+    let rocks_for_metrics = rocks.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            rocks_for_metrics.update_metrics();
+        }
+    });
+
     let pg_writer = pg.clone();
     tokio::spawn(async move { pg_writer_loop(pg_writer, pg_rx).await });
 

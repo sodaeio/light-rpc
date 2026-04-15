@@ -38,6 +38,39 @@ pub static LATEST_SLOT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+pub static ROCKSDB_SST_COUNT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new("li_rocksdb_sst_count", "Live SST file count per column family"),
+        &["cf"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static ROCKSDB_LIVE_DATA_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "li_rocksdb_live_data_bytes",
+            "Estimated live data bytes per column family",
+        ),
+        &["cf"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static ROCKSDB_L0_FILES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new("li_rocksdb_l0_files", "Number of files at L0 per column family"),
+        &["cf"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 pub static PIPELINE_CHANNEL_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
         Opts::new("li_pipeline_channel_size", "Pipeline channel utilization"),
