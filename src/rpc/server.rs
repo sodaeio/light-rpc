@@ -86,7 +86,12 @@ impl RpcServer {
             .allow_headers([axum::http::header::CONTENT_TYPE])
             .allow_origin(Any);
 
-        let compression = CompressionLayer::new().gzip(true).br(true);
+        // Only compress responses big enough that gzip setup isn't net-loss.
+        // Tiny getSlot responses stay uncompressed.
+        let compression = CompressionLayer::new()
+            .gzip(true)
+            .br(true)
+            .quality(tower_http::CompressionLevel::Fastest);
 
         let app = Router::new()
             .route("/", post(handle_jsonrpc))
@@ -103,7 +108,11 @@ impl RpcServer {
 
         info!(%addr, "rpc server starting");
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.set_reuseaddr(true)?;
+        socket.set_nodelay(true)?;
+        socket.bind(addr)?;
+        let listener = socket.listen(8192)?;
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await?;

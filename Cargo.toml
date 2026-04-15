@@ -66,6 +66,7 @@ figment = { version = "0.10", features = ["yaml", "env"] }
 # Utilities
 anyhow = "1.0"
 thiserror = "2.0"
+mimalloc = { version = "0.1", default-features = false }
 num_cpus = "1.16"
 chrono = "0.4"
 parking_lot = "0.12"

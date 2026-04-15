@@ -5,6 +5,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::{error, info};
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use light_indexer::config::Config;
 use light_indexer::metrics::REGISTRY;
 use light_indexer::rpc::server::RpcServer;
@@ -54,6 +57,7 @@ fn main() -> Result<()> {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.threads.rpc_count())
+        .max_blocking_threads(512)
         .thread_name("li-main")
         .enable_all()
         .build()
@@ -257,11 +261,18 @@ async fn run_metrics_server(endpoint: &str, cache: Arc<MemoryCache>) -> Result<(
                             }
                         }
                         _ => {
+                            use std::sync::Mutex;
+                            static BUF: std::sync::OnceLock<Mutex<Vec<u8>>> =
+                                std::sync::OnceLock::new();
                             let encoder = prometheus::TextEncoder::new();
                             let metric_families = REGISTRY.gather();
-                            let mut buffer = Vec::new();
-                            encoder.encode(&metric_families, &mut buffer).unwrap();
-                            (200, bytes::Bytes::from(buffer))
+                            let mut buf = BUF
+                                .get_or_init(|| Mutex::new(Vec::with_capacity(64 * 1024)))
+                                .lock()
+                                .unwrap();
+                            buf.clear();
+                            encoder.encode(&metric_families, &mut *buf).unwrap();
+                            (200, bytes::Bytes::from(buf.clone()))
                         }
                     };
                     let resp = hyper::Response::builder()

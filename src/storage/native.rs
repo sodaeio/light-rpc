@@ -8,15 +8,14 @@
 //! per slot but their lamports/owner/executable fields are stable.
 
 use base64::Engine;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::storage::accounts::StoredAccount;
 
-/// Lookup a native program or sysvar by pubkey.
-/// Returns Some(StoredAccount) if the address is a known native account.
 pub fn lookup(pubkey: &[u8; 32]) -> Option<StoredAccount> {
-    let registry = REGISTRY.get_or_init(build_registry);
-    let entry = registry.iter().find(|e| &e.pubkey == pubkey)?;
+    let map = REGISTRY_MAP.get_or_init(build_registry_map);
+    let entry = map.get(pubkey)?;
     Some(StoredAccount {
         owner: entry.owner,
         lamports: entry.lamports,
@@ -27,6 +26,15 @@ pub fn lookup(pubkey: &[u8; 32]) -> Option<StoredAccount> {
     })
 }
 
+static REGISTRY_MAP: OnceLock<HashMap<[u8; 32], NativeEntry>> = OnceLock::new();
+
+fn build_registry_map() -> HashMap<[u8; 32], NativeEntry> {
+    build_registry()
+        .into_iter()
+        .map(|e| (e.pubkey, e))
+        .collect()
+}
+
 struct NativeEntry {
     pubkey: [u8; 32],
     lamports: u64,
@@ -35,6 +43,7 @@ struct NativeEntry {
     data: Vec<u8>,
 }
 
+#[allow(dead_code)]
 static REGISTRY: OnceLock<Vec<NativeEntry>> = OnceLock::new();
 
 fn pk(s: &str) -> [u8; 32] {

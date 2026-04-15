@@ -656,6 +656,20 @@ impl PgStorage {
         Ok(row)
     }
 
+    pub async fn get_program_accounts_by_pubkeys(
+        &self,
+        pubkeys: &[Vec<u8>],
+    ) -> Result<Vec<ProgramAccountRow>> {
+        let rows: Vec<ProgramAccountRow> = sqlx::query_as(
+            "SELECT pubkey, program_id, lamports, data, owner, executable, rent_epoch, slot_updated
+             FROM program_accounts WHERE pubkey = ANY($1::bytea[])",
+        )
+        .bind(pubkeys)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn get_program_accounts_pg(
         &self,
         program_id: &[u8],

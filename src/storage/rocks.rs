@@ -25,7 +25,11 @@ const ALL_CFS: &[&str] = &[
 ];
 
 fn apply_cf_compaction_tuning(opts: &mut Options) {
-    opts.set_level_zero_file_num_compaction_trigger(2);
+    apply_cf_compaction_tuning_with(opts, 2);
+}
+
+fn apply_cf_compaction_tuning_with(opts: &mut Options, l0_trigger: i32) {
+    opts.set_level_zero_file_num_compaction_trigger(l0_trigger);
     opts.set_level_zero_slowdown_writes_trigger(20);
     opts.set_level_zero_stop_writes_trigger(36);
     opts.set_target_file_size_base(64 * 1024 * 1024);
@@ -53,10 +57,9 @@ fn build_block_opts(
     bo.set_pin_top_level_index_and_filter(true);
     bo.set_pin_l0_filter_and_index_blocks_in_cache(true);
     if with_bloom {
-        bo.set_bloom_filter(10.0, false);
+        // 15 bits/key: FP ~0.04% vs 0.9% at 10. ~60 bytes/million keys overhead.
+        bo.set_bloom_filter(15.0, false);
         if prefix_bloom {
-            // Prefix bloom only; point gets on prefix-scan CFs fall back
-            // to the full iterator.
             bo.set_whole_key_filtering(false);
         }
     }
@@ -130,7 +133,8 @@ impl UnifiedRocksDb {
     fn tx_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
         opts.set_compression_type(DBCompressionType::Lz4);
-        apply_cf_compaction_tuning(&mut opts);
+        // Write-heavy: keep L0 very thin for read latency.
+        apply_cf_compaction_tuning_with(&mut opts, 1);
         let block_opts = build_block_opts(cache, 16 * 1024, true, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_TX_INDEX, opts)
@@ -141,7 +145,7 @@ impl UnifiedRocksDb {
         opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
         opts.set_memtable_prefix_bloom_ratio(0.1);
-        apply_cf_compaction_tuning(&mut opts);
+        apply_cf_compaction_tuning_with(&mut opts, 1);
         let block_opts = build_block_opts(cache, 16 * 1024, true, true);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_SFA_INDEX, opts)
@@ -252,6 +256,20 @@ impl UnifiedRocksDb {
         Ok(self.db.get_cf(&self.cf(CF_ACCOUNTS), pubkey)?)
     }
 
+    pub fn get_accounts_batch(
+        &self,
+        pubkeys: &[[u8; 32]],
+    ) -> Vec<Option<Vec<u8>>> {
+        let cf = self.cf(CF_ACCOUNTS);
+        let keys: Vec<(&Arc<BoundColumnFamily<'_>>, &[u8; 32])> =
+            pubkeys.iter().map(|k| (&cf, k)).collect();
+        self.db
+            .multi_get_cf(keys)
+            .into_iter()
+            .map(|r| r.ok().flatten())
+            .collect()
+    }
+
     /// Store program index entry. Key: [program_id(32) | pubkey(32)] → empty
     pub fn put_program_index(&self, program_id: &[u8; 32], pubkey: &[u8; 32]) -> Result<()> {
         let mut key = Vec::with_capacity(64);
@@ -269,18 +287,30 @@ impl UnifiedRocksDb {
         let mut iter = self.db.raw_iterator_cf(&cf_prog);
         iter.seek(program_id);
 
-        let mut results = Vec::new();
+        let mut pubkeys: Vec<[u8; 32]> = Vec::new();
         while iter.valid() {
             if let Some(key) = iter.key() {
                 if key.len() != 64 || &key[..32] != program_id {
                     break;
                 }
-                let pubkey: [u8; 32] = key[32..64].try_into().unwrap();
-                if let Ok(Some(data)) = self.db.get_cf(&cf_acct, pubkey) {
-                    results.push((pubkey, data));
-                }
+                pubkeys.push(key[32..64].try_into().unwrap());
             }
             iter.next();
+        }
+
+        if pubkeys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let keys: Vec<(&Arc<BoundColumnFamily<'_>>, &[u8; 32])> =
+            pubkeys.iter().map(|k| (&cf_acct, k)).collect();
+        let values = self.db.multi_get_cf(keys);
+
+        let mut results = Vec::with_capacity(pubkeys.len());
+        for (pubkey, val) in pubkeys.into_iter().zip(values) {
+            if let Ok(Some(data)) = val {
+                results.push((pubkey, data));
+            }
         }
         Ok(results)
     }

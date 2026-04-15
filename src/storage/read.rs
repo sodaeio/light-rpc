@@ -17,7 +17,7 @@ use super::rocks::UnifiedRocksDb;
 
 pub struct MemoryCache {
     blocks: RwLock<BTreeMap<Slot, Arc<BlockWithData>>>,
-    recent_blockhashes: RwLock<BTreeMap<Slot, String>>,
+    recent_blockhashes: RwLock<BTreeMap<Slot, Arc<str>>>,
     processed_slot: AtomicU64,
     confirmed_slot: AtomicU64,
     finalized_slot: AtomicU64,
@@ -64,7 +64,7 @@ impl MemoryCache {
     }
 
     pub fn insert_block(&self, slot: Slot, block: Arc<BlockWithData>) {
-        let blockhash = block.info.blockhash.clone();
+        let blockhash: Arc<str> = Arc::from(block.info.blockhash.as_str());
         self.blocks.write().insert(slot, block);
         self.recent_blockhashes.write().insert(slot, blockhash);
         let current = self.processed_slot.load(Ordering::Relaxed);
@@ -78,7 +78,7 @@ impl MemoryCache {
         self.blocks.read().get(&slot).cloned()
     }
 
-    pub fn get_blockhash(&self, slot: Slot) -> Option<String> {
+    pub fn get_blockhash(&self, slot: Slot) -> Option<Arc<str>> {
         self.recent_blockhashes.read().get(&slot).cloned()
     }
 
@@ -86,7 +86,7 @@ impl MemoryCache {
         self.recent_blockhashes
             .read()
             .values()
-            .any(|h| h == blockhash)
+            .any(|h| h.as_ref() == blockhash)
     }
 
     pub fn set_confirmed(&self, slot: Slot) {
@@ -508,7 +508,7 @@ impl StorageReader {
         Ok(None)
     }
 
-    pub fn get_latest_blockhash(&self, commitment: Commitment) -> Option<(String, Slot)> {
+    pub fn get_latest_blockhash(&self, commitment: Commitment) -> Option<(Arc<str>, Slot)> {
         let slot = self.get_slot(commitment);
         self.cache.get_blockhash(slot).map(|h| (h, slot))
     }
@@ -660,14 +660,56 @@ impl StorageReader {
         pubkeys: &[[u8; 32]],
         encoding: &str,
     ) -> Vec<Option<serde_json::Value>> {
-        let mut results = Vec::with_capacity(pubkeys.len());
-        for pk in pubkeys {
-            let val: Option<serde_json::Value> = self
-                .get_account_info(pk, encoding)
-                .await
-                .unwrap_or_default();
-            results.push(val);
+        // Split into three populations: native-registry hits (free),
+        // rocksdb batch hits (one multi_get round-trip), and PG fallbacks.
+        let mut results: Vec<Option<serde_json::Value>> = vec![None; pubkeys.len()];
+        let mut rocks_idx: Vec<usize> = Vec::with_capacity(pubkeys.len());
+
+        for (i, pk) in pubkeys.iter().enumerate() {
+            if let Some(stored) = super::native::lookup(pk) {
+                results[i] = Some(Self::account_to_json(&stored, encoding));
+            } else {
+                rocks_idx.push(i);
+            }
         }
+
+        if !rocks_idx.is_empty() {
+            let batch_keys: Vec<[u8; 32]> =
+                rocks_idx.iter().map(|&i| pubkeys[i]).collect();
+            let batch_vals = self.rocks.get_accounts_batch(&batch_keys);
+            let mut missing: Vec<usize> = Vec::new();
+            for (j, val) in batch_vals.into_iter().enumerate() {
+                let idx = rocks_idx[j];
+                match val.and_then(|b| super::accounts::StoredAccount::deserialize(&b)) {
+                    Some(stored) => {
+                        results[idx] = Some(Self::account_to_json(&stored, encoding));
+                    }
+                    None => missing.push(idx),
+                }
+            }
+            if !missing.is_empty() {
+                let miss_keys: Vec<Vec<u8>> =
+                    missing.iter().map(|&i| pubkeys[i].to_vec()).collect();
+                if let Ok(rows) = self.pg.get_program_accounts_by_pubkeys(&miss_keys).await {
+                    let mut by_pk: std::collections::HashMap<Vec<u8>, _> =
+                        rows.into_iter().map(|r| (r.pubkey.clone(), r)).collect();
+                    for idx in missing {
+                        if let Some(row) = by_pk.remove(pubkeys[idx].as_slice()) {
+                            let stored = super::accounts::StoredAccount {
+                                owner: row.owner.try_into().unwrap_or([0u8; 32]),
+                                lamports: row.lamports as u64,
+                                data: row.data,
+                                executable: row.executable,
+                                rent_epoch: row.rent_epoch as u64,
+                                slot: row.slot_updated as u64,
+                            };
+                            results[idx] = Some(Self::account_to_json(&stored, encoding));
+                        }
+                    }
+                }
+            }
+        }
+
         results
     }
 

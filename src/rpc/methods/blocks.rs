@@ -130,11 +130,11 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         }
     })?;
 
+    static VERSION: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+        serde_json::json!({ "solana-core": "2.2.4", "feature-set": 0 })
+    });
     module.register_async_method("getVersion", |_, _, _| async move {
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-            "solana-core": "2.2.4",
-            "feature-set": 0,
-        }))
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(VERSION.clone())
     })?;
 
     Ok(())
