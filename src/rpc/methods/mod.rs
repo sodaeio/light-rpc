@@ -21,6 +21,29 @@ pub fn rpc_response(slot: u64, value: serde_json::Value) -> serde_json::Value {
     })
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct RpcResp<T: serde::Serialize + Clone> {
+    pub context: RpcCtx,
+    pub value: T,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct RpcCtx {
+    pub slot: u64,
+    #[serde(rename = "apiVersion")]
+    pub api_version: &'static str,
+}
+
+pub fn rpc_resp<T: serde::Serialize + Clone>(slot: u64, value: T) -> RpcResp<T> {
+    RpcResp {
+        context: RpcCtx {
+            slot,
+            api_version: API_VERSION,
+        },
+        value,
+    }
+}
+
 /// Build the unified RPC module with all method handlers registered.
 pub fn build_rpc_module(context: RpcContext) -> Result<RpcModule<RpcContext>> {
     let mut module = RpcModule::new(context);

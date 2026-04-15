@@ -304,6 +304,105 @@ impl ClickHouseStore {
             .execute()
             .await?;
 
+        // DAS migration scaffolding. The intent is that DAS reads
+        // (getAssetsByOwner / byCreator / byGroup / byAuthority, searchAssets)
+        // move off Postgres and serve from these tables. Writes must be
+        // populated either by extending the ingester (when we own the DAS
+        // pipeline) or by a Kafka/CDC stream from the existing DAS indexer.
+
+        self.client
+            .query(
+                r#"
+                CREATE TABLE IF NOT EXISTS asset (
+                    id              FixedString(32),
+                    asset_class     LowCardinality(String),
+                    owner           FixedString(32),
+                    delegate        Nullable(FixedString(32)),
+                    frozen          Bool,
+                    supply          UInt64,
+                    compressed      Bool,
+                    tree_id         Nullable(FixedString(32)),
+                    leaf            Nullable(FixedString(32)),
+                    nonce           Nullable(UInt64),
+                    royalty_amount  UInt32,
+                    burnt           Bool,
+                    slot_updated    UInt64   CODEC(Delta, LZ4),
+                    seq             UInt64
+                ) ENGINE = ReplacingMergeTree(slot_updated)
+                PARTITION BY toYYYYMM(toDateTime(slot_updated * 400 / 1000))
+                ORDER BY (owner, id)
+                SETTINGS index_granularity = 1024
+                "#,
+            )
+            .execute()
+            .await?;
+
+        self.client
+            .query(
+                r#"
+                CREATE TABLE IF NOT EXISTS asset_data (
+                    asset_id      FixedString(32),
+                    chain_data    String CODEC(ZSTD(3)),
+                    metadata_url  String,
+                    metadata      String CODEC(ZSTD(3)),
+                    raw_name      String,
+                    raw_symbol    String
+                ) ENGINE = ReplacingMergeTree
+                ORDER BY asset_id
+                SETTINGS index_granularity = 1024
+                "#,
+            )
+            .execute()
+            .await?;
+
+        self.client
+            .query(
+                r#"
+                CREATE TABLE IF NOT EXISTS asset_creators (
+                    asset_id  FixedString(32),
+                    creator   FixedString(32),
+                    share     UInt8,
+                    verified  Bool,
+                    position  UInt8
+                ) ENGINE = MergeTree
+                ORDER BY (creator, asset_id)
+                SETTINGS index_granularity = 1024
+                "#,
+            )
+            .execute()
+            .await?;
+
+        self.client
+            .query(
+                r#"
+                CREATE TABLE IF NOT EXISTS asset_grouping (
+                    asset_id     FixedString(32),
+                    group_key    LowCardinality(String),
+                    group_value  Nullable(String),
+                    verified     Bool
+                ) ENGINE = MergeTree
+                ORDER BY (group_key, group_value, asset_id)
+                SETTINGS index_granularity = 1024
+                "#,
+            )
+            .execute()
+            .await?;
+
+        self.client
+            .query(
+                r#"
+                CREATE TABLE IF NOT EXISTS asset_authority (
+                    asset_id   FixedString(32),
+                    authority  FixedString(32),
+                    scopes     Array(LowCardinality(String))
+                ) ENGINE = MergeTree
+                ORDER BY (authority, asset_id)
+                SETTINGS index_granularity = 1024
+                "#,
+            )
+            .execute()
+            .await?;
+
         // Daily program-activity aggregates.
         self.client
             .query(

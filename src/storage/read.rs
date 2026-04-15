@@ -15,6 +15,13 @@ use super::files::BlockFileStorage;
 use super::postgres::PgStorage;
 use super::rocks::UnifiedRocksDb;
 
+const LRU_SHARDS: usize = 32;
+
+#[inline(always)]
+fn shard_of(key_byte: u8) -> usize {
+    (key_byte as usize) & (LRU_SHARDS - 1)
+}
+
 pub struct MemoryCache {
     blocks: RwLock<BTreeMap<Slot, Arc<BlockWithData>>>,
     /// arc_swap of an immutable BTreeMap. Reads are wait-free pointer loads.
@@ -144,16 +151,14 @@ pub struct StorageReader {
     rocks: UnifiedRocksDb,
     files: Arc<BlockFileStorage>,
     pg: PgStorage,
-    /// Signature → decoded RPC-shape JSON. Confirmed txs never change so
-    /// entries live until LRU evicts them.
-    tx_cache: parking_lot::Mutex<lru::LruCache<[u8; 64], Arc<serde_json::Value>>>,
-    /// Mint pubkey → (decimals, slot_updated). Saves a PG round-trip on
-    /// every getTokenLargestAccounts / getTokenSupply for hot mints.
+    tx_cache: Vec<parking_lot::Mutex<lru::LruCache<[u8; 64], Arc<serde_json::Value>>>>,
     mint_meta_cache: dashmap::DashMap<[u8; 32], (i32, u64)>,
-    /// pubkey → deserialized account. Invalidated by the writer on account
-    /// updates through WriteToReadMessage::AccountUpdated.
-    account_lru: parking_lot::Mutex<
-        lru::LruCache<[u8; 32], Arc<super::accounts::StoredAccount>>,
+    account_lru: Vec<
+        parking_lot::Mutex<lru::LruCache<[u8; 32], Arc<super::accounts::StoredAccount>>>,
+    >,
+    /// Bounded: prior unbounded DashMap OOM'd under random-key load.
+    encoded_account_lru: Vec<
+        parking_lot::Mutex<lru::LruCache<([u8; 32], u8), Arc<Box<serde_json::value::RawValue>>>>,
     >,
 }
 
@@ -169,13 +174,37 @@ impl StorageReader {
             rocks,
             files,
             pg,
-            tx_cache: parking_lot::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(50_000).unwrap(),
-            )),
+            tx_cache: (0..LRU_SHARDS)
+                .map(|_| {
+                    parking_lot::Mutex::new(lru::LruCache::new(
+                        std::num::NonZeroUsize::new(50_000 / LRU_SHARDS).unwrap(),
+                    ))
+                })
+                .collect(),
             mint_meta_cache: dashmap::DashMap::new(),
-            account_lru: parking_lot::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(100_000).unwrap(),
-            )),
+            account_lru: (0..LRU_SHARDS)
+                .map(|_| {
+                    parking_lot::Mutex::new(lru::LruCache::new(
+                        std::num::NonZeroUsize::new(100_000 / LRU_SHARDS).unwrap(),
+                    ))
+                })
+                .collect(),
+            encoded_account_lru: (0..LRU_SHARDS)
+                .map(|_| {
+                    parking_lot::Mutex::new(lru::LruCache::new(
+                        std::num::NonZeroUsize::new(64_000 / LRU_SHARDS).unwrap(),
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    fn enc_idx(encoding: &str) -> u8 {
+        match encoding {
+            "base58" => 0,
+            "base64+zstd" => 2,
+            "jsonParsed" => 3,
+            _ => 1,
         }
     }
 
@@ -217,9 +246,13 @@ impl StorageReader {
         loop {
             match rx.recv().await {
                 Ok(WriteToReadMessage::AccountsUpdated { pubkeys }) => {
-                    let mut lru = self.account_lru.lock();
                     for pk in &pubkeys {
-                        lru.pop(pk);
+                        let s = shard_of(pk[0]);
+                        self.account_lru[s].lock().pop(pk);
+                        let mut enc_shard = self.encoded_account_lru[s].lock();
+                        for enc in 0u8..4 {
+                            enc_shard.pop(&(*pk, enc));
+                        }
                     }
                 }
                 Ok(WriteToReadMessage::MintUpdated {
@@ -241,7 +274,8 @@ impl StorageReader {
     // -- Private helpers (RocksDB point lookups) --
 
     fn rocks_get_account(&self, pubkey: &[u8; 32]) -> Option<StoredAccount> {
-        if let Some(arc) = self.account_lru.lock().get(pubkey).cloned() {
+        let s = shard_of(pubkey[0]);
+        if let Some(arc) = self.account_lru[s].lock().get(pubkey).cloned() {
             return Some((*arc).clone());
         }
         let stored = self
@@ -250,25 +284,33 @@ impl StorageReader {
             .ok()
             .flatten()
             .and_then(|data| StoredAccount::deserialize(&data))?;
-        self.account_lru
+        self.account_lru[s]
             .lock()
             .put(*pubkey, Arc::new(stored.clone()));
         Some(stored)
     }
 
     fn encode_account_data(data: &[u8], encoding: &str) -> serde_json::Value {
-        use base64::Engine;
         match encoding {
             "base58" => serde_json::json!([bs58::encode(data).into_string(), "base58"]),
             "base64+zstd" => {
-                let compressed = zstd::encode_all(data, 0).unwrap_or_default();
-                serde_json::json!([
-                    base64::engine::general_purpose::STANDARD.encode(&compressed),
-                    "base64+zstd"
-                ])
+                // Skip zstd for small payloads — the compression overhead
+                // dwarfs any size win and bloats compressed bytes slightly.
+                if data.len() < 5000 {
+                    serde_json::json!([
+                        base64_simd::STANDARD.encode_to_string(data),
+                        "base64"
+                    ])
+                } else {
+                    let compressed = zstd::encode_all(data, 0).unwrap_or_default();
+                    serde_json::json!([
+                        base64_simd::STANDARD.encode_to_string(&compressed),
+                        "base64+zstd"
+                    ])
+                }
             }
             _ => serde_json::json!([
-                base64::engine::general_purpose::STANDARD.encode(data),
+                base64_simd::STANDARD.encode_to_string(data),
                 "base64"
             ]),
         }
@@ -579,12 +621,13 @@ impl StorageReader {
     }
 
     pub fn get_transaction(&self, signature: &[u8; 64]) -> Result<Option<serde_json::Value>> {
-        if let Some(cached) = self.tx_cache.lock().get(signature).cloned() {
+        let s = shard_of(signature[0]);
+        if let Some(cached) = self.tx_cache[s].lock().get(signature).cloned() {
             return Ok(Some((*cached).clone()));
         }
         if let Some(data) = self.rocks.get_tx_index(signature)? {
             let decoded = crate::rpc::tx_format::decode_tx_index(&data)?;
-            self.tx_cache
+            self.tx_cache[s]
                 .lock()
                 .put(*signature, Arc::new(decoded.clone()));
             return Ok(Some(decoded));
@@ -598,15 +641,13 @@ impl StorageReader {
     ) -> Result<Vec<Option<serde_json::Value>>> {
         let mut results: Vec<Option<serde_json::Value>> = Vec::with_capacity(signatures.len());
         let mut missing: Vec<(usize, [u8; 64])> = Vec::new();
-        {
-            let mut cache = self.tx_cache.lock();
-            for (i, sig) in signatures.iter().enumerate() {
-                if let Some(v) = cache.get(sig) {
-                    results.push(Some((**v).clone()));
-                } else {
-                    results.push(None);
-                    missing.push((i, *sig));
-                }
+        for (i, sig) in signatures.iter().enumerate() {
+            let s = shard_of(sig[0]);
+            if let Some(v) = self.tx_cache[s].lock().get(sig).cloned() {
+                results.push(Some((*v).clone()));
+            } else {
+                results.push(None);
+                missing.push((i, *sig));
             }
         }
         if missing.is_empty() {
@@ -614,11 +655,11 @@ impl StorageReader {
         }
         let miss_keys: Vec<[u8; 64]> = missing.iter().map(|(_, s)| *s).collect();
         let raw = self.rocks.get_tx_index_batch(&miss_keys)?;
-        let mut cache = self.tx_cache.lock();
         for ((idx, sig), data) in missing.into_iter().zip(raw) {
             if let Some(bytes) = data {
                 let decoded = crate::rpc::tx_format::decode_tx_index(&bytes)?;
-                cache.put(sig, Arc::new(decoded.clone()));
+                let s = shard_of(sig[0]);
+                self.tx_cache[s].lock().put(sig, Arc::new(decoded.clone()));
                 results[idx] = Some(decoded);
             }
         }
@@ -631,11 +672,9 @@ impl StorageReader {
         before_slot: Option<Slot>,
         limit: usize,
     ) -> Result<Vec<TransactionInfo>> {
-        let entries = self.rocks.iter_sfa(address, before_slot, limit)?;
-        let mut results = Vec::with_capacity(entries.len());
-        for (slot, data) in entries {
-            let sigs: Vec<SignatureEntry> = bincode::deserialize(&data)
-                .or_else(|_| serde_json::from_slice(&data))?;
+        let entries = self.rocks.iter_sfa_limited(address, before_slot, limit)?;
+        let mut results: Vec<TransactionInfo> = Vec::with_capacity(limit);
+        for (slot, sigs) in entries {
             for sig in sigs {
                 results.push(TransactionInfo {
                     signature: sig.signature,
@@ -644,6 +683,9 @@ impl StorageReader {
                     err: sig.err,
                     memo: sig.memo,
                 });
+                if results.len() >= limit {
+                    return Ok(results);
+                }
             }
         }
         Ok(results)
@@ -671,16 +713,25 @@ impl StorageReader {
         let addresses: Vec<[u8; 32]> =
             std::iter::once(owner_key).chain(atas).collect();
 
-        // Collect per-address signature lists. Each call is bounded by `limit`.
+        // For whale scale (up to ~2k addresses), do per-address iter_sfa in
+        // parallel on the blocking pool. Each task is a short RocksDB prefix
+        // scan; fan-out cuts wall time ~N× up to `max_blocking_threads`.
+        let mut handles = Vec::with_capacity(addresses.len());
+        for addr in addresses.iter().copied() {
+            let rocks = self.rocks.clone();
+            let before = before_slot;
+            let lim = limit;
+            handles.push(tokio::task::spawn_blocking(move || {
+                let pk = solana_pubkey::Pubkey::new_from_array(addr);
+                rocks.iter_sfa_limited(&pk, before, lim)
+            }));
+        }
+
         let mut all: Vec<(Slot, SignatureEntry)> =
             Vec::with_capacity(addresses.len() * limit.min(100));
-        for addr in &addresses {
-            let pk = solana_pubkey::Pubkey::new_from_array(*addr);
-            let entries = self.rocks.iter_sfa(&pk, before_slot, limit)?;
-            for (slot, data) in entries {
-                let parsed = bincode::deserialize::<Vec<SignatureEntry>>(&data)
-                    .or_else(|_| serde_json::from_slice::<Vec<SignatureEntry>>(&data));
-                if let Ok(sigs) = parsed {
+        for h in handles {
+            if let Ok(Ok(entries)) = h.await {
+                for (slot, sigs) in entries {
                     for sig in sigs {
                         all.push((slot, sig));
                     }
@@ -787,6 +838,31 @@ impl StorageReader {
         Ok(None)
     }
 
+    /// Pre-serialized variant — jsonrpsee emits the `RawValue` verbatim.
+    pub async fn get_account_info_raw(
+        &self,
+        pubkey: &[u8; 32],
+        encoding: &str,
+    ) -> Result<Option<Arc<Box<serde_json::value::RawValue>>>> {
+        let idx = Self::enc_idx(encoding);
+        let s = shard_of(pubkey[0]);
+        if let Some(arc) = self.encoded_account_lru[s].lock().get(&(*pubkey, idx)).cloned() {
+            return Ok(Some(arc));
+        }
+
+        let value = match self.get_account_info(pubkey, encoding).await? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let raw = serde_json::value::to_raw_value(&value)
+            .map_err(|e| anyhow::anyhow!("serialize account: {e}"))?;
+        let arc = Arc::new(raw);
+        self.encoded_account_lru[s]
+            .lock()
+            .put((*pubkey, idx), Arc::clone(&arc));
+        Ok(Some(arc))
+    }
+
     pub async fn get_multiple_accounts(
         &self,
         pubkeys: &[[u8; 32]],
@@ -871,11 +947,94 @@ impl StorageReader {
         owner: &[u8],
         encoding: &str,
     ) -> Result<Vec<serde_json::Value>> {
+        let owner_key: [u8; 32] = match owner.try_into() {
+            Ok(k) => k,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        // RocksDB-first: prefix-scan owner_atas, batch-fetch accounts,
+        // parse the SPL token layout inline. No PG round-trip on the
+        // hot path.
+        let atas = self.rocks.get_owner_atas(&owner_key, 10_000)?;
+        if !atas.is_empty() {
+            let bytes = self.rocks.get_accounts_batch(&atas);
+            let mut out = Vec::with_capacity(atas.len());
+            for (pubkey, data) in atas.iter().zip(bytes.into_iter()) {
+                let Some(raw) = data else { continue };
+                let Some(stored) = super::accounts::StoredAccount::deserialize(&raw) else {
+                    continue;
+                };
+                if stored.data.len() < 72 {
+                    continue;
+                }
+                if let Some(v) = Self::spl_token_account_json(pubkey, &stored, encoding) {
+                    out.push(v);
+                }
+            }
+            if !out.is_empty() {
+                return Ok(out);
+            }
+        }
+
+        // Fallback: fresh deployment with owner_atas unpopulated.
         let rows = self.pg.get_token_accounts_by_owner(owner).await?;
         Ok(rows
             .iter()
             .map(|r| Self::token_account_to_json(r, encoding))
             .collect())
+    }
+
+    fn spl_token_account_json(
+        pubkey: &[u8; 32],
+        stored: &super::accounts::StoredAccount,
+        encoding: &str,
+    ) -> Option<serde_json::Value> {
+        let data = &stored.data;
+        if data.len() < 72 {
+            return None;
+        }
+        let mint = &data[0..32];
+        let owner = &data[32..64];
+        let amount = u64::from_le_bytes(data[64..72].try_into().ok()?);
+        let frozen = data.len() > 108 && data[108] == 2;
+        let owner_program = bs58::encode(&stored.owner).into_string();
+
+        let data_field = if encoding == "jsonParsed" {
+            let state = if frozen { "frozen" } else { "initialized" };
+            serde_json::json!({
+                "program": if owner_program.starts_with("Token") { "spl-token" } else { "spl-token-2022" },
+                "parsed": {
+                    "type": "account",
+                    "info": {
+                        "mint": bs58::encode(mint).into_string(),
+                        "owner": bs58::encode(owner).into_string(),
+                        "tokenAmount": {
+                            "amount": amount.to_string(),
+                            "decimals": 0,
+                            "uiAmount": null,
+                            "uiAmountString": amount.to_string(),
+                        },
+                        "state": state,
+                        "isNative": false,
+                    }
+                },
+                "space": data.len(),
+            })
+        } else {
+            Self::encode_account_data(data, encoding)
+        };
+
+        Some(serde_json::json!({
+            "pubkey": bs58::encode(pubkey).into_string(),
+            "account": {
+                "lamports": stored.lamports,
+                "owner": owner_program,
+                "data": data_field,
+                "executable": stored.executable,
+                "rentEpoch": stored.rent_epoch,
+                "space": data.len(),
+            }
+        }))
     }
 
     pub async fn get_token_accounts_by_delegate(
@@ -958,7 +1117,12 @@ impl StorageReader {
     }
 
     pub fn account_lru_invalidate(&self, pubkey: &[u8; 32]) {
-        self.account_lru.lock().pop(pubkey);
+        let s = shard_of(pubkey[0]);
+        self.account_lru[s].lock().pop(pubkey);
+        let mut enc_shard = self.encoded_account_lru[s].lock();
+        for enc in 0u8..4 {
+            enc_shard.pop(&(*pubkey, enc));
+        }
     }
 
     fn token_holder_json(pubkey: &[u8], amount: u64, decimals: i32) -> serde_json::Value {

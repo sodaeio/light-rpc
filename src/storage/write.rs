@@ -173,24 +173,7 @@ impl StorageWriter {
             }
         }
 
-        // address → signatures (PG, via isolated writer)
-        let mut addr_tx_entries = Vec::new();
-        for (address, sigs) in &block.address_signatures {
-            for sig in sigs {
-                addr_tx_entries.push(AddressTxEntry {
-                    address: *address,
-                    slot,
-                    signature: sig.signature,
-                    block_time: block.info.block_time,
-                    err: sig.err.clone(),
-                });
-            }
-        }
-        if !addr_tx_entries.is_empty() {
-            let _ = self
-                .pg_tx
-                .try_send(PgWriteJob::AddressTransactions(addr_tx_entries));
-        }
+        // gSFA/gTFA are served from sfa_index + owner_atas; PG write dropped.
 
         #[cfg(feature = "clickhouse")]
         self.send_to_clickhouse(slot, block);

@@ -4,4 +4,11 @@
 *.swo
 .env
 config.yml
+config-prod.yml
 data/
+
+# Ignore all Markdown except README.md. CLAUDE.md, ARCHITECTURE.md,
+# PERFORMANCE.md, DESIGN_DECISIONS.md, MIGRATIONS.md, TESTING.md etc.
+# are local notes that should not be tracked.
+*.md
+!README.md

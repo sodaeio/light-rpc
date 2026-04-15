@@ -258,7 +258,58 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Iterate signatures for an address in reverse slot order.
+    /// Iterate signatures for an address in reverse slot order, counting
+    /// decoded signatures (not slots) toward `limit`. For hot addresses
+    /// like the Token Program a single slot holds hundreds of sigs, so
+    /// the slot-limited variant wastes most of the work.
+    pub fn iter_sfa_limited(
+        &self,
+        address: &solana_pubkey::Pubkey,
+        before_slot: Option<Slot>,
+        sig_limit: usize,
+    ) -> Result<Vec<(Slot, Vec<super::super::types::SignatureEntry>)>> {
+        let cf = self.cf(CF_SFA_INDEX);
+        let prefix = address.as_ref();
+
+        let start_slot = before_slot.unwrap_or(u64::MAX);
+        let mut seek_key = Vec::with_capacity(40);
+        seek_key.extend_from_slice(prefix);
+        seek_key.extend_from_slice(&start_slot.to_be_bytes());
+
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_readahead_size(256 * 1024);
+        read_opts.set_prefix_same_as_start(true);
+        let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
+        iter.seek_for_prev(&seek_key);
+
+        let mut results: Vec<(Slot, Vec<super::super::types::SignatureEntry>)> = Vec::new();
+        let mut total = 0usize;
+        while iter.valid() && total < sig_limit {
+            let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
+                break;
+            };
+            if key.len() < 40 || &key[..32] != prefix {
+                break;
+            }
+            let slot = u64::from_be_bytes(key[32..40].try_into().unwrap());
+            let sigs: Vec<super::super::types::SignatureEntry> =
+                bincode::deserialize(value).or_else(|_| serde_json::from_slice(value))?;
+            let remaining = sig_limit - total;
+            let take = remaining.min(sigs.len());
+            total += take;
+            // Keep only the suffix we need; skip the rest of this slot's blob.
+            if take == sigs.len() {
+                results.push((slot, sigs));
+            } else {
+                results.push((slot, sigs.into_iter().take(take).collect()));
+            }
+            iter.prev();
+        }
+        Ok(results)
+    }
+
+    /// Legacy: returns (slot, raw_bytes) pairs. `sig_limit`-counting variant
+    /// (`iter_sfa_limited`) should be preferred for new code.
     pub fn iter_sfa(
         &self,
         address: &solana_pubkey::Pubkey,
