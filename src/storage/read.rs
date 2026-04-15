@@ -533,7 +533,8 @@ impl StorageReader {
         let entries = self.rocks.iter_sfa(address, before_slot, limit)?;
         let mut results = Vec::with_capacity(entries.len());
         for (slot, data) in entries {
-            let sigs: Vec<SignatureEntry> = serde_json::from_slice(&data)?;
+            let sigs: Vec<SignatureEntry> = bincode::deserialize(&data)
+                .or_else(|_| serde_json::from_slice(&data))?;
             for sig in sigs {
                 results.push(TransactionInfo {
                     signature: sig.signature,
@@ -576,7 +577,9 @@ impl StorageReader {
             let pk = solana_pubkey::Pubkey::new_from_array(*addr);
             let entries = self.rocks.iter_sfa(&pk, before_slot, limit)?;
             for (slot, data) in entries {
-                if let Ok(sigs) = serde_json::from_slice::<Vec<SignatureEntry>>(&data) {
+                let parsed = bincode::deserialize::<Vec<SignatureEntry>>(&data)
+                    .or_else(|_| serde_json::from_slice::<Vec<SignatureEntry>>(&data));
+                if let Ok(sigs) = parsed {
                     for sig in sigs {
                         all.push((slot, sig));
                     }

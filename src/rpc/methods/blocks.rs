@@ -37,10 +37,9 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             h
         };
 
-        if let Some(cached) = ctx.block_cache.lock().get(&(slot, cfg_hash)).cloned() {
-            let val: serde_json::Value = serde_json::from_slice(&cached)
-                .map_err(|e| err(-32603, &e.to_string()))?;
-            return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(val);
+        let shard = crate::rpc::server::block_cache_shard(slot, cfg_hash);
+        if let Some(cached) = ctx.block_cache[shard].lock().get(&(slot, cfg_hash)).cloned() {
+            return Ok::<_, jsonrpsee::types::ErrorObjectOwned>((*cached).clone());
         }
 
         match ctx.reader.get_block(slot) {
@@ -76,12 +75,11 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     "rewards": if include_rewards { serde_json::json!([]) } else { serde_json::Value::Null },
                     "transactions": transactions,
                 });
-                if let Ok(bytes) = serde_json::to_vec(&response) {
-                    ctx.block_cache
-                        .lock()
-                        .put((slot, cfg_hash), bytes::Bytes::from(bytes));
-                }
-                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(response)
+                let arc = std::sync::Arc::new(response);
+                ctx.block_cache[shard]
+                    .lock()
+                    .put((slot, cfg_hash), arc.clone());
+                Ok::<_, jsonrpsee::types::ErrorObjectOwned>((*arc).clone())
             }
             Ok(None) => Err(err(
                 -32009,

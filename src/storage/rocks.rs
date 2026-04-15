@@ -245,7 +245,10 @@ impl UnifiedRocksDb {
         seek_key.extend_from_slice(prefix);
         seek_key.extend_from_slice(&start_slot.to_be_bytes());
 
-        let mut iter = self.db.raw_iterator_cf(&cf);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_readahead_size(256 * 1024);
+        read_opts.set_prefix_same_as_start(true);
+        let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
         iter.seek_for_prev(&seek_key);
 
         let mut results = Vec::with_capacity(limit);

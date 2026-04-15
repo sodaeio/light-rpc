@@ -36,7 +36,16 @@ pub struct RpcContext {
     pub block_cache: BlockResponseCache,
 }
 
-pub type BlockResponseCache = Arc<parking_lot::Mutex<lru::LruCache<(u64, u64), bytes::Bytes>>>;
+pub const BLOCK_CACHE_SHARDS: usize = 16;
+pub type BlockCacheShard = parking_lot::Mutex<lru::LruCache<(u64, u64), Arc<serde_json::Value>>>;
+pub type BlockResponseCache = Arc<[BlockCacheShard; BLOCK_CACHE_SHARDS]>;
+
+#[inline]
+pub fn block_cache_shard(slot: u64, cfg_hash: u64) -> usize {
+    let mut h = slot.wrapping_mul(0x9E3779B97F4A7C15);
+    h ^= cfg_hash;
+    h.wrapping_mul(0xBF58476D1CE4E5B9) as usize % BLOCK_CACHE_SHARDS
+}
 
 type RpcState = Arc<RpcModule<RpcContext>>;
 
@@ -74,9 +83,9 @@ impl RpcServer {
 
     pub async fn run(self) -> Result<()> {
         let gpa_blocked = Self::build_gpa_blocklist(&self.config);
-        let block_cache = Arc::new(parking_lot::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(512).unwrap(),
-        )));
+        let cap = std::num::NonZeroUsize::new(64).unwrap();
+        let block_cache: BlockResponseCache =
+            Arc::new(std::array::from_fn(|_| parking_lot::Mutex::new(lru::LruCache::new(cap))));
         let context = RpcContext {
             reader: Arc::clone(&self.reader),
             upstream: self.upstream,

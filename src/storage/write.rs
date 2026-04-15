@@ -160,10 +160,11 @@ impl StorageWriter {
             }
         }
 
-        // address → signatures (RocksDB)
+        // address → signatures (RocksDB). bincode is ~5× faster than serde_json
+        // to deserialize on read; the value is hot in gSFA / gTFA.
         let mut sfa_entries = Vec::new();
         for (address, sigs) in &block.address_signatures {
-            let data = serde_json::to_vec(&sigs).unwrap_or_default();
+            let data = bincode::serialize(sigs).unwrap_or_default();
             sfa_entries.push((*address, slot, data));
         }
         if !sfa_entries.is_empty() {
