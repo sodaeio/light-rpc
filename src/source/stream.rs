@@ -20,6 +20,14 @@ use crate::types::*;
 
 use super::commitment::CommitmentTracker;
 
+// Placeholder prebuilt — replaced with the real agave-shape JSON in
+// `into_block` via rayon par_iter. Using a shared Arc avoids allocating
+// a fresh "null" RawValue per tx on arrival.
+static PLACEHOLDER_RAW: std::sync::LazyLock<Arc<Box<serde_json::value::RawValue>>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(serde_json::value::RawValue::from_string("null".into()).unwrap())
+    });
+
 /// Accumulates partial data for an in-progress slot from the gRPC stream.
 struct SlotAccumulator {
     parent_slot: Slot,
@@ -61,6 +69,23 @@ impl SlotAccumulator {
     }
 
     fn into_block(self, slot: Slot) -> BlockWithData {
+        use rayon::prelude::*;
+        use yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo;
+        use yellowstone_grpc_proto::prost::Message;
+
+        // Parallel per-tx agave-shape JSON build. ~50µs/tx serial becomes
+        // near-instant on a 48-core box; block-seal latency drops from
+        // ~100ms on heavy blocks to a few ms.
+        let mut txs: Vec<TransactionEntry> = self.transactions.into_values().collect();
+        txs.par_iter_mut().for_each(|tx| {
+            if let Ok(info) = SubscribeUpdateTransactionInfo::decode(tx.payload.as_ref()) {
+                let val = crate::rpc::tx_format::prebuild_tx_value(info, tx.err.clone());
+                if let Ok(raw) = serde_json::value::to_raw_value(&val) {
+                    tx.prebuilt = Arc::new(raw);
+                }
+            }
+        });
+
         BlockWithData {
             info: BlockInfo {
                 slot,
@@ -70,7 +95,7 @@ impl SlotAccumulator {
                 blockhash: self.blockhash.unwrap_or_default(),
             },
             encoded_block: self.encoded_block.unwrap_or_default(),
-            transactions: self.transactions.into_values().collect(),
+            transactions: txs,
             address_signatures: self.address_signatures,
             fees: self.fees,
         }
@@ -156,10 +181,14 @@ impl StreamSource {
                     match update.update_oneof {
                         Some(UpdateOneof::Account(account_update)) => {
                             if let Some(account) = account_update.account {
-                                let pubkey = Pubkey::try_from(account.pubkey.as_slice())
-                                    .unwrap_or_default();
-                                let owner = Pubkey::try_from(account.owner.as_slice())
-                                    .unwrap_or_default();
+                                let (Ok(pubkey), Ok(owner)) = (
+                                    Pubkey::try_from(account.pubkey.as_slice()),
+                                    Pubkey::try_from(account.owner.as_slice()),
+                                ) else {
+                                    tracing::warn!(slot = account_update.slot, "malformed account pubkey/owner, skipping");
+                                    metrics::SOURCE_MALFORMED.inc();
+                                    continue;
+                                };
 
                                 let update = AccountUpdate {
                                     pubkey,
@@ -184,8 +213,11 @@ impl StreamSource {
                         Some(UpdateOneof::Transaction(tx_update)) => {
                             if let Some(tx_info) = tx_update.transaction {
                                 let slot = tx_update.slot;
-                                let sig = Signature::try_from(tx_info.signature.as_slice())
-                                    .unwrap_or_default();
+                                let Ok(sig) = Signature::try_from(tx_info.signature.as_slice()) else {
+                                    tracing::warn!(slot, "malformed transaction signature, skipping");
+                                    metrics::SOURCE_MALFORMED.inc();
+                                    continue;
+                                };
 
                                 let acc = accumulators
                                     .entry(slot)
@@ -194,35 +226,51 @@ impl StreamSource {
                                 let err_msg = tx_info.meta.as_ref()
                                     .and_then(|m| m.err.as_ref())
                                     .map(|e| format!("{:?}", e));
+                                let fee = tx_info.meta.as_ref().map(|m| m.fee).unwrap_or(0);
+                                let tx_idx = tx_info.index as u32;
 
-                                acc.transactions.insert(sig, TransactionEntry {
-                                    signature: sig,
-                                    offset: 0,
-                                    length: 0,
-                                    err: err_msg.clone(),
-                                });
-
-                                // Index address → signature for getSignaturesForAddress
+                                // Harvest address keys before the proto is consumed by encode().
+                                let mut account_pks: Vec<Pubkey> = Vec::new();
                                 if let Some(tx_msg) = &tx_info.transaction {
                                     if let Some(msg) = &tx_msg.message {
+                                        account_pks.reserve(msg.account_keys.len());
                                         for key in &msg.account_keys {
                                             if let Ok(pk) = Pubkey::try_from(key.as_slice()) {
-                                                acc.address_signatures
-                                                    .entry(pk)
-                                                    .or_default()
-                                                    .push(SignatureEntry {
-                                                        signature: sig,
-                                                        err: err_msg.clone(),
-                                                        memo: None,
-                                                    });
+                                                account_pks.push(pk);
                                             }
                                         }
                                     }
                                 }
 
-                                if let Some(meta) = &tx_info.meta {
-                                    acc.fees.push(meta.fee);
+                                // Encode prost payload. Prebuild of the agave-shape
+                                // JSON is deferred to block-seal time (parallel).
+                                let payload = {
+                                    use yellowstone_grpc_proto::prost::Message;
+                                    let mut buf = Vec::with_capacity(tx_info.encoded_len());
+                                    let _ = tx_info.encode(&mut buf);
+                                    bytes::Bytes::from(buf)
+                                };
+
+                                acc.transactions.insert(sig, TransactionEntry {
+                                    signature: sig,
+                                    tx_index: tx_idx,
+                                    err: err_msg.clone(),
+                                    payload,
+                                    prebuilt: PLACEHOLDER_RAW.clone(),
+                                });
+
+                                for pk in &account_pks {
+                                    acc.address_signatures
+                                        .entry(*pk)
+                                        .or_default()
+                                        .push(SignatureEntry {
+                                            signature: sig,
+                                            err: err_msg.clone(),
+                                            memo: None,
+                                        });
                                 }
+
+                                acc.fees.push(fee);
 
                                 txs_count += 1;
                                 metrics::INGESTED_TRANSACTIONS.inc();

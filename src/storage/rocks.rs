@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rocksdb::{
-    BlockBasedOptions, BoundColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded,
-    Options, SliceTransform, WriteBatch,
+    BlockBasedIndexType, BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor,
+    DBCompressionType, DBWithThreadMode, MultiThreaded, Options, SliceTransform, WriteBatch,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -10,16 +10,13 @@ use crate::config::RocksDbConfig;
 use crate::metrics;
 use crate::types::*;
 
-/// Column family names for all indexed data.
-///
-/// Block pipeline CFs (history queries):
 const CF_SLOT_INDEX: &str = "slot_index";
 const CF_TX_INDEX: &str = "tx_index";
 const CF_SFA_INDEX: &str = "sfa_index";
-
-/// Account pipeline CFs (state queries):
 const CF_ACCOUNTS: &str = "accounts";
 const CF_PROGRAM_INDEX: &str = "program_index";
+const CF_OWNER_ATAS: &str = "owner_atas";
+const CF_MINT_TOP_HOLDERS: &str = "mint_top_holders";
 
 const ALL_CFS: &[&str] = &[
     CF_SLOT_INDEX,
@@ -27,18 +24,52 @@ const ALL_CFS: &[&str] = &[
     CF_SFA_INDEX,
     CF_ACCOUNTS,
     CF_PROGRAM_INDEX,
+    CF_OWNER_ATAS,
+    CF_MINT_TOP_HOLDERS,
 ];
 
-/// Apply shared compaction tuning to a CF's options.
-/// Without this, RocksDB uses defaults (L0 trigger=4, unbounded level sizes)
-/// which falls behind under high ingest and piles up thousands of L0 SSTs.
+pub const MINT_TOP_HOLDERS_K: usize = 100;
+
 fn apply_cf_compaction_tuning(opts: &mut Options) {
-    opts.set_level_zero_file_num_compaction_trigger(2);
+    apply_cf_compaction_tuning_with(opts, 2);
+}
+
+fn apply_cf_compaction_tuning_with(opts: &mut Options, l0_trigger: i32) {
+    opts.set_level_zero_file_num_compaction_trigger(l0_trigger);
     opts.set_level_zero_slowdown_writes_trigger(20);
     opts.set_level_zero_stop_writes_trigger(36);
     opts.set_target_file_size_base(64 * 1024 * 1024);
     opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
     opts.set_max_bytes_for_level_multiplier(10.0);
+    opts.set_level_compaction_dynamic_level_bytes(true);
+    opts.set_bottommost_compression_type(DBCompressionType::Zstd);
+    opts.set_bottommost_zstd_max_train_bytes(0, true);
+}
+
+fn build_block_opts(
+    cache: &Cache,
+    block_size: usize,
+    with_bloom: bool,
+    prefix_bloom: bool,
+) -> BlockBasedOptions {
+    let mut bo = BlockBasedOptions::default();
+    bo.set_block_cache(cache);
+    bo.set_block_size(block_size);
+    bo.set_format_version(5);
+    bo.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
+    bo.set_partition_filters(true);
+    bo.set_metadata_block_size(4096);
+    bo.set_cache_index_and_filter_blocks(true);
+    bo.set_pin_top_level_index_and_filter(true);
+    bo.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    if with_bloom {
+        // 15 bits/key: FP ~0.04% vs 0.9% at 10. ~60 bytes/million keys overhead.
+        bo.set_bloom_filter(15.0, false);
+        if prefix_bloom {
+            bo.set_whole_key_filtering(false);
+        }
+    }
+    bo
 }
 
 type DB = DBWithThreadMode<MultiThreaded>;
@@ -52,16 +83,18 @@ impl UnifiedRocksDb {
         let path = Path::new(&config.path);
         std::fs::create_dir_all(path).context("creating rocksdb directory")?;
 
-        // Shared block cache across all CFs — bounds total memory usage.
-        // Without this, each CF allocates its own unbounded cache.
-        let cache = rocksdb::Cache::new_lru_cache(512 * 1024 * 1024); // 512MB shared
+        // Shared block cache across all CFs. 32 GiB: hot blocks + indexes
+        // stay hot in RAM on our 377 GiB host.
+        let cache = Cache::new_lru_cache(32 * 1024 * 1024 * 1024);
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        // Per-CF write buffer. 5 CFs × 64MB × 2 (active + flushing) = 640MB max memtables.
-        db_opts.set_write_buffer_size(64 * 1024 * 1024);
-        db_opts.set_max_write_buffer_number(2);
+        // Write buffer tuning: 128 MB × 4. Larger than the original 64×2
+        // for burst ingest headroom, but not 256×8 — bigger memtables
+        // slow range scans (measured gSFA regression at that size).
+        db_opts.set_write_buffer_size(128 * 1024 * 1024);
+        db_opts.set_max_write_buffer_number(4);
         db_opts.set_max_open_files(config.max_open_files);
         db_opts.set_allow_concurrent_memtable_write(true);
         let parallelism = std::thread::available_parallelism()
@@ -69,8 +102,20 @@ impl UnifiedRocksDb {
             .unwrap_or(4);
         db_opts.increase_parallelism(parallelism);
         db_opts.set_max_background_jobs(parallelism.max(4));
-        // Force L0 to drain even during low-write periods; prevents silent accumulation.
         db_opts.set_periodic_compaction_seconds(3600);
+
+        // 200 MB/s — tune up on enterprise SSDs.
+        db_opts.set_ratelimiter(200 * 1024 * 1024, 100_000, 10);
+
+        // Direct I/O for flush+compaction was measured neutral on our NVMe;
+        // leaving off so the kernel page cache keeps helping sfa_index
+        // prefix-scan read-ahead. Revisit when dedicated I/O threads land.
+        // db_opts.set_use_direct_io_for_flush_and_compaction(true);
+
+        db_opts.enable_statistics();
+        db_opts.set_stats_dump_period_sec(600);
+        db_opts.set_report_bg_io_stats(true);
+        db_opts.set_wal_recovery_mode(rocksdb::DBRecoveryMode::PointInTime);
 
         if config.enable_pipelined_writes {
             db_opts.set_enable_pipelined_write(true);
@@ -82,6 +127,8 @@ impl UnifiedRocksDb {
             Self::sfa_index_cf_opts(&cache),
             Self::accounts_cf_opts(&cache),
             Self::program_index_cf_opts(&cache),
+            Self::owner_atas_cf_opts(&cache),
+            Self::mint_top_holders_cf_opts(&cache),
         ];
 
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)
@@ -90,61 +137,79 @@ impl UnifiedRocksDb {
         Ok(Self { db: Arc::new(db) })
     }
 
-    fn slot_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn slot_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
+        let block_opts = build_block_opts(cache, 4 * 1024, false, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_SLOT_INDEX, opts)
     }
 
-    fn tx_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn tx_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        opts.set_compression_type(DBCompressionType::Lz4);
+        // Write-heavy: keep L0 very thin for read latency.
+        apply_cf_compaction_tuning_with(&mut opts, 1);
+        let block_opts = build_block_opts(cache, 16 * 1024, true, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_TX_INDEX, opts)
     }
 
-    fn sfa_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn sfa_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
-        apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        opts.set_memtable_prefix_bloom_ratio(0.1);
+        apply_cf_compaction_tuning_with(&mut opts, 1);
+        let block_opts = build_block_opts(cache, 16 * 1024, true, true);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_SFA_INDEX, opts)
     }
 
-    fn accounts_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn accounts_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_bottommost_compression_type(rocksdb::DBCompressionType::Zstd);
+        opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 8 * 1024, true, false);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_ACCOUNTS, opts)
     }
 
-    fn program_index_cf_opts(cache: &rocksdb::Cache) -> ColumnFamilyDescriptor {
+    fn program_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        opts.set_memtable_prefix_bloom_ratio(0.1);
         apply_cf_compaction_tuning(&mut opts);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(cache);
-        block_opts.set_bloom_filter(10.0, false);
+        let block_opts = build_block_opts(cache, 4 * 1024, true, true);
         opts.set_block_based_table_factory(&block_opts);
         ColumnFamilyDescriptor::new(CF_PROGRAM_INDEX, opts)
+    }
+
+    fn owner_atas_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
+        // Key [owner(32) | token_account_pubkey(32)] → empty. Prefix scan
+        // by owner to list the owner's token accounts. Same shape as
+        // program_index but keyed on token-account owner.
+        let mut opts = Options::default();
+        opts.set_compression_type(DBCompressionType::Lz4);
+        opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
+        opts.set_memtable_prefix_bloom_ratio(0.1);
+        apply_cf_compaction_tuning_with(&mut opts, 1);
+        let block_opts = build_block_opts(cache, 4 * 1024, true, true);
+        opts.set_block_based_table_factory(&block_opts);
+        ColumnFamilyDescriptor::new(CF_OWNER_ATAS, opts)
+    }
+
+    fn mint_top_holders_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
+        // Key mint(32) → bincode Vec<(amount u64, pubkey [u8;32])> sorted DESC,
+        // capped at MINT_TOP_HOLDERS_K. Point lookup CF.
+        let mut opts = Options::default();
+        opts.set_compression_type(DBCompressionType::Lz4);
+        apply_cf_compaction_tuning_with(&mut opts, 1);
+        let block_opts = build_block_opts(cache, 4 * 1024, true, false);
+        opts.set_block_based_table_factory(&block_opts);
+        ColumnFamilyDescriptor::new(CF_MINT_TOP_HOLDERS, opts)
     }
 
     fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
@@ -174,6 +239,18 @@ impl UnifiedRocksDb {
         Ok(self.db.get_cf(&self.cf(CF_TX_INDEX), signature)?)
     }
 
+    pub fn get_tx_index_batch(&self, signatures: &[[u8; 64]]) -> Result<Vec<Option<Vec<u8>>>> {
+        let cf = self.cf(CF_TX_INDEX);
+        let keys: Vec<(&Arc<BoundColumnFamily<'_>>, &[u8; 64])> =
+            signatures.iter().map(|s| (&cf, s)).collect();
+        Ok(self
+            .db
+            .multi_get_cf(keys)
+            .into_iter()
+            .map(|r| r.ok().flatten())
+            .collect())
+    }
+
     /// Write address → signature entries for a slot.
     /// Key format: [address(32) | slot(8 BE)]
     pub fn put_sfa_batch(&self, entries: &[(solana_pubkey::Pubkey, Slot, Vec<u8>)]) -> Result<()> {
@@ -189,7 +266,58 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Iterate signatures for an address in reverse slot order.
+    /// Iterate signatures for an address in reverse slot order, counting
+    /// decoded signatures (not slots) toward `limit`. For hot addresses
+    /// like the Token Program a single slot holds hundreds of sigs, so
+    /// the slot-limited variant wastes most of the work.
+    pub fn iter_sfa_limited(
+        &self,
+        address: &solana_pubkey::Pubkey,
+        before_slot: Option<Slot>,
+        sig_limit: usize,
+    ) -> Result<Vec<(Slot, Vec<super::super::types::SignatureEntry>)>> {
+        let cf = self.cf(CF_SFA_INDEX);
+        let prefix = address.as_ref();
+
+        let start_slot = before_slot.unwrap_or(u64::MAX);
+        let mut seek_key = Vec::with_capacity(40);
+        seek_key.extend_from_slice(prefix);
+        seek_key.extend_from_slice(&start_slot.to_be_bytes());
+
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_readahead_size(256 * 1024);
+        read_opts.set_prefix_same_as_start(true);
+        let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
+        iter.seek_for_prev(&seek_key);
+
+        let mut results: Vec<(Slot, Vec<super::super::types::SignatureEntry>)> = Vec::new();
+        let mut total = 0usize;
+        while iter.valid() && total < sig_limit {
+            let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
+                break;
+            };
+            if key.len() < 40 || &key[..32] != prefix {
+                break;
+            }
+            let slot = u64::from_be_bytes(key[32..40].try_into().unwrap());
+            let sigs: Vec<super::super::types::SignatureEntry> =
+                bincode::deserialize(value).or_else(|_| serde_json::from_slice(value))?;
+            let remaining = sig_limit - total;
+            let take = remaining.min(sigs.len());
+            total += take;
+            // Keep only the suffix we need; skip the rest of this slot's blob.
+            if take == sigs.len() {
+                results.push((slot, sigs));
+            } else {
+                results.push((slot, sigs.into_iter().take(take).collect()));
+            }
+            iter.prev();
+        }
+        Ok(results)
+    }
+
+    /// Legacy: returns (slot, raw_bytes) pairs. `sig_limit`-counting variant
+    /// (`iter_sfa_limited`) should be preferred for new code.
     pub fn iter_sfa(
         &self,
         address: &solana_pubkey::Pubkey,
@@ -204,7 +332,10 @@ impl UnifiedRocksDb {
         seek_key.extend_from_slice(prefix);
         seek_key.extend_from_slice(&start_slot.to_be_bytes());
 
-        let mut iter = self.db.raw_iterator_cf(&cf);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_readahead_size(256 * 1024);
+        read_opts.set_prefix_same_as_start(true);
+        let mut iter = self.db.raw_iterator_cf_opt(&cf, read_opts);
         iter.seek_for_prev(&seek_key);
 
         let mut results = Vec::with_capacity(limit);
@@ -232,6 +363,20 @@ impl UnifiedRocksDb {
         Ok(self.db.get_cf(&self.cf(CF_ACCOUNTS), pubkey)?)
     }
 
+    pub fn get_accounts_batch(
+        &self,
+        pubkeys: &[[u8; 32]],
+    ) -> Vec<Option<Vec<u8>>> {
+        let cf = self.cf(CF_ACCOUNTS);
+        let keys: Vec<(&Arc<BoundColumnFamily<'_>>, &[u8; 32])> =
+            pubkeys.iter().map(|k| (&cf, k)).collect();
+        self.db
+            .multi_get_cf(keys)
+            .into_iter()
+            .map(|r| r.ok().flatten())
+            .collect()
+    }
+
     /// Store program index entry. Key: [program_id(32) | pubkey(32)] → empty
     pub fn put_program_index(&self, program_id: &[u8; 32], pubkey: &[u8; 32]) -> Result<()> {
         let mut key = Vec::with_capacity(64);
@@ -241,26 +386,120 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
+    /// Record that `pubkey` is a token account owned by `owner`.
+    pub fn put_owner_ata(&self, owner: &[u8; 32], pubkey: &[u8; 32]) -> Result<()> {
+        let mut key = Vec::with_capacity(64);
+        key.extend_from_slice(owner);
+        key.extend_from_slice(pubkey);
+        self.db.put_cf(&self.cf(CF_OWNER_ATAS), &key, [])?;
+        Ok(())
+    }
+
+    pub fn put_owner_atas_batch(&self, entries: &[([u8; 32], [u8; 32])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let cf = self.cf(CF_OWNER_ATAS);
+        let mut batch = WriteBatch::default();
+        for (owner, pubkey) in entries {
+            let mut key = [0u8; 64];
+            key[..32].copy_from_slice(owner);
+            key[32..].copy_from_slice(pubkey);
+            batch.put_cf(&cf, key, []);
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    pub fn get_mint_top_holders(&self, mint: &[u8; 32]) -> Result<Vec<(u64, [u8; 32])>> {
+        match self.db.get_cf(&self.cf(CF_MINT_TOP_HOLDERS), mint)? {
+            Some(bytes) => Ok(bincode::deserialize(&bytes).unwrap_or_default()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Merge `updates` into the per-mint top-K, persist if changed.
+    /// `updates` is `(amount, token_account_pubkey)` for each freshly-written
+    /// token account belonging to `mint`.
+    pub fn update_mint_top_holders(
+        &self,
+        mint: &[u8; 32],
+        updates: &[(u64, [u8; 32])],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let cf = self.cf(CF_MINT_TOP_HOLDERS);
+        let mut current: Vec<(u64, [u8; 32])> = match self.db.get_cf(&cf, mint)? {
+            Some(bytes) => bincode::deserialize(&bytes).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        // Replace existing entries for the same pubkeys, then add new ones.
+        for (amount, pk) in updates {
+            current.retain(|(_, existing)| existing != pk);
+            if *amount > 0 {
+                current.push((*amount, *pk));
+            }
+        }
+        current.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        current.truncate(MINT_TOP_HOLDERS_K);
+        let encoded = bincode::serialize(&current)?;
+        self.db.put_cf(&cf, mint, encoded)?;
+        Ok(())
+    }
+
+    /// List token account pubkeys owned by `owner` via prefix scan.
+    pub fn get_owner_atas(&self, owner: &[u8; 32], cap: usize) -> Result<Vec<[u8; 32]>> {
+        let cf = self.cf(CF_OWNER_ATAS);
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek(owner);
+        let mut out = Vec::new();
+        while iter.valid() && out.len() < cap {
+            if let Some(key) = iter.key() {
+                if key.len() != 64 || &key[..32] != owner {
+                    break;
+                }
+                out.push(key[32..64].try_into().unwrap());
+            }
+            iter.next();
+        }
+        Ok(out)
+    }
+
     /// Get all accounts owned by a program via prefix scan.
     pub fn get_program_accounts(&self, program_id: &[u8; 32]) -> Result<Vec<([u8; 32], Vec<u8>)>> {
         let cf_prog = self.cf(CF_PROGRAM_INDEX);
         let cf_acct = self.cf(CF_ACCOUNTS);
 
-        let mut iter = self.db.raw_iterator_cf(&cf_prog);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_readahead_size(2 * 1024 * 1024);
+        let mut iter = self.db.raw_iterator_cf_opt(&cf_prog, read_opts);
         iter.seek(program_id);
 
-        let mut results = Vec::new();
+        let mut pubkeys: Vec<[u8; 32]> = Vec::new();
         while iter.valid() {
             if let Some(key) = iter.key() {
                 if key.len() != 64 || &key[..32] != program_id {
                     break;
                 }
-                let pubkey: [u8; 32] = key[32..64].try_into().unwrap();
-                if let Ok(Some(data)) = self.db.get_cf(&cf_acct, pubkey) {
-                    results.push((pubkey, data));
-                }
+                pubkeys.push(key[32..64].try_into().unwrap());
             }
             iter.next();
+        }
+
+        if pubkeys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let keys: Vec<(&Arc<BoundColumnFamily<'_>>, &[u8; 32])> =
+            pubkeys.iter().map(|k| (&cf_acct, k)).collect();
+        let values = self.db.multi_get_cf(keys);
+
+        let mut results = Vec::with_capacity(pubkeys.len());
+        for (pubkey, val) in pubkeys.into_iter().zip(values) {
+            if let Ok(Some(data)) = val {
+                results.push((pubkey, data));
+            }
         }
         Ok(results)
     }
@@ -288,9 +527,7 @@ impl UnifiedRocksDb {
         &self.db
     }
 
-    /// Force a full-range compaction on every CF. Blocking and expensive —
-    /// use once after recovery or on a scheduled maintenance window to drain
-    /// an accumulated L0 backlog. Safe to call while serving reads.
+    /// Blocking full-range compaction across all CFs.
     pub fn compact_all(&self) -> Result<()> {
         for name in ALL_CFS {
             let cf = self.cf(name);
@@ -300,8 +537,57 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Refresh Prometheus gauges for per-CF SST counts, L0 file counts, and
-    /// estimated live data size. Call on a timer (e.g. every 60s) from main.
+    /// Delete sfa_index entries older than `cutoff_slot`, walking the CF
+    /// once and issuing one DeleteRange per distinct address.
+    pub fn prune_sfa_before(&self, cutoff_slot: Slot) -> Result<u64> {
+        let cf = self.cf(CF_SFA_INDEX);
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut dropped = 0u64;
+        let mut last_address: Option<[u8; 32]> = None;
+
+        while iter.valid() {
+            let Some(key) = iter.key() else { break };
+            if key.len() < 40 {
+                iter.next();
+                continue;
+            }
+            let address: [u8; 32] = key[0..32].try_into().unwrap();
+
+            if Some(address) == last_address {
+                iter.next();
+                continue;
+            }
+            last_address = Some(address);
+
+            // Range: [address | 0] .. [address | cutoff]
+            let mut start = Vec::with_capacity(40);
+            start.extend_from_slice(&address);
+            start.extend_from_slice(&0u64.to_be_bytes());
+            let mut end = Vec::with_capacity(40);
+            end.extend_from_slice(&address);
+            end.extend_from_slice(&cutoff_slot.to_be_bytes());
+
+            self.db.delete_range_cf(&cf, &start, &end)?;
+            dropped += 1;
+
+            let mut next_prefix = address;
+            for i in (0..32).rev() {
+                if next_prefix[i] < u8::MAX {
+                    next_prefix[i] += 1;
+                    for j in i + 1..32 {
+                        next_prefix[j] = 0;
+                    }
+                    break;
+                }
+            }
+            iter.seek(next_prefix);
+        }
+
+        Ok(dropped)
+    }
+
     pub fn update_metrics(&self) {
         for name in ALL_CFS {
             let cf = self.cf(name);
@@ -324,7 +610,6 @@ impl UnifiedRocksDb {
                     .set(total as i64);
             }
 
-            // num-live-sst-files is tracked via total across all levels.
             let mut total_sst = 0i64;
             for level in 0..7 {
                 let prop = format!("rocksdb.num-files-at-level{level}");

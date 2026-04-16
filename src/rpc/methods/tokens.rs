@@ -28,7 +28,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     .and_then(|v| v.get("encoding"))
                     .and_then(|v| v.as_str())
             })
-            .unwrap_or("jsonParsed");
+            .unwrap_or("base64");
         let slot = ctx.reader.cache().processed_slot();
 
         match ctx
@@ -62,7 +62,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     .and_then(|v| v.get("encoding"))
                     .and_then(|v| v.as_str())
             })
-            .unwrap_or("jsonParsed");
+            .unwrap_or("base64");
         let slot = ctx.reader.cache().processed_slot();
 
         match ctx
@@ -107,15 +107,26 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let mint_bytes = bs58::decode(mint_str)
             .into_vec()
             .map_err(|_| err(-32602, "Invalid encoding"))?;
+        let mint_key: [u8; 32] = mint_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| err(-32602, "Invalid mint length"))?;
         let slot = ctx.reader.cache().processed_slot();
 
-        match ctx.reader.get_token_largest_accounts(&mint_bytes, 20).await {
-            Ok(accounts) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(
-                slot,
-                serde_json::json!(accounts),
-            )),
-            Err(e) => Err(err(-32603, &e.to_string())),
-        }
+        let reader = std::sync::Arc::clone(&ctx.reader);
+        let arc = ctx
+            .gtla_coalescer
+            .run(mint_key, move || async move {
+                reader
+                    .get_token_largest_accounts(&mint_bytes, 20)
+                    .await
+                    .unwrap_or_default()
+            })
+            .await;
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(
+            slot,
+            serde_json::json!(*arc),
+        ))
     })?;
 
     Ok(())

@@ -77,9 +77,13 @@ pub struct BlockWithData {
 #[derive(Debug, Clone)]
 pub struct TransactionEntry {
     pub signature: solana_signature::Signature,
-    pub offset: u32,
-    pub length: u32,
+    pub tx_index: u32,
     pub err: Option<String>,
+    /// prost-encoded SubscribeUpdateTransactionInfo.
+    pub payload: bytes::Bytes,
+    /// Agave-shape JSON, pre-built at ingest. Hot-path getTransaction and
+    /// getBlock(full) clone this Arc rather than re-decoding the prost payload.
+    pub prebuilt: Arc<Box<serde_json::value::RawValue>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +164,14 @@ pub enum WriteToReadMessage {
         slot: Slot,
     },
     BlockDead {
+        slot: Slot,
+    },
+    AccountsUpdated {
+        pubkeys: Vec<[u8; 32]>,
+    },
+    MintUpdated {
+        mint: [u8; 32],
+        decimals: i32,
         slot: Slot,
     },
 }

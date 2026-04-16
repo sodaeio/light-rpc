@@ -21,9 +21,16 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .try_into()
             .map_err(|_| err(-32602, "Invalid signature length"))?;
 
+        // Hot path: memory-cached prebuilt (last ~64 slots). Splices slot +
+        // blockTime into the stored per-tx RawValue at response time.
+        if let Some(raw) = ctx.reader.get_transaction_prebuilt(&sig_bytes) {
+            return Ok::<Box<serde_json::value::RawValue>, jsonrpsee::types::ErrorObjectOwned>(raw);
+        }
+
+        let null_raw = || serde_json::value::RawValue::from_string("null".into()).unwrap();
         match ctx.reader.get_transaction(&sig_bytes) {
-            Ok(Some(info)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(info),
-            Ok(None) => Ok(serde_json::Value::Null),
+            Ok(Some(info)) => Ok(serde_json::value::to_raw_value(&info).unwrap_or_else(|_| null_raw())),
+            Ok(None) => Ok(null_raw()),
             Err(e) => Err(err(-32603, &e.to_string())),
         }
     })?;
@@ -118,30 +125,40 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let slot = ctx.reader.cache().processed_slot();
         let finalized = ctx.reader.cache().finalized_slot();
 
-        let statuses: Vec<serde_json::Value> = sigs.iter().map(|sig_val| {
-            let sig_str = sig_val.as_str().unwrap_or("");
-            let sig_bytes: Result<[u8; 64], _> = bs58::decode(sig_str).into_vec()
-                .map_err(|_| ())
-                .and_then(|v| v.try_into().map_err(|_| ()));
+        // Decode all sigs first; keep track of originals for null-slot fallback.
+        let decoded: Vec<Option<[u8; 64]>> = sigs
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .and_then(|s| bs58::decode(s).into_vec().ok())
+                    .and_then(|b| b.try_into().ok())
+            })
+            .collect();
+        let valid: Vec<[u8; 64]> = decoded.iter().filter_map(|o| *o).collect();
 
-            match sig_bytes {
-                Ok(bytes) => {
-                    match ctx.reader.get_transaction(&bytes) {
-                        Ok(Some(tx_info)) => {
-                            let tx_slot = tx_info["slot"].as_u64().unwrap_or(0);
-                            serde_json::json!({
-                                "slot": tx_slot,
-                                "confirmations": null,
-                                "err": tx_info.get("err").cloned().unwrap_or(serde_json::Value::Null),
-                                "confirmationStatus": if tx_slot <= finalized { "finalized" } else { "confirmed" },
-                            })
-                        }
-                        _ => serde_json::Value::Null,
+        let fetched = ctx
+            .reader
+            .get_transactions_batch(&valid)
+            .unwrap_or_else(|_| vec![None; valid.len()]);
+        let mut iter = fetched.into_iter();
+        let statuses: Vec<serde_json::Value> = decoded
+            .into_iter()
+            .map(|maybe_sig| match maybe_sig {
+                None => serde_json::Value::Null,
+                Some(_) => match iter.next().unwrap_or(None) {
+                    Some(tx) => {
+                        let tx_slot = tx["slot"].as_u64().unwrap_or(0);
+                        serde_json::json!({
+                            "slot": tx_slot,
+                            "confirmations": null,
+                            "err": tx.get("err").cloned().unwrap_or(serde_json::Value::Null),
+                            "confirmationStatus": if tx_slot <= finalized { "finalized" } else { "confirmed" },
+                        })
                     }
-                }
-                Err(_) => serde_json::Value::Null,
-            }
-        }).collect();
+                    None => serde_json::Value::Null,
+                },
+            })
+            .collect();
 
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(slot, serde_json::json!(statuses)))
     })?;

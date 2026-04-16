@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use jsonrpsee::RpcModule;
 
-use super::rpc_response;
+use super::{rpc_resp, rpc_response};
 use crate::rpc::server::RpcContext;
 
 fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
@@ -24,16 +26,19 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .get(1)
             .and_then(|v| v.get("encoding"))
             .and_then(|v| v.as_str())
-            .unwrap_or("base64");
+            .unwrap_or("base64")
+            .to_string();
         let slot = ctx.reader.cache().processed_slot();
 
-        match ctx.reader.get_account_info(&pubkey_bytes, encoding).await {
-            Ok(Some(account)) => {
-                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(slot, account))
-            }
-            Ok(None) => Ok(rpc_response(slot, serde_json::Value::Null)),
-            Err(e) => Err(err(-32603, &e.to_string())),
-        }
+        let raw = match ctx
+            .reader
+            .get_account_info_raw(&pubkey_bytes, &encoding)
+            .await
+        {
+            Ok(Some(arc)) => arc,
+            _ => Arc::new(serde_json::value::RawValue::from_string("null".into()).unwrap()),
+        };
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_resp(slot, raw))
     })?;
 
     module.register_async_method("getMultipleAccounts", |params, ctx, _| async move {
@@ -78,6 +83,24 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .map_err(|_| err(-32602, "Invalid encoding"))?
             .try_into()
             .map_err(|_| err(-32602, "Invalid pubkey length"))?;
+
+        // Denylist check: pathologically large programs (Token, System,
+        // ATA, etc.) would return gigabyte-scale payloads and DoS the
+        // service. Refuse with a helpful hint pointing at the typed
+        // alternative (`getTokenAccountsByOwner`). Industry standard
+        // across every production Solana RPC provider.
+        if ctx.gpa_blocked.contains(&program_bytes) {
+            return Err(err(
+                -32602,
+                &format!(
+                    "getProgramAccounts is not supported for {program_str}. \
+                     Use getTokenAccountsByOwner / getTokenAccountsByDelegate \
+                     for SPL Token programs, or getAccountInfo for a single \
+                     account."
+                ),
+            ));
+        }
+
         let encoding = p
             .get(1)
             .and_then(|v| v.get("encoding"))
@@ -94,7 +117,19 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .get_program_accounts(&program_bytes, encoding)
             .await
         {
-            Ok(accounts) => {
+            Ok(mut accounts) => {
+                if accounts.len() > ctx.gpa_max_accounts {
+                    return Err(err(
+                        -32602,
+                        &format!(
+                            "getProgramAccounts would return {} accounts \
+                             (server cap {}). Add dataSize or memcmp filters.",
+                            accounts.len(),
+                            ctx.gpa_max_accounts
+                        ),
+                    ));
+                }
+                accounts.truncate(ctx.gpa_max_accounts);
                 if with_context {
                     let slot = ctx.reader.cache().processed_slot();
                     Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(

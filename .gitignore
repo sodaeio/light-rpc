@@ -4,4 +4,11 @@
 *.swo
 .env
 config.yml
+config-prod.yml
 data/
+
+# Local-only docs (CLAUDE.md, ARCHITECTURE.md, PERFORMANCE.md, etc.)
+# live here and are never tracked.
+docs-local/
+*.md
+!README.md

@@ -31,6 +31,27 @@ pub struct RpcServer {
 pub struct RpcContext {
     pub reader: Arc<StorageReader>,
     pub upstream: Option<UpstreamForwarder>,
+    pub gpa_blocked: std::collections::HashSet<[u8; 32]>,
+    pub gpa_max_accounts: usize,
+    pub block_cache: BlockResponseCache,
+    pub gai_coalescer:
+        Arc<crate::rpc::coalesce::Coalescer<([u8; 32], String), serde_json::Value>>,
+    pub gtla_coalescer:
+        Arc<crate::rpc::coalesce::Coalescer<[u8; 32], Vec<serde_json::Value>>>,
+    pub block_coalescer:
+        Arc<crate::rpc::coalesce::Coalescer<(u64, u64), Option<BlockCacheEntry>>>,
+}
+
+pub const BLOCK_CACHE_SHARDS: usize = 16;
+pub type BlockCacheEntry = Arc<Box<serde_json::value::RawValue>>;
+pub type BlockCacheShard = parking_lot::Mutex<lru::LruCache<(u64, u64), BlockCacheEntry>>;
+pub type BlockResponseCache = Arc<[BlockCacheShard; BLOCK_CACHE_SHARDS]>;
+
+#[inline]
+pub fn block_cache_shard(slot: u64, cfg_hash: u64) -> usize {
+    let mut h = slot.wrapping_mul(0x9E3779B97F4A7C15);
+    h ^= cfg_hash;
+    h.wrapping_mul(0xBF58476D1CE4E5B9) as usize % BLOCK_CACHE_SHARDS
 }
 
 type RpcState = Arc<RpcModule<RpcContext>>;
@@ -48,10 +69,39 @@ impl RpcServer {
         }
     }
 
+    fn build_gpa_blocklist(config: &RpcConfig) -> std::collections::HashSet<[u8; 32]> {
+        use crate::config::DEFAULT_GPA_BLOCKED;
+        let entries: Vec<String> = match &config.gpa_blocked_programs {
+            Some(list) => list.clone(),
+            None => DEFAULT_GPA_BLOCKED.iter().map(|s| s.to_string()).collect(),
+        };
+        let mut set = std::collections::HashSet::with_capacity(entries.len());
+        for s in entries {
+            match bs58::decode(&s).into_vec() {
+                Ok(v) if v.len() == 32 => {
+                    set.insert(v.try_into().unwrap());
+                }
+                _ => tracing::warn!(pubkey = %s, "invalid gpa_blocked_programs entry, skipping"),
+            }
+        }
+        tracing::info!(count = set.len(), "gpa blocklist loaded");
+        set
+    }
+
     pub async fn run(self) -> Result<()> {
+        let gpa_blocked = Self::build_gpa_blocklist(&self.config);
+        let cap = std::num::NonZeroUsize::new(64).unwrap();
+        let block_cache: BlockResponseCache =
+            Arc::new(std::array::from_fn(|_| parking_lot::Mutex::new(lru::LruCache::new(cap))));
         let context = RpcContext {
             reader: Arc::clone(&self.reader),
             upstream: self.upstream,
+            gpa_blocked,
+            gpa_max_accounts: self.config.gpa_max_accounts,
+            block_cache,
+            gai_coalescer: Arc::new(crate::rpc::coalesce::Coalescer::new()),
+            gtla_coalescer: Arc::new(crate::rpc::coalesce::Coalescer::new()),
+            block_coalescer: Arc::new(crate::rpc::coalesce::Coalescer::new()),
         };
 
         let module = methods::build_rpc_module(context)?;
@@ -62,7 +112,12 @@ impl RpcServer {
             .allow_headers([axum::http::header::CONTENT_TYPE])
             .allow_origin(Any);
 
-        let compression = CompressionLayer::new().gzip(true).br(true);
+        // Only compress responses big enough that gzip setup isn't net-loss.
+        // Tiny getSlot responses stay uncompressed.
+        let compression = CompressionLayer::new()
+            .gzip(true)
+            .br(true)
+            .quality(tower_http::CompressionLevel::Fastest);
 
         let app = Router::new()
             .route("/", post(handle_jsonrpc))
@@ -77,15 +132,52 @@ impl RpcServer {
             .parse()
             .context("parsing rpc endpoint address")?;
 
-        info!(%addr, "rpc server starting");
+        // One listener per worker via SO_REUSEPORT. Kernel hashes inbound
+        // connections by 5-tuple so cross-worker accept-queue contention is
+        // gone. Matches the scaling pattern used by nginx/envoy.
+        let n_listeners = num_cpus::get().clamp(1, 32);
+        info!(%addr, listeners = n_listeners, "rpc server starting");
 
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await?;
+        let mut handles = Vec::with_capacity(n_listeners);
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let sig_shutdown = std::sync::Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            sig_shutdown.notify_waiters();
+        });
 
+        for i in 0..n_listeners {
+            let listener = bind_reuseport(addr)?;
+            let svc = app.clone();
+            let shutdown = std::sync::Arc::clone(&shutdown);
+            handles.push(tokio::spawn(async move {
+                let _ = axum::serve(listener, svc)
+                    .with_graceful_shutdown(async move { shutdown.notified().await })
+                    .await;
+                tracing::info!(listener = i, "rpc listener stopped");
+            }));
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
         Ok(())
     }
+}
+
+fn bind_reuseport(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    let sock = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.set_nodelay(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(32768)?;
+    Ok(tokio::net::TcpListener::from_std(sock.into())?)
 }
 
 async fn handle_jsonrpc(

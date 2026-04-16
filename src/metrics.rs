@@ -28,6 +28,16 @@ pub static INGESTED_TRANSACTIONS: LazyLock<IntCounter> = LazyLock::new(|| {
     counter
 });
 
+pub static SOURCE_MALFORMED: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "li_source_malformed_total",
+        "gRPC updates skipped due to malformed pubkey/signature",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
 pub static LATEST_SLOT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
         Opts::new("li_latest_slot", "Latest slot by commitment level"),
