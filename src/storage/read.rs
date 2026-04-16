@@ -618,6 +618,14 @@ impl StorageReader {
 
     /// Cheap path for getBlockTime: hit memory first, else read `slot_index`
     /// CF directly — no block file load, no tx decode.
+    pub fn get_first_available_slot(&self) -> Slot {
+        self.rocks.first_slot_index().unwrap_or(0)
+    }
+
+    pub fn get_blocks_in_range(&self, start: Slot, end: Slot) -> Result<Vec<Slot>> {
+        self.rocks.scan_slot_index_range(start, end)
+    }
+
     pub fn get_block_time(&self, slot: Slot) -> Result<Option<UnixTimestamp>> {
         if let Some(block) = self.cache.get_block(slot) {
             return Ok(block.info.block_time);

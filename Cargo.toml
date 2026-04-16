@@ -81,6 +81,7 @@ bytes = "1.10"
 lz4 = "1.28"
 reqwest = { version = "0.12", features = ["json"] }
 zstd = "0.13"
+tar = "0.4"
 
 # ClickHouse (historical module, feature-flagged until rollout complete)
 clickhouse = { version = "0.15", features = ["native-tls", "lz4"], optional = true }

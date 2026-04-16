@@ -15,6 +15,12 @@ use yellowstone_grpc_proto::prost::Message;
 const HEADER_LEN: usize = 21;
 
 pub fn decode_tx_index(bytes: &[u8]) -> Result<Value> {
+    // Backfilled txs are stored as raw JSON (first byte = '{').
+    // Stream txs use prost format with a binary header.
+    if bytes.first() == Some(&b'{') {
+        return serde_json::from_slice(bytes).map_err(|e| anyhow!("json tx_index: {e}"));
+    }
+
     if bytes.len() < HEADER_LEN {
         return Err(anyhow!("tx_index value too short ({} bytes)", bytes.len()));
     }

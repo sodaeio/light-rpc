@@ -230,6 +230,33 @@ impl UnifiedRocksDb {
             .get_cf(&self.cf(CF_SLOT_INDEX), slot.to_be_bytes())?)
     }
 
+    pub fn first_slot_index(&self) -> Option<Slot> {
+        let cf = self.cf(CF_SLOT_INDEX);
+        let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        iter.next()
+            .and_then(|r| r.ok())
+            .and_then(|(k, _)| k.as_ref().try_into().ok().map(Slot::from_be_bytes))
+    }
+
+    pub fn scan_slot_index_range(&self, start: Slot, end: Slot) -> Result<Vec<Slot>> {
+        let cf = self.cf(CF_SLOT_INDEX);
+        let mut iter = self.db.iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(&start.to_be_bytes(), rocksdb::Direction::Forward),
+        );
+        let mut slots = Vec::with_capacity(((end - start) / 3).min(50_000) as usize);
+        while let Some(Ok((key, _))) = iter.next() {
+            if let Ok(bytes) = <[u8; 8]>::try_from(key.as_ref()) {
+                let slot = Slot::from_be_bytes(bytes);
+                if slot > end {
+                    break;
+                }
+                slots.push(slot);
+            }
+        }
+        Ok(slots)
+    }
+
     pub fn put_tx_index(&self, signature: &[u8; 64], data: &[u8]) -> Result<()> {
         self.db.put_cf(&self.cf(CF_TX_INDEX), signature, data)?;
         Ok(())
@@ -586,6 +613,79 @@ impl UnifiedRocksDb {
         }
 
         Ok(dropped)
+    }
+
+    /// Delete slot_index entries before cutoff_slot.
+    pub fn prune_slot_index_before(&self, cutoff_slot: Slot) -> Result<u64> {
+        let cf = self.cf(CF_SLOT_INDEX);
+        let start = 0u64.to_be_bytes();
+        let end = cutoff_slot.to_be_bytes();
+        self.db.delete_range_cf(&cf, start, end)?;
+        Ok(cutoff_slot)
+    }
+
+    /// Delete tx_index entries that reference slots before cutoff_slot.
+    /// tx_index key = signature[64], value starts with slot_le(8).
+    /// Full scan required since keys aren't slot-ordered.
+    pub fn prune_tx_index_before(&self, cutoff_slot: Slot) -> Result<u64> {
+        let cf = self.cf(CF_TX_INDEX);
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut dropped = 0u64;
+
+        while iter.valid() {
+            let Some(key) = iter.key() else { break };
+            let Some(value) = iter.value() else {
+                iter.next();
+                continue;
+            };
+
+            // Detect format: JSON (starts with '{') or binary (slot in first 8 bytes)
+            let slot = if value.first() == Some(&b'{') {
+                // JSON backfilled tx: parse slot field
+                serde_json::from_slice::<serde_json::Value>(value)
+                    .ok()
+                    .and_then(|v| v.get("slot").and_then(|s| s.as_u64()))
+                    .unwrap_or(u64::MAX)
+            } else if value.len() >= 8 {
+                u64::from_le_bytes(value[0..8].try_into().unwrap_or([0; 8]))
+            } else {
+                u64::MAX
+            };
+
+            if slot < cutoff_slot {
+                batch.delete_cf(&cf, key);
+                dropped += 1;
+                // Flush batch periodically
+                if dropped % 100_000 == 0 {
+                    self.db.write(batch)?;
+                    batch = rocksdb::WriteBatch::default();
+                }
+            }
+
+            iter.next();
+        }
+
+        if batch.len() > 0 {
+            self.db.write(batch)?;
+        }
+        Ok(dropped)
+    }
+
+    /// Estimate total RocksDB data size in bytes.
+    pub fn estimated_size_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for name in ALL_CFS {
+            let cf = self.cf(name);
+            if let Ok(Some(size)) =
+                self.db.property_int_value_cf(&cf, "rocksdb.estimate-live-data-size")
+            {
+                total += size;
+            }
+        }
+        total
     }
 
     pub fn update_metrics(&self) {

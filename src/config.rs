@@ -20,7 +20,11 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SourceConfig {
+    /// Primary gRPC endpoint.
     pub endpoint: String,
+    /// Fallback gRPC endpoints. Tried in order when primary fails.
+    #[serde(default)]
+    pub fallback_endpoints: Vec<String>,
     pub x_token: Option<String>,
     #[serde(default)]
     pub commitment: Commitment,
@@ -30,7 +34,15 @@ pub struct SourceConfig {
     pub request_timeout_secs: u64,
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
+    #[serde(default = "default_gap_threshold")]
+    pub gap_threshold_secs: u64,
+    /// Local directory containing Solana snapshot files for account state recovery.
+    #[serde(default = "default_snapshot_dir")]
+    pub snapshot_dir: String,
 }
+
+fn default_gap_threshold() -> u64 { 60 }
+fn default_snapshot_dir() -> String { "/tmp/light-indexer-snapshots".into() }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
@@ -39,10 +51,51 @@ pub struct StorageConfig {
     pub postgres: PostgresConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
     #[cfg(feature = "clickhouse")]
     #[serde(default)]
     pub clickhouse: Option<crate::storage::clickhouse::ClickHouseConfig>,
 }
+
+/// Controls how long historical data is kept. Pruning runs every 10 min.
+/// Account state (accounts, owner_atas, program_index, mint_top_holders)
+/// is always kept — those are current state, not history.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    /// Max days to keep slot_index entries. 0 = keep forever.
+    #[serde(default = "default_retention_days")]
+    pub slot_index_days: u64,
+    /// Max days to keep tx_index entries. 0 = keep forever.
+    #[serde(default = "default_retention_days")]
+    pub tx_index_days: u64,
+    /// Max days to keep sfa_index entries. 0 = keep forever.
+    #[serde(default = "default_sfa_retention_days")]
+    pub sfa_index_days: u64,
+    /// Max total disk usage for RocksDB in GB. When exceeded, oldest
+    /// history is pruned until below this limit. 0 = no limit.
+    #[serde(default)]
+    pub max_disk_gb: u64,
+    /// Prune interval in seconds.
+    #[serde(default = "default_prune_interval")]
+    pub prune_interval_secs: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            slot_index_days: default_retention_days(),
+            tx_index_days: default_retention_days(),
+            sfa_index_days: default_sfa_retention_days(),
+            max_disk_gb: 0,
+            prune_interval_secs: default_prune_interval(),
+        }
+    }
+}
+
+fn default_retention_days() -> u64 { 7 }
+fn default_sfa_retention_days() -> u64 { 30 }
+fn default_prune_interval() -> u64 { 600 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RocksDbConfig {

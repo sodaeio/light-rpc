@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -106,9 +106,17 @@ async fn run(config: Config) -> Result<()> {
     let pg_retention = pg.clone();
     let rocks_retention = rocks.clone();
     let cache_retention = Arc::clone(&memory_cache);
+    let retention_config = config.storage.retention.clone();
     let retention_slots = config.storage.postgres.address_retention_slots;
     tokio::spawn(async move {
-        run_retention_loop(pg_retention, rocks_retention, cache_retention, retention_slots).await;
+        run_retention_loop(
+            pg_retention,
+            rocks_retention,
+            cache_retention,
+            retention_slots,
+            retention_config,
+        )
+        .await;
     });
 
     let pg_writer = pg.clone();
@@ -153,7 +161,20 @@ async fn run(config: Config) -> Result<()> {
         }
     });
 
-    let source = StreamSource::new(config.source, source_tx);
+    // Cold-start: if RocksDB is empty and snapshot recovery is configured,
+    // load a full snapshot so account-state queries work from first request.
+    let rocks_for_source = rocks.clone();
+    if rocks.first_slot_index().is_none() {
+        let snap_dir = &config.source.snapshot_dir;
+        info!("empty database — attempting cold-start snapshot load from {snap_dir}");
+        match cold_start_snapshot(snap_dir, &rocks).await {
+            Ok((slot, count)) => info!(slot, accounts = count, "cold-start snapshot loaded"),
+            Err(e) => warn!(error = %e, "cold-start snapshot failed (no files?), starting from stream"),
+        }
+    }
+
+    let source = StreamSource::new(config.source, source_tx)
+        .with_rocks(rocks_for_source);
     tokio::spawn(async move {
         if let Err(e) = source.run().await {
             error!(error = %e, "stream source failed");
@@ -173,14 +194,41 @@ async fn run(config: Config) -> Result<()> {
     server.run().await.context("rpc server failed")
 }
 
+/// Cold-start: download full snapshot, stream-parse AppendVec accounts,
+/// batch-write to all RocksDB CFs. ~30-60 min for 200M mainnet accounts.
+async fn cold_start_snapshot(
+    snapshot_dir: &str,
+    rocks: &UnifiedRocksDb,
+) -> Result<(u64, usize)> {
+    use light_indexer::source::snapshot;
+
+    let dir = std::path::Path::new(snapshot_dir);
+    let info = snapshot::find_latest_snapshot(dir)?;
+    let slot = info.slot;
+
+    info!(slot, path = %info.path.display(), "parsing snapshot for cold start");
+
+    let path = info.path.clone();
+    let accounts =
+        tokio::task::spawn_blocking(move || snapshot::parse_snapshot_accounts(&path))
+            .await??;
+
+    info!(total = accounts.len(), "applying snapshot to rocksdb");
+    let applied = snapshot::apply_snapshot_to_rocks(rocks, &accounts, slot)?;
+
+    Ok((slot, applied))
+}
+
 async fn run_retention_loop(
     pg: PgStorage,
     rocks: UnifiedRocksDb,
     cache: Arc<MemoryCache>,
     retention_slots: u64,
+    retention: light_indexer::config::RetentionConfig,
 ) {
     use std::time::Duration;
 
+    // Wait for first finalized slot
     loop {
         if cache.finalized_slot() > 0 {
             break;
@@ -188,7 +236,10 @@ async fn run_retention_loop(
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+    let interval_secs = retention.prune_interval_secs.max(60);
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    let slots_per_day: u64 = 216_000; // ~2.5 slots/s × 86400
+
     loop {
         ticker.tick().await;
         let current = cache.finalized_slot();
@@ -196,33 +247,95 @@ async fn run_retention_loop(
             continue;
         }
 
+        // PG partitions (existing logic)
         match pg.ensure_address_partitions(current, 4).await {
-            Ok(_) => info!(current_slot = current, "ensured address_transactions partitions"),
-            Err(e) => error!(error = %e, "failed to ensure address_transactions partitions"),
-        }
-
-        let cutoff = current.saturating_sub(retention_slots);
-        if cutoff == 0 {
-            continue;
-        }
-
-        match pg.drop_address_partitions_before(cutoff).await {
-            Ok(dropped) if !dropped.is_empty() => {
-                info!(cutoff, dropped = ?dropped, "dropped old address_transactions partitions")
-            }
             Ok(_) => {}
-            Err(e) => error!(error = %e, "failed to drop old partitions"),
+            Err(e) => error!(error = %e, "failed to ensure partitions"),
+        }
+        let pg_cutoff = current.saturating_sub(retention_slots);
+        if pg_cutoff > 0 {
+            match pg.drop_address_partitions_before(pg_cutoff).await {
+                Ok(dropped) if !dropped.is_empty() => {
+                    info!(cutoff = pg_cutoff, dropped = ?dropped, "pruned PG partitions")
+                }
+                _ => {}
+            }
         }
 
-        let rocks_task = rocks.clone();
-        let dropped = tokio::task::spawn_blocking(move || rocks_task.prune_sfa_before(cutoff))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(0);
-        if dropped > 0 {
-            info!(cutoff, addresses = dropped, "pruned sfa_index before cutoff");
+        // sfa_index retention
+        if retention.sfa_index_days > 0 {
+            let cutoff = current.saturating_sub(retention.sfa_index_days * slots_per_day);
+            if cutoff > 0 {
+                let r = rocks.clone();
+                let dropped = tokio::task::spawn_blocking(move || r.prune_sfa_before(cutoff))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or(0);
+                if dropped > 0 {
+                    info!(cutoff, addresses = dropped, days = retention.sfa_index_days, "pruned sfa_index");
+                }
+            }
         }
+
+        // slot_index retention
+        if retention.slot_index_days > 0 {
+            let cutoff = current.saturating_sub(retention.slot_index_days * slots_per_day);
+            if cutoff > 0 {
+                let r = rocks.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    match r.prune_slot_index_before(cutoff) {
+                        Ok(_) => info!(cutoff, days = retention.slot_index_days, "pruned slot_index"),
+                        Err(e) => error!(error = %e, "slot_index prune failed"),
+                    }
+                })
+                .await;
+            }
+        }
+
+        // tx_index retention
+        if retention.tx_index_days > 0 {
+            let cutoff = current.saturating_sub(retention.tx_index_days * slots_per_day);
+            if cutoff > 0 {
+                let r = rocks.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    match r.prune_tx_index_before(cutoff) {
+                        Ok(n) => info!(cutoff, dropped = n, days = retention.tx_index_days, "pruned tx_index"),
+                        Err(e) => error!(error = %e, "tx_index prune failed"),
+                    }
+                })
+                .await;
+            }
+        }
+
+        // Disk limit check
+        if retention.max_disk_gb > 0 {
+            let size_bytes = rocks.estimated_size_bytes();
+            let size_gb = size_bytes / (1024 * 1024 * 1024);
+            if size_gb > retention.max_disk_gb {
+                warn!(
+                    size_gb,
+                    limit_gb = retention.max_disk_gb,
+                    "RocksDB exceeds disk limit, aggressive pruning needed"
+                );
+                // Halve the retention window and re-prune
+                let emergency_days = retention.tx_index_days / 2;
+                let cutoff = current.saturating_sub(emergency_days.max(1) * slots_per_day);
+                let r = rocks.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = r.prune_slot_index_before(cutoff);
+                    let _ = r.prune_tx_index_before(cutoff);
+                })
+                .await;
+            }
+        }
+
+        let size_gb = rocks.estimated_size_bytes() / (1024 * 1024 * 1024);
+        info!(
+            current,
+            rocksdb_gb = size_gb,
+            "retention check complete"
+        );
     }
 }
 
