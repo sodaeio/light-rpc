@@ -130,7 +130,6 @@ impl StreamSource {
     pub async fn run(self) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(60);
-        let stream_timeout = Duration::from_secs(self.config.gap_threshold_secs + 30);
 
         // Build endpoint list: primary + fallbacks
         let mut endpoints = vec![self.config.endpoint.clone()];
@@ -141,17 +140,20 @@ impl StreamSource {
             let endpoint = &endpoints[current_idx % endpoints.len()];
             info!(endpoint, idx = current_idx % endpoints.len(), "connecting to gRPC source");
 
-            match tokio::time::timeout(stream_timeout, self.run_stream_endpoint(endpoint)).await {
-                Ok(Ok(())) => {
+            // No outer wrapping timeout: connect/subscribe/per-message reads
+            // each have their own timeouts inside `run_stream_endpoint`, and
+            // a wrapping timeout would kill a healthy long-running stream.
+            // Gap detection lives in the inner loop and triggers snapshot
+            // recovery without dropping the connection.
+            match self.run_stream_endpoint(endpoint).await {
+                Ok(()) => {
                     info!("stream ended cleanly, reconnecting");
                     backoff = Duration::from_secs(1);
-                    // Stay on same endpoint if it was working
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     error!(error = %e, endpoint, "stream error");
-                    current_idx += 1; // try next endpoint
+                    current_idx += 1;
                     if current_idx % endpoints.len() == 0 {
-                        // Cycled through all endpoints — backoff + snapshot recovery
                         warn!("all {} endpoints failed, attempting snapshot recovery", endpoints.len());
                         match self.try_snapshot_recovery().await {
                             Ok(slot) => info!(slot, "snapshot recovery succeeded"),
@@ -160,17 +162,6 @@ impl StreamSource {
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(max_backoff);
                     }
-                }
-                Err(_timeout) => {
-                    warn!(endpoint, timeout_s = stream_timeout.as_secs(), "stream timed out");
-                    current_idx += 1; // try next endpoint
-                    if current_idx % endpoints.len() == 0 {
-                        match self.try_snapshot_recovery().await {
-                            Ok(slot) => info!(slot, "snapshot recovery after timeout succeeded"),
-                            Err(e) => warn!(error = %e, "snapshot recovery failed"),
-                        }
-                    }
-                    backoff = Duration::from_secs(1);
                 }
             }
         }

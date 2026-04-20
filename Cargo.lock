@@ -2338,8 +2338,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "light-indexer"
-version = "0.2.1"
+name = "light-rpc"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2356,6 +2356,7 @@ dependencies = [
  "dashmap",
  "figment",
  "futures",
+ "hex",
  "http-body-util",
  "hyper",
  "hyper-util",

@@ -266,7 +266,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
     module.register_async_method("getIdentity", |_, _, _| async move {
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-            "identity": "light-indexer"
+            "identity": "light-rpc"
         }))
     })?;
 

@@ -8,6 +8,8 @@ pub mod write;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse_read;
 
 pub use read::StorageReader;
 pub use write::StorageWriter;

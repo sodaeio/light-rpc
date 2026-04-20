@@ -15,9 +15,10 @@ use yellowstone_grpc_proto::prost::Message;
 const HEADER_LEN: usize = 21;
 
 pub fn decode_tx_index(bytes: &[u8]) -> Result<Value> {
-    // Backfilled txs are stored as raw JSON (first byte = '{').
-    // Stream txs use prost format with a binary header.
-    if bytes.first() == Some(&b'{') {
+    // Backfilled txs are stored as compact serde_json: always starts `{"`.
+    // Stream prost values start with a u64 slot LE, whose LSB is `{` 1/256
+    // of the time — so check two bytes to disambiguate, not one.
+    if bytes.starts_with(b"{\"") {
         return serde_json::from_slice(bytes).map_err(|e| anyhow!("json tx_index: {e}"));
     }
 

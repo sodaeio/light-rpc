@@ -28,6 +28,16 @@ pub static INGESTED_TRANSACTIONS: LazyLock<IntCounter> = LazyLock::new(|| {
     counter
 });
 
+pub static ROCKSDB_QUARANTINED: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "li_rocksdb_quarantined_sst_total",
+        "Corrupt SST files moved to quarantine/ by the self-heal layer",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
 pub static SOURCE_MALFORMED: LazyLock<IntCounter> = LazyLock::new(|| {
     let counter = IntCounter::new(
         "li_source_malformed_total",

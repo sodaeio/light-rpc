@@ -8,20 +8,20 @@ use tracing::{error, info, warn};
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use light_indexer::config::Config;
-use light_indexer::metrics::REGISTRY;
-use light_indexer::rpc::server::RpcServer;
-use light_indexer::rpc::upstream::UpstreamForwarder;
-use light_indexer::source::StreamSource;
-use light_indexer::storage::files::BlockFileStorage;
-use light_indexer::storage::postgres::PgStorage;
-use light_indexer::storage::read::{MemoryCache, StorageReader};
-use light_indexer::storage::rocks::UnifiedRocksDb;
-use light_indexer::storage::write::{pg_writer_loop, StorageWriter};
+use light_rpc::config::Config;
+use light_rpc::metrics::REGISTRY;
+use light_rpc::rpc::server::RpcServer;
+use light_rpc::rpc::upstream::UpstreamForwarder;
+use light_rpc::source::StreamSource;
+use light_rpc::storage::files::BlockFileStorage;
+use light_rpc::storage::postgres::PgStorage;
+use light_rpc::storage::read::{MemoryCache, StorageReader};
+use light_rpc::storage::rocks::UnifiedRocksDb;
+use light_rpc::storage::write::{pg_writer_loop, StorageWriter};
 
 #[derive(Parser)]
 #[command(
-    name = "light-indexer",
+    name = "light-rpc",
     about = "Unified Solana indexer and RPC server"
 )]
 struct Cli {
@@ -45,14 +45,14 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,light_indexer=debug".into()),
+                .unwrap_or_else(|_| "info,light_rpc=debug".into()),
         )
         .with_target(true)
         .init();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        "starting light-indexer"
+        "starting light-rpc"
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -137,7 +137,7 @@ async fn run(config: Config) -> Result<()> {
 
     #[cfg(feature = "clickhouse")]
     {
-        use light_indexer::storage::clickhouse::{
+        use light_rpc::storage::clickhouse::{
             clickhouse_writer_loop, ClickHouseStore,
         };
         if let Some(ch_cfg) = &config.storage.clickhouse {
@@ -200,7 +200,7 @@ async fn cold_start_snapshot(
     snapshot_dir: &str,
     rocks: &UnifiedRocksDb,
 ) -> Result<(u64, usize)> {
-    use light_indexer::source::snapshot;
+    use light_rpc::source::snapshot;
 
     let dir = std::path::Path::new(snapshot_dir);
     let info = snapshot::find_latest_snapshot(dir)?;
@@ -224,7 +224,7 @@ async fn run_retention_loop(
     rocks: UnifiedRocksDb,
     cache: Arc<MemoryCache>,
     retention_slots: u64,
-    retention: light_indexer::config::RetentionConfig,
+    retention: light_rpc::config::RetentionConfig,
 ) {
     use std::time::Duration;
 
