@@ -201,9 +201,10 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     // Pre-encoded static JSON — jsonrpsee emits verbatim.
     static VERSION_RAW: std::sync::LazyLock<Box<serde_json::value::RawValue>> =
         std::sync::LazyLock::new(|| {
-            serde_json::value::RawValue::from_string(
-                r#"{"solana-core":"2.2.4","feature-set":0}"#.to_string(),
-            )
+            serde_json::value::RawValue::from_string(format!(
+                r#"{{"solana-core":"2.2.4","feature-set":0,"light-rpc":"{}"}}"#,
+                env!("CARGO_PKG_VERSION"),
+            ))
             .unwrap()
         });
     module.register_async_method("getVersion", |_, _, _| async move {
