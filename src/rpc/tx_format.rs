@@ -111,8 +111,7 @@ fn build_rpc_shape(
             .collect();
         let recent_blockhash = bs58::encode(&msg.recent_blockhash).into_string();
         let header = msg.header.unwrap_or_default();
-        let instructions: Vec<Value> =
-            msg.instructions.iter().map(compiled_ix_json).collect();
+        let instructions: Vec<Value> = msg.instructions.iter().map(compiled_ix_json).collect();
         let mut message = json!({
             "header": {
                 "numRequiredSignatures": header.num_required_signatures,
@@ -124,11 +123,7 @@ fn build_rpc_shape(
             "instructions": instructions,
         });
         if msg.versioned && !msg.address_table_lookups.is_empty() {
-            let atl: Vec<Value> = msg
-                .address_table_lookups
-                .iter()
-                .map(atl_json)
-                .collect();
+            let atl: Vec<Value> = msg.address_table_lookups.iter().map(atl_json).collect();
             message["addressTableLookups"] = json!(atl);
         }
         message
@@ -153,7 +148,7 @@ fn build_rpc_shape(
 fn compiled_ix_json(ix: &CompiledInstruction) -> Value {
     json!({
         "programIdIndex": ix.program_id_index,
-        "accounts": ix.accounts.iter().copied().collect::<Vec<u8>>(),
+        "accounts": ix.accounts.to_vec(),
         "data": bs58::encode(&ix.data).into_string(),
     })
 }
@@ -161,7 +156,7 @@ fn compiled_ix_json(ix: &CompiledInstruction) -> Value {
 fn inner_ix_json(ix: &InnerInstruction) -> Value {
     let mut v = json!({
         "programIdIndex": ix.program_id_index,
-        "accounts": ix.accounts.iter().copied().collect::<Vec<u8>>(),
+        "accounts": ix.accounts.to_vec(),
         "data": bs58::encode(&ix.data).into_string(),
     });
     if let Some(sh) = ix.stack_height {
@@ -173,8 +168,8 @@ fn inner_ix_json(ix: &InnerInstruction) -> Value {
 fn atl_json(l: &MessageAddressTableLookup) -> Value {
     json!({
         "accountKey": bs58::encode(&l.account_key).into_string(),
-        "writableIndexes": l.writable_indexes.iter().copied().collect::<Vec<u8>>(),
-        "readonlyIndexes": l.readonly_indexes.iter().copied().collect::<Vec<u8>>(),
+        "writableIndexes": l.writable_indexes.to_vec(),
+        "readonlyIndexes": l.readonly_indexes.to_vec(),
     })
 }
 
@@ -213,18 +208,23 @@ fn meta_json(meta: &TransactionStatusMeta, err_str: Option<String>) -> Value {
         (Some(TransactionError { err }), _) if !err.is_empty() => {
             match bincode::deserialize::<solana_transaction_error::TransactionError>(err) {
                 Ok(te) => serde_json::to_value(&te).unwrap_or(Value::Null),
-                Err(_) => err_str
-                    .as_ref()
-                    .map(|s| json!(s))
-                    .unwrap_or(Value::Null),
+                Err(_) => err_str.as_ref().map(|s| json!(s)).unwrap_or(Value::Null),
             }
         }
         (_, Some(s)) => json!(s),
         _ => Value::Null,
     };
 
-    let pre_token: Vec<Value> = meta.pre_token_balances.iter().map(token_balance_json).collect();
-    let post_token: Vec<Value> = meta.post_token_balances.iter().map(token_balance_json).collect();
+    let pre_token: Vec<Value> = meta
+        .pre_token_balances
+        .iter()
+        .map(token_balance_json)
+        .collect();
+    let post_token: Vec<Value> = meta
+        .post_token_balances
+        .iter()
+        .map(token_balance_json)
+        .collect();
     let loaded = json!({
         "writable": meta
             .loaded_writable_addresses

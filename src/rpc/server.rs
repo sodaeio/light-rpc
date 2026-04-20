@@ -34,12 +34,9 @@ pub struct RpcContext {
     pub gpa_blocked: std::collections::HashSet<[u8; 32]>,
     pub gpa_max_accounts: usize,
     pub block_cache: BlockResponseCache,
-    pub gai_coalescer:
-        Arc<crate::rpc::coalesce::Coalescer<([u8; 32], String), serde_json::Value>>,
-    pub gtla_coalescer:
-        Arc<crate::rpc::coalesce::Coalescer<[u8; 32], Vec<serde_json::Value>>>,
-    pub block_coalescer:
-        Arc<crate::rpc::coalesce::Coalescer<(u64, u64), Option<BlockCacheEntry>>>,
+    pub gai_coalescer: Arc<crate::rpc::coalesce::Coalescer<([u8; 32], String), serde_json::Value>>,
+    pub gtla_coalescer: Arc<crate::rpc::coalesce::Coalescer<[u8; 32], Vec<serde_json::Value>>>,
+    pub block_coalescer: Arc<crate::rpc::coalesce::Coalescer<(u64, u64), Option<BlockCacheEntry>>>,
 }
 
 pub const BLOCK_CACHE_SHARDS: usize = 16;
@@ -91,8 +88,9 @@ impl RpcServer {
     pub async fn run(self) -> Result<()> {
         let gpa_blocked = Self::build_gpa_blocklist(&self.config);
         let cap = std::num::NonZeroUsize::new(64).unwrap();
-        let block_cache: BlockResponseCache =
-            Arc::new(std::array::from_fn(|_| parking_lot::Mutex::new(lru::LruCache::new(cap))));
+        let block_cache: BlockResponseCache = Arc::new(std::array::from_fn(|_| {
+            parking_lot::Mutex::new(lru::LruCache::new(cap))
+        }));
         let context = RpcContext {
             reader: Arc::clone(&self.reader),
             upstream: self.upstream,

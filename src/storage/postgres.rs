@@ -19,10 +19,7 @@ impl PgStorage {
             .context("parsing postgres url")?
             .application_name("light-rpc")
             .log_statements(tracing::log::LevelFilter::Trace)
-            .log_slow_statements(
-                tracing::log::LevelFilter::Warn,
-                Duration::from_secs(1),
-            );
+            .log_slow_statements(tracing::log::LevelFilter::Warn, Duration::from_secs(1));
 
         let pool = PgPoolOptions::new()
             .max_connections(config.max_connections)
@@ -118,12 +115,11 @@ impl PgStorage {
     async fn bootstrap_address_partitions(&self) -> Result<()> {
         // Use slot_metas (has idx_slot_desc); MAX(slot) on the legacy
         // table is a full seq scan.
-        let latest: Option<i64> = sqlx::query_scalar(
-            "SELECT slot FROM slot_metas ORDER BY slot DESC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?
-        .flatten();
+        let latest: Option<i64> =
+            sqlx::query_scalar("SELECT slot FROM slot_metas ORDER BY slot DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
 
         let seed_slot = latest.unwrap_or(413_000_000).max(0) as u64;
         let current_partition = (seed_slot as i64) / Self::SLOTS_PER_PARTITION;
@@ -173,11 +169,9 @@ impl PgStorage {
         .await?;
 
         if exists {
-            sqlx::query(
-                "ALTER TABLE address_transactions RENAME TO address_transactions_legacy",
-            )
-            .execute(&self.pool)
-            .await?;
+            sqlx::query("ALTER TABLE address_transactions RENAME TO address_transactions_legacy")
+                .execute(&self.pool)
+                .await?;
             info!("renamed address_transactions to address_transactions_legacy");
         }
 
@@ -237,10 +231,7 @@ impl PgStorage {
     }
 
     /// Returns names of partitions dropped.
-    pub async fn drop_address_partitions_before(
-        &self,
-        cutoff_slot: Slot,
-    ) -> Result<Vec<String>> {
+    pub async fn drop_address_partitions_before(&self, cutoff_slot: Slot) -> Result<Vec<String>> {
         let cutoff = cutoff_slot as i64;
         let partitions: Vec<String> = sqlx::query_scalar(
             "SELECT c.relname FROM pg_class c

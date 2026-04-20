@@ -47,6 +47,7 @@ where
     /// First caller installs an OnceCell, drives the future, and stores the
     /// result. Concurrent callers see the OnceCell, await it, and clone the
     /// resulting Arc.
+    #[allow(clippy::clone_on_ref_ptr)]
     pub async fn run<F, Fut>(&self, key: K, fetch: F) -> Arc<V>
     where
         F: FnOnce() -> Fut,

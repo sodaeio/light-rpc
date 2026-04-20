@@ -92,16 +92,16 @@ async fn main() -> Result<()> {
                 }
                 total += 1;
                 let kind = match &update.update_oneof {
-                    Some(UpdateOneof::Account(_))           => "account",
-                    Some(UpdateOneof::Slot(_))              => "slot",
-                    Some(UpdateOneof::Transaction(_))       => "transaction",
+                    Some(UpdateOneof::Account(_)) => "account",
+                    Some(UpdateOneof::Slot(_)) => "slot",
+                    Some(UpdateOneof::Transaction(_)) => "transaction",
                     Some(UpdateOneof::TransactionStatus(_)) => "tx_status",
-                    Some(UpdateOneof::Entry(_))             => "entry",
-                    Some(UpdateOneof::BlockMeta(_))         => "block_meta",
-                    Some(UpdateOneof::Block(_))             => "block",
-                    Some(UpdateOneof::Ping(_))              => "ping",
-                    Some(UpdateOneof::Pong(_))              => "pong",
-                    None                                    => "empty",
+                    Some(UpdateOneof::Entry(_)) => "entry",
+                    Some(UpdateOneof::BlockMeta(_)) => "block_meta",
+                    Some(UpdateOneof::Block(_)) => "block",
+                    Some(UpdateOneof::Ping(_)) => "ping",
+                    Some(UpdateOneof::Pong(_)) => "pong",
+                    None => "empty",
                 };
                 *by_kind.entry(kind).or_insert(0) += 1;
 

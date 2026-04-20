@@ -90,7 +90,7 @@ impl MemoryCache {
         self.blocks.write().insert(slot, block);
         self.recent_blockhashes.rcu(|m| {
             let mut next = (**m).clone();
-            next.insert(slot, blockhash.clone());
+            next.insert(slot, Arc::clone(&blockhash));
             next
         });
         let current = self.processed_slot.load(Ordering::Relaxed);
@@ -115,7 +115,7 @@ impl MemoryCache {
             .load()
             .range(..=slot)
             .next_back()
-            .map(|(s, h)| (h.clone(), *s))
+            .map(|(s, h)| (Arc::clone(h), *s))
     }
 
     pub fn is_blockhash_valid(&self, blockhash: &str) -> bool {
@@ -185,6 +185,9 @@ impl Default for MemoryCache {
     }
 }
 
+type EncodedAccountShard =
+    parking_lot::Mutex<lru::LruCache<([u8; 32], u8), Arc<Box<serde_json::value::RawValue>>>>;
+
 /// Unified storage reader. Each method picks the optimal storage path internally:
 ///   - Memory cache for recent blocks/slots
 ///   - RocksDB for account point lookups and block indexes
@@ -197,13 +200,10 @@ pub struct StorageReader {
     pg: PgStorage,
     tx_cache: Vec<parking_lot::Mutex<lru::LruCache<[u8; 64], Arc<serde_json::Value>>>>,
     mint_meta_cache: dashmap::DashMap<[u8; 32], (i32, u64)>,
-    account_lru: Vec<
-        parking_lot::Mutex<lru::LruCache<[u8; 32], Arc<super::accounts::StoredAccount>>>,
-    >,
+    account_lru:
+        Vec<parking_lot::Mutex<lru::LruCache<[u8; 32], Arc<super::accounts::StoredAccount>>>>,
     /// Bounded: prior unbounded DashMap OOM'd under random-key load.
-    encoded_account_lru: Vec<
-        parking_lot::Mutex<lru::LruCache<([u8; 32], u8), Arc<Box<serde_json::value::RawValue>>>>,
-    >,
+    encoded_account_lru: Vec<EncodedAccountShard>,
     /// ClickHouse client for historical query fallback (rocks miss → CH).
     #[cfg(feature = "clickhouse")]
     ch_client: Option<clickhouse::Client>,
@@ -352,10 +352,7 @@ impl StorageReader {
                 // Skip zstd for small payloads — the compression overhead
                 // dwarfs any size win and bloats compressed bytes slightly.
                 if data.len() < 5000 {
-                    serde_json::json!([
-                        base64_simd::STANDARD.encode_to_string(data),
-                        "base64"
-                    ])
+                    serde_json::json!([base64_simd::STANDARD.encode_to_string(data), "base64"])
                 } else {
                     let compressed = zstd::encode_all(data, 0).unwrap_or_default();
                     serde_json::json!([
@@ -364,10 +361,7 @@ impl StorageReader {
                     ])
                 }
             }
-            _ => serde_json::json!([
-                base64_simd::STANDARD.encode_to_string(data),
-                "base64"
-            ]),
+            _ => serde_json::json!([base64_simd::STANDARD.encode_to_string(data), "base64"]),
         }
     }
 
@@ -642,6 +636,9 @@ impl StorageReader {
         start: Slot,
         end: Slot,
     ) -> Result<Vec<Slot>> {
+        // `mut` is only needed under --features clickhouse for the fallback
+        // reassignment; allow it so the no-feature build doesn't warn.
+        #[allow(unused_mut)]
         let mut slots = self.rocks.scan_slot_index_range(start, end)?;
         #[cfg(feature = "clickhouse")]
         if slots.is_empty() {
@@ -868,7 +865,10 @@ impl StorageReader {
                 let ch_before = results.last().map(|r| r.slot).or(before_slot);
                 let addr_bytes: [u8; 32] = address.to_bytes();
                 let ch_entries = super::clickhouse_read::get_signatures_for_address(
-                    ch, &addr_bytes, ch_before, remaining,
+                    ch,
+                    &addr_bytes,
+                    ch_before,
+                    remaining,
                 )
                 .await?;
                 for e in ch_entries {
@@ -876,7 +876,11 @@ impl StorageReader {
                         signature: solana_signature::Signature::default(),
                         slot: e.slot,
                         block_time: Some(e.block_time),
-                        err: if e.err { Some("true".to_string()) } else { None },
+                        err: if e.err {
+                            Some("true".to_string())
+                        } else {
+                            None
+                        },
                         memo: None,
                     });
                 }
@@ -905,8 +909,7 @@ impl StorageReader {
         };
 
         let atas = self.rocks.get_owner_atas(&owner_key, Self::GTFA_ATA_CAP)?;
-        let addresses: Vec<[u8; 32]> =
-            std::iter::once(owner_key).chain(atas).collect();
+        let addresses: Vec<[u8; 32]> = std::iter::once(owner_key).chain(atas).collect();
 
         // For whale scale (up to ~2k addresses), do per-address iter_sfa in
         // parallel on the blocking pool. Each task is a short RocksDB prefix
@@ -1041,7 +1044,11 @@ impl StorageReader {
     ) -> Result<Option<Arc<Box<serde_json::value::RawValue>>>> {
         let idx = Self::enc_idx(encoding);
         let s = shard_of(pubkey[0]);
-        if let Some(arc) = self.encoded_account_lru[s].lock().get(&(*pubkey, idx)).cloned() {
+        if let Some(arc) = self.encoded_account_lru[s]
+            .lock()
+            .get(&(*pubkey, idx))
+            .cloned()
+        {
             return Ok(Some(arc));
         }
 
@@ -1077,8 +1084,7 @@ impl StorageReader {
         }
 
         if !rocks_idx.is_empty() {
-            let batch_keys: Vec<[u8; 32]> =
-                rocks_idx.iter().map(|&i| pubkeys[i]).collect();
+            let batch_keys: Vec<[u8; 32]> = rocks_idx.iter().map(|&i| pubkeys[i]).collect();
             let batch_vals = self.rocks.get_accounts_batch(&batch_keys);
             let mut missing: Vec<usize> = Vec::new();
             for (j, val) in batch_vals.into_iter().enumerate() {
@@ -1327,7 +1333,6 @@ impl StorageReader {
         }
         self.mint_meta_cache.insert(mint, (decimals, slot));
     }
-
 
     fn token_holder_json(pubkey: &[u8], amount: u64, decimals: i32) -> serde_json::Value {
         let ui_amount = if decimals > 0 {

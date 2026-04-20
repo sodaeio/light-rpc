@@ -138,7 +138,11 @@ impl StreamSource {
 
         loop {
             let endpoint = &endpoints[current_idx % endpoints.len()];
-            info!(endpoint, idx = current_idx % endpoints.len(), "connecting to gRPC source");
+            info!(
+                endpoint,
+                idx = current_idx % endpoints.len(),
+                "connecting to gRPC source"
+            );
 
             // No outer wrapping timeout: connect/subscribe/per-message reads
             // each have their own timeouts inside `run_stream_endpoint`, and
@@ -154,7 +158,10 @@ impl StreamSource {
                     error!(error = %e, endpoint, "stream error");
                     current_idx += 1;
                     if current_idx % endpoints.len() == 0 {
-                        warn!("all {} endpoints failed, attempting snapshot recovery", endpoints.len());
+                        warn!(
+                            "all {} endpoints failed, attempting snapshot recovery",
+                            endpoints.len()
+                        );
                         match self.try_snapshot_recovery().await {
                             Ok(slot) => info!(slot, "snapshot recovery succeeded"),
                             Err(e) => warn!(error = %e, "snapshot recovery failed"),
@@ -263,186 +270,210 @@ impl StreamSource {
             };
 
             {
+                match update.update_oneof {
+                    Some(UpdateOneof::Account(account_update)) => {
+                        if let Some(account) = account_update.account {
+                            let (Ok(pubkey), Ok(owner)) = (
+                                Pubkey::try_from(account.pubkey.as_slice()),
+                                Pubkey::try_from(account.owner.as_slice()),
+                            ) else {
+                                tracing::warn!(
+                                    slot = account_update.slot,
+                                    "malformed account pubkey/owner, skipping"
+                                );
+                                metrics::SOURCE_MALFORMED.inc();
+                                continue;
+                            };
 
-                    match update.update_oneof {
-                        Some(UpdateOneof::Account(account_update)) => {
-                            if let Some(account) = account_update.account {
-                                let (Ok(pubkey), Ok(owner)) = (
-                                    Pubkey::try_from(account.pubkey.as_slice()),
-                                    Pubkey::try_from(account.owner.as_slice()),
-                                ) else {
-                                    tracing::warn!(slot = account_update.slot, "malformed account pubkey/owner, skipping");
-                                    metrics::SOURCE_MALFORMED.inc();
-                                    continue;
-                                };
+                            let update = AccountUpdate {
+                                pubkey,
+                                slot: account_update.slot,
+                                owner,
+                                lamports: account.lamports,
+                                data: account.data,
+                                executable: account.executable,
+                                rent_epoch: account.rent_epoch,
+                                write_version: account.write_version,
+                            };
 
-                                let update = AccountUpdate {
-                                    pubkey,
-                                    slot: account_update.slot,
-                                    owner,
-                                    lamports: account.lamports,
-                                    data: account.data,
-                                    executable: account.executable,
-                                    rent_epoch: account.rent_epoch,
-                                    write_version: account.write_version,
-                                };
+                            accounts_count += 1;
+                            metrics::INGESTED_ACCOUNTS.inc();
 
-                                accounts_count += 1;
-                                metrics::INGESTED_ACCOUNTS.inc();
-
-                                if self.sink.send(SourceMessage::AccountUpdate(update)).await.is_err() {
-                                    return Ok(());
-                                }
+                            if self
+                                .sink
+                                .send(SourceMessage::AccountUpdate(update))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(());
                             }
                         }
+                    }
 
-                        Some(UpdateOneof::Transaction(tx_update)) => {
-                            if let Some(tx_info) = tx_update.transaction {
-                                let slot = tx_update.slot;
-                                let Ok(sig) = Signature::try_from(tx_info.signature.as_slice()) else {
-                                    tracing::warn!(slot, "malformed transaction signature, skipping");
-                                    metrics::SOURCE_MALFORMED.inc();
-                                    continue;
-                                };
+                    Some(UpdateOneof::Transaction(tx_update)) => {
+                        if let Some(tx_info) = tx_update.transaction {
+                            let slot = tx_update.slot;
+                            let Ok(sig) = Signature::try_from(tx_info.signature.as_slice()) else {
+                                tracing::warn!(slot, "malformed transaction signature, skipping");
+                                metrics::SOURCE_MALFORMED.inc();
+                                continue;
+                            };
 
-                                let acc = accumulators
-                                    .entry(slot)
-                                    .or_insert_with(|| SlotAccumulator::new(0));
+                            let acc = accumulators
+                                .entry(slot)
+                                .or_insert_with(|| SlotAccumulator::new(0));
 
-                                let err_msg = tx_info.meta.as_ref()
-                                    .and_then(|m| m.err.as_ref())
-                                    .map(|e| format!("{:?}", e));
-                                let fee = tx_info.meta.as_ref().map(|m| m.fee).unwrap_or(0);
-                                let tx_idx = tx_info.index as u32;
+                            let err_msg = tx_info
+                                .meta
+                                .as_ref()
+                                .and_then(|m| m.err.as_ref())
+                                .map(|e| format!("{:?}", e));
+                            let fee = tx_info.meta.as_ref().map(|m| m.fee).unwrap_or(0);
+                            let tx_idx = tx_info.index as u32;
 
-                                // Harvest address keys before the proto is consumed by encode().
-                                let mut account_pks: Vec<Pubkey> = Vec::new();
-                                if let Some(tx_msg) = &tx_info.transaction {
-                                    if let Some(msg) = &tx_msg.message {
-                                        account_pks.reserve(msg.account_keys.len());
-                                        for key in &msg.account_keys {
-                                            if let Ok(pk) = Pubkey::try_from(key.as_slice()) {
-                                                account_pks.push(pk);
-                                            }
+                            // Harvest address keys before the proto is consumed by encode().
+                            let mut account_pks: Vec<Pubkey> = Vec::new();
+                            if let Some(tx_msg) = &tx_info.transaction {
+                                if let Some(msg) = &tx_msg.message {
+                                    account_pks.reserve(msg.account_keys.len());
+                                    for key in &msg.account_keys {
+                                        if let Ok(pk) = Pubkey::try_from(key.as_slice()) {
+                                            account_pks.push(pk);
                                         }
                                     }
                                 }
+                            }
 
-                                // Encode prost payload. Prebuild of the agave-shape
-                                // JSON is deferred to block-seal time (parallel).
-                                let payload = {
-                                    use yellowstone_grpc_proto::prost::Message;
-                                    let mut buf = Vec::with_capacity(tx_info.encoded_len());
-                                    let _ = tx_info.encode(&mut buf);
-                                    bytes::Bytes::from(buf)
-                                };
+                            // Encode prost payload. Prebuild of the agave-shape
+                            // JSON is deferred to block-seal time (parallel).
+                            let payload = {
+                                use yellowstone_grpc_proto::prost::Message;
+                                let mut buf = Vec::with_capacity(tx_info.encoded_len());
+                                let _ = tx_info.encode(&mut buf);
+                                bytes::Bytes::from(buf)
+                            };
 
-                                acc.transactions.insert(sig, TransactionEntry {
+                            acc.transactions.insert(
+                                sig,
+                                TransactionEntry {
                                     signature: sig,
                                     tx_index: tx_idx,
                                     err: err_msg.clone(),
                                     payload,
                                     prebuilt: PLACEHOLDER_RAW.clone(),
-                                });
+                                },
+                            );
 
-                                for pk in &account_pks {
-                                    acc.address_signatures
-                                        .entry(*pk)
-                                        .or_default()
-                                        .push(SignatureEntry {
-                                            signature: sig,
-                                            err: err_msg.clone(),
-                                            memo: None,
-                                        });
-                                }
-
-                                acc.fees.push(fee);
-
-                                txs_count += 1;
-                                metrics::INGESTED_TRANSACTIONS.inc();
-                            }
-                        }
-
-                        Some(UpdateOneof::BlockMeta(block_meta)) => {
-                            let slot = block_meta.slot;
-                            let acc = accumulators
-                                .entry(slot)
-                                .or_insert_with(|| SlotAccumulator::new(block_meta.parent_slot));
-
-                            acc.parent_slot = block_meta.parent_slot;
-                            acc.block_time = block_meta.block_time.map(|t| t.timestamp);
-                            acc.block_height = block_meta.block_height.map(|h| h.block_height);
-                            acc.blockhash = Some(block_meta.blockhash.clone());
-                            acc.expected_tx_count = Some(block_meta.executed_transaction_count as usize);
-
-                            tracker.set_processed(slot);
-                            metrics::LATEST_SLOT
-                                .with_label_values(&["processed"])
-                                .set(tracker.processed_slot() as i64);
-
-                            // Check if this block is now complete
-                            if acc.is_complete() {
-                                acc.sealed = true;
-                                let block_data = accumulators.remove(&slot)
-                                    .unwrap()
-                                    .into_block(slot);
-                                let block = Arc::new(block_data);
-
-                                blocks_count += 1;
-                                last_block_time = std::time::Instant::now();
-                                metrics::INGESTED_BLOCKS.inc();
-
-                                if self.sink.send(SourceMessage::Block { slot, block }).await.is_err() {
-                                    return Ok(());
-                                }
+                            for pk in &account_pks {
+                                acc.address_signatures.entry(*pk).or_default().push(
+                                    SignatureEntry {
+                                        signature: sig,
+                                        err: err_msg.clone(),
+                                        memo: None,
+                                    },
+                                );
                             }
 
-                            // Send slot status
-                            let _ = self.sink.send(SourceMessage::SlotStatus {
-                                slot,
-                                parent_slot: Some(block_meta.parent_slot),
-                                status: SlotStatus::ProcessedOrSkipped,
-                            }).await;
+                            acc.fees.push(fee);
+
+                            txs_count += 1;
+                            metrics::INGESTED_TRANSACTIONS.inc();
                         }
+                    }
 
-                        Some(UpdateOneof::Slot(slot_update)) => {
-                            let slot = slot_update.slot;
-                            let status = match ProtoSlotStatus::try_from(slot_update.status) {
-                                Ok(ProtoSlotStatus::SlotConfirmed) => {
-                                    tracker.set_confirmed(slot);
-                                    metrics::LATEST_SLOT
-                                        .with_label_values(&["confirmed"])
-                                        .set(tracker.confirmed_slot() as i64);
-                                    SlotStatus::Confirmed
-                                }
-                                Ok(ProtoSlotStatus::SlotFinalized) => {
-                                    tracker.set_finalized(slot);
-                                    metrics::LATEST_SLOT
-                                        .with_label_values(&["finalized"])
-                                        .set(tracker.finalized_slot() as i64);
+                    Some(UpdateOneof::BlockMeta(block_meta)) => {
+                        let slot = block_meta.slot;
+                        let acc = accumulators
+                            .entry(slot)
+                            .or_insert_with(|| SlotAccumulator::new(block_meta.parent_slot));
 
-                                    // GC old accumulators below finalized
-                                    let finalized = tracker.finalized_slot();
-                                    accumulators = accumulators.split_off(&finalized.saturating_sub(32));
+                        acc.parent_slot = block_meta.parent_slot;
+                        acc.block_time = block_meta.block_time.map(|t| t.timestamp);
+                        acc.block_height = block_meta.block_height.map(|h| h.block_height);
+                        acc.blockhash = Some(block_meta.blockhash.clone());
+                        acc.expected_tx_count =
+                            Some(block_meta.executed_transaction_count as usize);
 
-                                    SlotStatus::Finalized
-                                }
-                                _ => SlotStatus::ProcessedOrSkipped,
-                            };
+                        tracker.set_processed(slot);
+                        metrics::LATEST_SLOT
+                            .with_label_values(&["processed"])
+                            .set(tracker.processed_slot() as i64);
 
-                            if self.sink.send(SourceMessage::SlotStatus {
-                                slot,
-                                parent_slot: Some(slot_update.parent.unwrap_or(0)),
-                                status,
-                            }).await.is_err() {
+                        // Check if this block is now complete
+                        if acc.is_complete() {
+                            acc.sealed = true;
+                            let block_data = accumulators.remove(&slot).unwrap().into_block(slot);
+                            let block = Arc::new(block_data);
+
+                            blocks_count += 1;
+                            last_block_time = std::time::Instant::now();
+                            metrics::INGESTED_BLOCKS.inc();
+
+                            if self
+                                .sink
+                                .send(SourceMessage::Block { slot, block })
+                                .await
+                                .is_err()
+                            {
                                 return Ok(());
                             }
                         }
 
-                        Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => {}
-
-                        _ => {}
+                        // Send slot status
+                        let _ = self
+                            .sink
+                            .send(SourceMessage::SlotStatus {
+                                slot,
+                                parent_slot: Some(block_meta.parent_slot),
+                                status: SlotStatus::ProcessedOrSkipped,
+                            })
+                            .await;
                     }
+
+                    Some(UpdateOneof::Slot(slot_update)) => {
+                        let slot = slot_update.slot;
+                        let status = match ProtoSlotStatus::try_from(slot_update.status) {
+                            Ok(ProtoSlotStatus::SlotConfirmed) => {
+                                tracker.set_confirmed(slot);
+                                metrics::LATEST_SLOT
+                                    .with_label_values(&["confirmed"])
+                                    .set(tracker.confirmed_slot() as i64);
+                                SlotStatus::Confirmed
+                            }
+                            Ok(ProtoSlotStatus::SlotFinalized) => {
+                                tracker.set_finalized(slot);
+                                metrics::LATEST_SLOT
+                                    .with_label_values(&["finalized"])
+                                    .set(tracker.finalized_slot() as i64);
+
+                                // GC old accumulators below finalized
+                                let finalized = tracker.finalized_slot();
+                                accumulators =
+                                    accumulators.split_off(&finalized.saturating_sub(32));
+
+                                SlotStatus::Finalized
+                            }
+                            _ => SlotStatus::ProcessedOrSkipped,
+                        };
+
+                        if self
+                            .sink
+                            .send(SourceMessage::SlotStatus {
+                                slot,
+                                parent_slot: Some(slot_update.parent.unwrap_or(0)),
+                                status,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+
+                    Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => {}
+
+                    _ => {}
+                }
             }
         }
     }
@@ -471,10 +502,8 @@ impl StreamSource {
 
         let path = info.path.clone();
         let slot = info.slot;
-        let accounts = tokio::task::spawn_blocking(move || {
-            snapshot::parse_snapshot_accounts(&path)
-        })
-        .await??;
+        let accounts =
+            tokio::task::spawn_blocking(move || snapshot::parse_snapshot_accounts(&path)).await??;
 
         if let Some(ref rocks) = self.rocks {
             let count = snapshot::apply_snapshot_to_rocks(rocks, &accounts, slot)?;

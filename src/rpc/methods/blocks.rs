@@ -73,12 +73,12 @@ fn build_block_raw(
     }
     body.push('}');
 
-    let raw: Box<serde_json::value::RawValue> = serde_json::value::RawValue::from_string(body)
-        .ok()?;
+    let raw: Box<serde_json::value::RawValue> =
+        serde_json::value::RawValue::from_string(body).ok()?;
     let entry: crate::rpc::server::BlockCacheEntry = Arc::new(raw);
     block_cache[shard]
         .lock()
-        .put((slot, cfg_hash), entry.clone());
+        .put((slot, cfg_hash), Arc::clone(&entry));
     Some(entry)
 }
 
@@ -110,8 +110,14 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         };
 
         let shard = crate::rpc::server::block_cache_shard(slot, cfg_hash);
-        if let Some(cached) = ctx.block_cache[shard].lock().get(&(slot, cfg_hash)).cloned() {
-            return Ok::<crate::rpc::server::BlockCacheEntry, jsonrpsee::types::ErrorObjectOwned>(cached);
+        if let Some(cached) = ctx.block_cache[shard]
+            .lock()
+            .get(&(slot, cfg_hash))
+            .cloned()
+        {
+            return Ok::<crate::rpc::server::BlockCacheEntry, jsonrpsee::types::ErrorObjectOwned>(
+                cached,
+            );
         }
 
         // Singleflight on (slot, cfg_hash) — N concurrent first-time callers
@@ -119,7 +125,8 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let reader = std::sync::Arc::clone(&ctx.reader);
         let block_cache = std::sync::Arc::clone(&ctx.block_cache);
         let tx_details_owned = tx_details.to_string();
-        let built = ctx.block_coalescer
+        let built = ctx
+            .block_coalescer
             .run((slot, cfg_hash), move || async move {
                 build_block_raw(
                     &reader,
@@ -133,8 +140,13 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             })
             .await;
         match (*built).clone() {
-            Some(entry) => Ok::<crate::rpc::server::BlockCacheEntry, jsonrpsee::types::ErrorObjectOwned>(entry),
-            None => Err(err(-32009, "Slot was skipped, or missing in long-term storage")),
+            Some(entry) => {
+                Ok::<crate::rpc::server::BlockCacheEntry, jsonrpsee::types::ErrorObjectOwned>(entry)
+            }
+            None => Err(err(
+                -32009,
+                "Slot was skipped, or missing in long-term storage",
+            )),
         }
     })?;
 
@@ -221,12 +233,15 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(GENESIS_HASH))
     })?;
 
-    module.register_async_method("getMinimumBalanceForRentExemption", |params, _, _| async move {
-        let p: Vec<serde_json::Value> = params.parse()?;
-        let data_len = p.first().and_then(|v| v.as_u64()).unwrap_or(0);
-        let lamports = (128 + data_len) * 6960;
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(lamports))
-    })?;
+    module.register_async_method(
+        "getMinimumBalanceForRentExemption",
+        |params, _, _| async move {
+            let p: Vec<serde_json::Value> = params.parse()?;
+            let data_len = p.first().and_then(|v| v.as_u64()).unwrap_or(0);
+            let lamports = (128 + data_len) * 6960;
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(lamports))
+        },
+    )?;
 
     module.register_async_method("getEpochInfo", |params, ctx, _| async move {
         let commitment = parse_commitment(&params);
@@ -235,7 +250,12 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let slots_per_epoch: u64 = 432_000;
         let epoch = slot / slots_per_epoch;
         let slot_index = slot % slots_per_epoch;
-        let block_height = ctx.reader.get_block_height(commitment).ok().flatten().unwrap_or(slot);
+        let block_height = ctx
+            .reader
+            .get_block_height(commitment)
+            .ok()
+            .flatten()
+            .unwrap_or(slot);
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
             "epoch": epoch,
             "slotIndex": slot_index,
@@ -278,25 +298,39 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
     module.register_async_method("getBlocks", |params, ctx, _| async move {
         let p: Vec<serde_json::Value> = params.parse()?;
-        let start: Slot = p.first().and_then(|v| v.as_u64())
+        let start: Slot = p
+            .first()
+            .and_then(|v| v.as_u64())
             .ok_or_else(|| err(-32602, "Invalid start slot"))?;
-        let end: Slot = p.get(1).and_then(|v| v.as_u64())
+        let end: Slot = p
+            .get(1)
+            .and_then(|v| v.as_u64())
             .unwrap_or_else(|| ctx.reader.cache().finalized_slot());
         if end.saturating_sub(start) > 500_000 {
             return Err(err(-32602, "Slot range too large (max 500,000)"));
         }
-        let slots = ctx.reader.get_blocks_in_range(start, end)
+        let slots = ctx
+            .reader
+            .get_blocks_in_range(start, end)
             .map_err(|e| err(-32603, &e.to_string()))?;
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(slots))
     })?;
 
     module.register_async_method("getBlocksWithLimit", |params, ctx, _| async move {
         let p: Vec<serde_json::Value> = params.parse()?;
-        let start: Slot = p.first().and_then(|v| v.as_u64())
+        let start: Slot = p
+            .first()
+            .and_then(|v| v.as_u64())
             .ok_or_else(|| err(-32602, "Invalid start slot"))?;
-        let limit = p.get(1).and_then(|v| v.as_u64()).unwrap_or(500_000).min(500_000);
+        let limit = p
+            .get(1)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(500_000)
+            .min(500_000);
         let end = start + limit;
-        let slots = ctx.reader.get_blocks_in_range(start, end)
+        let slots = ctx
+            .reader
+            .get_blocks_in_range(start, end)
             .map_err(|e| err(-32603, &e.to_string()))?;
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(slots))
     })?;

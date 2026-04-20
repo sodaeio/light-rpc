@@ -18,7 +18,7 @@ async fn rpc_call_raw(
 ) -> Result<Value, reqwest::Error> {
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
     client
-        .post(&endpoint())
+        .post(endpoint())
         .json(&body)
         .send()
         .await?
@@ -26,6 +26,7 @@ async fn rpc_call_raw(
         .await
 }
 
+#[allow(dead_code)]
 struct BenchResult {
     total_requests: u64,
     successful: u64,

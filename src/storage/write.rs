@@ -218,11 +218,7 @@ impl StorageWriter {
         for (address, sigs) in &block.address_signatures {
             let addr_bytes: [u8; 32] = address.to_bytes();
             for sig in sigs {
-                let sig_bytes: [u8; 64] = sig
-                    .signature
-                    .as_ref()
-                    .try_into()
-                    .unwrap_or([0u8; 64]);
+                let sig_bytes: [u8; 64] = sig.signature.as_ref().try_into().unwrap_or([0u8; 64]);
                 sig_addrs.entry(sig_bytes).or_default().push(addr_bytes);
             }
         }
@@ -230,11 +226,7 @@ impl StorageWriter {
         let block_time = block.info.block_time.unwrap_or(0);
         let mut rows: Vec<TransactionRow> = Vec::with_capacity(block.transactions.len());
         for (idx, tx) in block.transactions.iter().enumerate() {
-            let sig_bytes: [u8; 64] = tx
-                .signature
-                .as_ref()
-                .try_into()
-                .unwrap_or([0u8; 64]);
+            let sig_bytes: [u8; 64] = tx.signature.as_ref().try_into().unwrap_or([0u8; 64]);
             let addresses = sig_addrs
                 .remove(&sig_bytes)
                 .unwrap_or_default()
@@ -386,15 +378,17 @@ impl StorageWriter {
             for (mint, updates) in by_mint {
                 if let Err(e) = self.rocks.update_mint_top_holders(&mint, &updates) {
                     let s = e.to_string();
-                    if self.rocks.try_quarantine_corrupt_sst(&s, "mint_top_holders") {
+                    if self
+                        .rocks
+                        .try_quarantine_corrupt_sst(&s, "mint_top_holders")
+                    {
                         let _ = self.rocks.update_mint_top_holders(&mint, &updates);
                     } else {
                         error!(error = %s, "failed to update mint_top_holders");
                     }
                 }
             }
-            let pubkeys: Vec<[u8; 32]> =
-                ta_updates.iter().map(|u| u.pubkey.to_bytes()).collect();
+            let pubkeys: Vec<[u8; 32]> = ta_updates.iter().map(|u| u.pubkey.to_bytes()).collect();
             let _ = self
                 .broadcast_tx
                 .send(WriteToReadMessage::AccountsUpdated { pubkeys });

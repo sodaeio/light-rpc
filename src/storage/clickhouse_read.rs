@@ -107,8 +107,10 @@ pub async fn get_signatures_for_address(
 /// Fetch block time for a slot from ClickHouse.
 pub async fn get_block_time(client: &Client, slot: Slot) -> Result<Option<i64>> {
     let rows: Vec<ChTransaction> = client
-        .query("SELECT slot, block_time, err, fee, message, meta \
-                FROM transactions WHERE slot = ? LIMIT 1")
+        .query(
+            "SELECT slot, block_time, err, fee, message, meta \
+                FROM transactions WHERE slot = ? LIMIT 1",
+        )
         .bind(slot)
         .fetch_all()
         .await?;
@@ -117,11 +119,7 @@ pub async fn get_block_time(client: &Client, slot: Slot) -> Result<Option<i64>> 
 }
 
 /// Fetch slots that have transactions in a range.
-pub async fn get_blocks_in_range(
-    client: &Client,
-    start: Slot,
-    end: Slot,
-) -> Result<Vec<Slot>> {
+pub async fn get_blocks_in_range(client: &Client, start: Slot, end: Slot) -> Result<Vec<Slot>> {
     let rows: Vec<ChSlot> = client
         .query(
             "SELECT DISTINCT slot FROM transactions \

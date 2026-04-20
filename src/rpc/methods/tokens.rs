@@ -123,10 +123,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     .unwrap_or_default()
             })
             .await;
-        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(
-            slot,
-            serde_json::json!(*arc),
-        ))
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(slot, serde_json::json!(*arc)))
     })?;
 
     Ok(())

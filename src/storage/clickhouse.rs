@@ -59,9 +59,7 @@ pub async fn clickhouse_writer_loop(
             || prog_buf.len() >= FLUSH_ROWS
             || last_flush.elapsed() >= FLUSH_INTERVAL;
 
-        if should_flush
-            && !(tx_buf.is_empty() && tok_buf.is_empty() && prog_buf.is_empty())
-        {
+        if should_flush && !(tx_buf.is_empty() && tok_buf.is_empty() && prog_buf.is_empty()) {
             flush(&store, &mut tx_buf, &mut tok_buf, &mut prog_buf).await;
             last_flush = Instant::now();
         }
@@ -454,10 +452,7 @@ impl ClickHouseStore {
         Ok(())
     }
 
-    pub async fn insert_program_invocations(
-        &self,
-        rows: &[ProgramInvocationRow],
-    ) -> Result<()> {
+    pub async fn insert_program_invocations(&self, rows: &[ProgramInvocationRow]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }

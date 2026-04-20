@@ -59,10 +59,8 @@ pub fn find_latest_snapshot(dir: &Path) -> Result<SnapshotInfo> {
                 .splitn(3, '-')
                 .collect();
             if parts.len() >= 2 {
-                if let (Ok(base), Ok(slot)) =
-                    (parts[0].parse::<Slot>(), parts[1].parse::<Slot>())
-                {
-                    if best_incremental.as_ref().map_or(true, |(s, _, _)| slot > *s) {
+                if let (Ok(base), Ok(slot)) = (parts[0].parse::<Slot>(), parts[1].parse::<Slot>()) {
+                    if best_incremental.as_ref().is_none_or(|(s, _, _)| slot > *s) {
                         best_incremental = Some((slot, base, entry.path()));
                     }
                 }
@@ -75,7 +73,7 @@ pub fn find_latest_snapshot(dir: &Path) -> Result<SnapshotInfo> {
                 .splitn(2, '-')
                 .collect();
             if let Some(Ok(slot)) = parts.first().map(|s| s.parse::<Slot>()) {
-                if best_full.as_ref().map_or(true, |(s, _)| slot > *s) {
+                if best_full.as_ref().is_none_or(|(s, _)| slot > *s) {
                     best_full = Some((slot, entry.path()));
                 }
             }
@@ -131,7 +129,11 @@ pub fn parse_snapshot_accounts(path: &Path) -> Result<Vec<SnapshotAccount>> {
 
         files_parsed += 1;
         if files_parsed % 100 == 0 {
-            info!(files = files_parsed, accounts = accounts.len(), "parsing snapshot");
+            info!(
+                files = files_parsed,
+                accounts = accounts.len(),
+                "parsing snapshot"
+            );
         }
     }
 
@@ -187,8 +189,7 @@ pub fn apply_snapshot_to_rocks(
 
                 let mut mint = [0u8; 32];
                 mint.copy_from_slice(&acc.data[0..32]);
-                let amount =
-                    u64::from_le_bytes(acc.data[64..72].try_into().unwrap_or([0; 8]));
+                let amount = u64::from_le_bytes(acc.data[64..72].try_into().unwrap_or([0; 8]));
                 let _ = rocks.update_mint_top_holders(&mint, &[(amount, acc.pubkey)]);
             }
         }
@@ -238,11 +239,9 @@ fn parse_append_vec(buf: &[u8], out: &mut Vec<SnapshotAccount>) {
         if offset + 56 > buf.len() {
             break;
         }
-        let lamports =
-            u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap_or([0; 8]));
+        let lamports = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap_or([0; 8]));
         offset += 8;
-        let rent_epoch =
-            u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap_or([0; 8]));
+        let rent_epoch = u64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap_or([0; 8]));
         offset += 8;
         let mut owner = [0u8; 32];
         owner.copy_from_slice(&buf[offset..offset + 32]);

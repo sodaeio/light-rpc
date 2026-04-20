@@ -60,7 +60,10 @@ pub static LATEST_SLOT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 
 pub static ROCKSDB_SST_COUNT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
-        Opts::new("li_rocksdb_sst_count", "Live SST file count per column family"),
+        Opts::new(
+            "li_rocksdb_sst_count",
+            "Live SST file count per column family",
+        ),
         &["cf"],
     )
     .unwrap();
@@ -83,7 +86,10 @@ pub static ROCKSDB_LIVE_DATA_SIZE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 
 pub static ROCKSDB_L0_FILES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
-        Opts::new("li_rocksdb_l0_files", "Number of files at L0 per column family"),
+        Opts::new(
+            "li_rocksdb_l0_files",
+            "Number of files at L0 per column family",
+        ),
         &["cf"],
     )
     .unwrap();

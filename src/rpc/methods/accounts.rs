@@ -133,9 +133,10 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                 // Apply cursor: drop everything up to and including `after`.
                 if let Some(cursor) = after {
                     let cursor_str = bs58::encode(cursor).into_string();
-                    if let Some(pos) = accounts.iter().position(|a| {
-                        a.get("pubkey").and_then(|v| v.as_str()) == Some(&cursor_str)
-                    }) {
+                    if let Some(pos) = accounts
+                        .iter()
+                        .position(|a| a.get("pubkey").and_then(|v| v.as_str()) == Some(&cursor_str))
+                    {
                         accounts = accounts.split_off(pos + 1);
                     }
                 }

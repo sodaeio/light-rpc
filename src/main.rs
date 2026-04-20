@@ -20,10 +20,7 @@ use light_rpc::storage::rocks::UnifiedRocksDb;
 use light_rpc::storage::write::{pg_writer_loop, StorageWriter};
 
 #[derive(Parser)]
-#[command(
-    name = "light-rpc",
-    about = "Unified Solana indexer and RPC server"
-)]
+#[command(name = "light-rpc", about = "Unified Solana indexer and RPC server")]
 struct Cli {
     #[arg(short, long, default_value = "config.yml")]
     config: PathBuf,
@@ -50,10 +47,7 @@ fn main() -> Result<()> {
         .with_target(true)
         .init();
 
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "starting light-rpc"
-    );
+    info!(version = env!("CARGO_PKG_VERSION"), "starting light-rpc");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.threads.rpc_count())
@@ -137,9 +131,7 @@ async fn run(config: Config) -> Result<()> {
 
     #[cfg(feature = "clickhouse")]
     {
-        use light_rpc::storage::clickhouse::{
-            clickhouse_writer_loop, ClickHouseStore,
-        };
+        use light_rpc::storage::clickhouse::{clickhouse_writer_loop, ClickHouseStore};
         if let Some(ch_cfg) = &config.storage.clickhouse {
             let store = ClickHouseStore::connect(ch_cfg)
                 .await
@@ -169,12 +161,13 @@ async fn run(config: Config) -> Result<()> {
         info!("empty database — attempting cold-start snapshot load from {snap_dir}");
         match cold_start_snapshot(snap_dir, &rocks).await {
             Ok((slot, count)) => info!(slot, accounts = count, "cold-start snapshot loaded"),
-            Err(e) => warn!(error = %e, "cold-start snapshot failed (no files?), starting from stream"),
+            Err(e) => {
+                warn!(error = %e, "cold-start snapshot failed (no files?), starting from stream")
+            }
         }
     }
 
-    let source = StreamSource::new(config.source, source_tx)
-        .with_rocks(rocks_for_source);
+    let source = StreamSource::new(config.source, source_tx).with_rocks(rocks_for_source);
     tokio::spawn(async move {
         if let Err(e) = source.run().await {
             error!(error = %e, "stream source failed");
@@ -184,7 +177,9 @@ async fn run(config: Config) -> Result<()> {
     let reader = Arc::new(StorageReader::new(memory_cache, rocks, files, pg));
     let invalidator_reader = Arc::clone(&reader);
     tokio::spawn(async move {
-        invalidator_reader.run_reader_invalidator(invalidator_rx).await;
+        invalidator_reader
+            .run_reader_invalidator(invalidator_rx)
+            .await;
     });
     let upstream = config.rpc.upstream.as_ref().map(|endpoint| {
         UpstreamForwarder::new(endpoint.clone(), config.rpc.forwarded_methods.clone())
@@ -196,10 +191,7 @@ async fn run(config: Config) -> Result<()> {
 
 /// Cold-start: download full snapshot, stream-parse AppendVec accounts,
 /// batch-write to all RocksDB CFs. ~30-60 min for 200M mainnet accounts.
-async fn cold_start_snapshot(
-    snapshot_dir: &str,
-    rocks: &UnifiedRocksDb,
-) -> Result<(u64, usize)> {
+async fn cold_start_snapshot(snapshot_dir: &str, rocks: &UnifiedRocksDb) -> Result<(u64, usize)> {
     use light_rpc::source::snapshot;
 
     let dir = std::path::Path::new(snapshot_dir);
@@ -210,8 +202,7 @@ async fn cold_start_snapshot(
 
     let path = info.path.clone();
     let accounts =
-        tokio::task::spawn_blocking(move || snapshot::parse_snapshot_accounts(&path))
-            .await??;
+        tokio::task::spawn_blocking(move || snapshot::parse_snapshot_accounts(&path)).await??;
 
     info!(total = accounts.len(), "applying snapshot to rocksdb");
     let applied = snapshot::apply_snapshot_to_rocks(rocks, &accounts, slot)?;
@@ -273,7 +264,12 @@ async fn run_retention_loop(
                     .and_then(|r| r.ok())
                     .unwrap_or(0);
                 if dropped > 0 {
-                    info!(cutoff, addresses = dropped, days = retention.sfa_index_days, "pruned sfa_index");
+                    info!(
+                        cutoff,
+                        addresses = dropped,
+                        days = retention.sfa_index_days,
+                        "pruned sfa_index"
+                    );
                 }
             }
         }
@@ -283,13 +279,16 @@ async fn run_retention_loop(
             let cutoff = current.saturating_sub(retention.slot_index_days * slots_per_day);
             if cutoff > 0 {
                 let r = rocks.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    match r.prune_slot_index_before(cutoff) {
-                        Ok(_) => info!(cutoff, days = retention.slot_index_days, "pruned slot_index"),
+                let _ =
+                    tokio::task::spawn_blocking(move || match r.prune_slot_index_before(cutoff) {
+                        Ok(_) => info!(
+                            cutoff,
+                            days = retention.slot_index_days,
+                            "pruned slot_index"
+                        ),
                         Err(e) => error!(error = %e, "slot_index prune failed"),
-                    }
-                })
-                .await;
+                    })
+                    .await;
             }
         }
 
@@ -298,13 +297,17 @@ async fn run_retention_loop(
             let cutoff = current.saturating_sub(retention.tx_index_days * slots_per_day);
             if cutoff > 0 {
                 let r = rocks.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    match r.prune_tx_index_before(cutoff) {
-                        Ok(n) => info!(cutoff, dropped = n, days = retention.tx_index_days, "pruned tx_index"),
+                let _ =
+                    tokio::task::spawn_blocking(move || match r.prune_tx_index_before(cutoff) {
+                        Ok(n) => info!(
+                            cutoff,
+                            dropped = n,
+                            days = retention.tx_index_days,
+                            "pruned tx_index"
+                        ),
                         Err(e) => error!(error = %e, "tx_index prune failed"),
-                    }
-                })
-                .await;
+                    })
+                    .await;
             }
         }
 
@@ -331,11 +334,7 @@ async fn run_retention_loop(
         }
 
         let size_gb = rocks.estimated_size_bytes() / (1024 * 1024 * 1024);
-        info!(
-            current,
-            rocksdb_gb = size_gb,
-            "retention check complete"
-        );
+        info!(current, rocksdb_gb = size_gb, "retention check complete");
     }
 }
 

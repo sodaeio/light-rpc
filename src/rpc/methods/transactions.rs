@@ -29,7 +29,9 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
         let null_raw = || serde_json::value::RawValue::from_string("null".into()).unwrap();
         match ctx.reader.get_transaction(&sig_bytes) {
-            Ok(Some(info)) => Ok(serde_json::value::to_raw_value(&info).unwrap_or_else(|_| null_raw())),
+            Ok(Some(info)) => {
+                Ok(serde_json::value::to_raw_value(&info).unwrap_or_else(|_| null_raw()))
+            }
             Ok(None) => Ok(null_raw()),
             Err(e) => Err(err(-32603, &e.to_string())),
         }

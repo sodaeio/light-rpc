@@ -118,7 +118,7 @@ impl UnifiedRocksDb {
         // Was parallelism.max(4) — too low on a 48-core box. Allow up to 16
         // background jobs (compactions + flushes) so a write burst can drain
         // L0 in parallel before it stalls writes.
-        db_opts.set_max_background_jobs(parallelism.min(16).max(8));
+        db_opts.set_max_background_jobs(parallelism.clamp(8, 16));
         db_opts.set_periodic_compaction_seconds(3600);
 
         // 200 MB/s — tune up on enterprise SSDs.
@@ -184,11 +184,17 @@ impl UnifiedRocksDb {
             return false;
         }
         // Match the SST path inside `in /abs/path/NNNNNN.sst offset ...`
-        let Some(idx) = err.find(" in ") else { return false };
+        let Some(idx) = err.find(" in ") else {
+            return false;
+        };
         let tail = &err[idx + 4..];
-        let Some(end) = tail.find(".sst") else { return false };
+        let Some(end) = tail.find(".sst") else {
+            return false;
+        };
         let sst_path = std::path::PathBuf::from(&tail[..end + 4]);
-        let Some(file_name) = sst_path.file_name() else { return false };
+        let Some(file_name) = sst_path.file_name() else {
+            return false;
+        };
 
         let dest = self.root.join("quarantine").join(file_name);
         let renamed = match std::fs::rename(&sst_path, &dest) {
@@ -470,10 +476,7 @@ impl UnifiedRocksDb {
         Ok(self.db.get_cf(&self.cf(CF_ACCOUNTS), pubkey)?)
     }
 
-    pub fn get_accounts_batch(
-        &self,
-        pubkeys: &[[u8; 32]],
-    ) -> Vec<Option<Vec<u8>>> {
+    pub fn get_accounts_batch(&self, pubkeys: &[[u8; 32]]) -> Vec<Option<Vec<u8>>> {
         let cf = self.cf(CF_ACCOUNTS);
         let keys: Vec<(&Arc<BoundColumnFamily<'_>>, &[u8; 32])> =
             pubkeys.iter().map(|k| (&cf, k)).collect();
@@ -638,8 +641,7 @@ impl UnifiedRocksDb {
     pub fn compact_all(&self) -> Result<()> {
         for name in ALL_CFS {
             let cf = self.cf(name);
-            self.db
-                .compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+            self.db.compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
         }
         Ok(())
     }
@@ -683,9 +685,7 @@ impl UnifiedRocksDb {
             for i in (0..32).rev() {
                 if next_prefix[i] < u8::MAX {
                     next_prefix[i] += 1;
-                    for j in i + 1..32 {
-                        next_prefix[j] = 0;
-                    }
+                    next_prefix[i + 1..32].fill(0);
                     break;
                 }
             }
@@ -739,7 +739,7 @@ impl UnifiedRocksDb {
                 batch.delete_cf(&cf, key);
                 dropped += 1;
                 // Flush batch periodically
-                if dropped % 100_000 == 0 {
+                if dropped.is_multiple_of(100_000) {
                     self.db.write(batch)?;
                     batch = rocksdb::WriteBatch::default();
                 }
@@ -748,7 +748,7 @@ impl UnifiedRocksDb {
             iter.next();
         }
 
-        if batch.len() > 0 {
+        if !batch.is_empty() {
             self.db.write(batch)?;
         }
         Ok(dropped)
@@ -759,8 +759,9 @@ impl UnifiedRocksDb {
         let mut total = 0u64;
         for name in ALL_CFS {
             let cf = self.cf(name);
-            if let Ok(Some(size)) =
-                self.db.property_int_value_cf(&cf, "rocksdb.estimate-live-data-size")
+            if let Ok(Some(size)) = self
+                .db
+                .property_int_value_cf(&cf, "rocksdb.estimate-live-data-size")
             {
                 total += size;
             }

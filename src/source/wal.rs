@@ -84,9 +84,7 @@ impl WalWriter {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("wal-") && name.ends_with(".bin") {
-                let slot_str = name
-                    .trim_start_matches("wal-")
-                    .trim_end_matches(".bin");
+                let slot_str = name.trim_start_matches("wal-").trim_end_matches(".bin");
                 if let Ok(slot) = slot_str.parse::<Slot>() {
                     if slot < cutoff_slot {
                         let _ = std::fs::remove_file(entry.path());
@@ -143,8 +141,7 @@ pub fn replay_wal(dir: &Path, after_slot: Slot) -> Result<Vec<(Slot, Vec<u8>)>> 
 
             let mut slot_buf = [0u8; 8];
             let mut len_buf = [0u8; 4];
-            if reader.read_exact(&mut slot_buf).is_err()
-                || reader.read_exact(&mut len_buf).is_err()
+            if reader.read_exact(&mut slot_buf).is_err() || reader.read_exact(&mut len_buf).is_err()
             {
                 break;
             }

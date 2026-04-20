@@ -41,8 +41,12 @@ pub struct SourceConfig {
     pub snapshot_dir: String,
 }
 
-fn default_gap_threshold() -> u64 { 60 }
-fn default_snapshot_dir() -> String { "/tmp/light-rpc-snapshots".into() }
+fn default_gap_threshold() -> u64 {
+    60
+}
+fn default_snapshot_dir() -> String {
+    "/tmp/light-rpc-snapshots".into()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
@@ -93,9 +97,15 @@ impl Default for RetentionConfig {
     }
 }
 
-fn default_retention_days() -> u64 { 2 }
-fn default_sfa_retention_days() -> u64 { 7 }
-fn default_prune_interval() -> u64 { 600 }
+fn default_retention_days() -> u64 {
+    2
+}
+fn default_sfa_retention_days() -> u64 {
+    7
+}
+fn default_prune_interval() -> u64 {
+    600
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RocksDbConfig {
