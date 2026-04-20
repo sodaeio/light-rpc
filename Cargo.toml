@@ -1,15 +1,15 @@
 [package]
-name = "light-indexer"
-version = "0.2.1"
+name = "light-rpc"
+version = "0.2.2"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "light-indexer"
+name = "light-rpc"
 path = "src/main.rs"
 
 [lib]
-name = "light_indexer"
+name = "light_rpc"
 path = "src/lib.rs"
 
 [dependencies]
@@ -81,6 +81,8 @@ bytes = "1.10"
 lz4 = "1.28"
 reqwest = { version = "0.12", features = ["json"] }
 zstd = "0.13"
+hex = "0.4"
+tar = "0.4"
 
 # ClickHouse (historical module, feature-flagged until rollout complete)
 clickhouse = { version = "0.15", features = ["native-tls", "lz4"], optional = true }

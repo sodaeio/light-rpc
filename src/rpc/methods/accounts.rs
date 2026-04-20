@@ -101,16 +101,28 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             ));
         }
 
-        let encoding = p
-            .get(1)
-            .and_then(|v| v.get("encoding"))
+        let opts = p.get(1).and_then(|v| v.as_object());
+        let encoding = opts
+            .and_then(|o| o.get("encoding"))
             .and_then(|v| v.as_str())
             .unwrap_or("base64");
-        let with_context = p
-            .get(1)
-            .and_then(|v| v.get("withContext"))
+        let with_context = opts
+            .and_then(|o| o.get("withContext"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        // Cursor-based pagination: client passes the last pubkey it received
+        // as `after`; we skip all keys ≤ that pubkey so the next page starts
+        // right after it.
+        let after: Option<[u8; 32]> = opts
+            .and_then(|o| o.get("after"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| bs58::decode(s).into_vec().ok())
+            .and_then(|v| v.try_into().ok());
+        let limit = opts
+            .and_then(|o| o.get("limit"))
+            .and_then(|v| v.as_u64())
+            .map(|l| l.min(ctx.gpa_max_accounts as u64) as usize)
+            .unwrap_or(ctx.gpa_max_accounts);
 
         match ctx
             .reader
@@ -118,18 +130,16 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .await
         {
             Ok(mut accounts) => {
-                if accounts.len() > ctx.gpa_max_accounts {
-                    return Err(err(
-                        -32602,
-                        &format!(
-                            "getProgramAccounts would return {} accounts \
-                             (server cap {}). Add dataSize or memcmp filters.",
-                            accounts.len(),
-                            ctx.gpa_max_accounts
-                        ),
-                    ));
+                // Apply cursor: drop everything up to and including `after`.
+                if let Some(cursor) = after {
+                    let cursor_str = bs58::encode(cursor).into_string();
+                    if let Some(pos) = accounts.iter().position(|a| {
+                        a.get("pubkey").and_then(|v| v.as_str()) == Some(&cursor_str)
+                    }) {
+                        accounts = accounts.split_off(pos + 1);
+                    }
                 }
-                accounts.truncate(ctx.gpa_max_accounts);
+                accounts.truncate(limit);
                 if with_context {
                     let slot = ctx.reader.cache().processed_slot();
                     Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(

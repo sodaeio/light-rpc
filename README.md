@@ -1,10 +1,12 @@
-# light-indexer
+# light-rpc
 
 A unified Solana indexer and RPC server. Single binary that replaces the need for separate block history, account indexing, and DAS API services.
 
+> Repo dir is still `light-indexer/`; the Rust crate, library, and binary were renamed to `light-rpc` in v0.2.2. Existing systemd units and `/home/das/light-indexer/` deploy paths were left alone for ops continuity.
+
 ## What it does
 
-light-indexer subscribes to a Solana validator's gRPC stream (via [Richat](https://github.com/lamports-dev/richat)) and indexes everything into a tiered storage system. It then serves the full Solana JSON-RPC API from one HTTP endpoint — no validator node required.
+light-rpc subscribes to a Solana validator's gRPC stream (via [Richat](https://github.com/lamports-dev/richat)) and indexes everything into a tiered storage system. It then serves the full Solana JSON-RPC API from one HTTP endpoint — no validator node required.
 
 ```
 Validator (Richat gRPC)
@@ -127,7 +129,8 @@ storage:
   rocksdb:
     path: "data/rocksdb"
     write_buffer_size: 268435456         # 256MB
-    max_open_files: 512
+    max_open_files: -1                   # unlimited; required so compaction
+                                         # can drain a large L0 backlog
 
   blocks:
     path: "data/blocks"
@@ -135,7 +138,7 @@ storage:
     max_stored_blocks: 500000
 
   postgres:
-    url: "postgres://user:pass@localhost:5432/light_indexer"
+    url: "postgres://user:pass@localhost:5432/light_rpc"
     max_connections: 50
 
   pipeline:
@@ -169,20 +172,20 @@ The release binary is ~18MB (LTO + stripped).
 
 ```bash
 # Validate config
-./target/release/light-indexer --config config.yml --check
+./target/release/light-rpc --config config.yml --check
 
 # Run
-./target/release/light-indexer --config config.yml
+./target/release/light-rpc --config config.yml
 
 # With debug logging
-RUST_LOG=debug ./target/release/light-indexer --config config.yml
+RUST_LOG=debug ./target/release/light-rpc --config config.yml
 ```
 
 ## Docker
 
 ```bash
-docker build -t light-indexer .
-docker run -v ./config.yml:/etc/light-indexer/config.yml light-indexer
+docker build -t light-rpc .
+docker run -v ./config.yml:/etc/light-rpc/config.yml light-rpc
 ```
 
 ## Metrics

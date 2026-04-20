@@ -36,14 +36,24 @@ fn apply_cf_compaction_tuning(opts: &mut Options) {
 
 fn apply_cf_compaction_tuning_with(opts: &mut Options, l0_trigger: i32) {
     opts.set_level_zero_file_num_compaction_trigger(l0_trigger);
-    opts.set_level_zero_slowdown_writes_trigger(20);
-    opts.set_level_zero_stop_writes_trigger(36);
-    opts.set_target_file_size_base(64 * 1024 * 1024);
-    opts.set_max_bytes_for_level_base(512 * 1024 * 1024);
+    // Wider headroom so a brief compaction lull doesn't stall writes:
+    //   slowdown at 64 (was 20), stop at 256 (was 36).
+    // With ratelimiter capping write rate anyway, a deeper L0 queue is fine
+    // and avoids the "ingest dies until compaction catches up" failure mode.
+    opts.set_level_zero_slowdown_writes_trigger(64);
+    opts.set_level_zero_stop_writes_trigger(256);
+    // Larger SSTs = fewer files to track, fewer compaction jobs, lower
+    // open-file pressure, and larger sequential reads during compaction.
+    opts.set_target_file_size_base(128 * 1024 * 1024);
+    opts.set_target_file_size_multiplier(2);
+    opts.set_max_bytes_for_level_base(1024 * 1024 * 1024);
     opts.set_max_bytes_for_level_multiplier(10.0);
     opts.set_level_compaction_dynamic_level_bytes(true);
     opts.set_bottommost_compression_type(DBCompressionType::Zstd);
     opts.set_bottommost_zstd_max_train_bytes(0, true);
+    // More parallel sub-compactions per L0→L1 job so a 200+ GB backlog
+    // (e.g. post-repair) drains in minutes, not hours.
+    opts.set_max_subcompactions(4);
 }
 
 fn build_block_opts(
@@ -76,6 +86,10 @@ type DB = DBWithThreadMode<MultiThreaded>;
 
 pub struct UnifiedRocksDb {
     db: Arc<DB>,
+    /// Root rocksdb directory — used to relocate corrupt SST files to
+    /// `<root>/quarantine/` so the indexer self-heals on checksum errors
+    /// instead of waiting for an operator to drop a CF or repair the DB.
+    root: std::path::PathBuf,
 }
 
 impl UnifiedRocksDb {
@@ -101,16 +115,27 @@ impl UnifiedRocksDb {
             .map(|n| n.get() as i32)
             .unwrap_or(4);
         db_opts.increase_parallelism(parallelism);
-        db_opts.set_max_background_jobs(parallelism.max(4));
+        // Was parallelism.max(4) — too low on a 48-core box. Allow up to 16
+        // background jobs (compactions + flushes) so a write burst can drain
+        // L0 in parallel before it stalls writes.
+        db_opts.set_max_background_jobs(parallelism.min(16).max(8));
         db_opts.set_periodic_compaction_seconds(3600);
 
         // 200 MB/s — tune up on enterprise SSDs.
         db_opts.set_ratelimiter(200 * 1024 * 1024, 100_000, 10);
 
-        // Direct I/O for flush+compaction was measured neutral on our NVMe;
-        // leaving off so the kernel page cache keeps helping sfa_index
-        // prefix-scan read-ahead. Revisit when dedicated I/O threads land.
-        // db_opts.set_use_direct_io_for_flush_and_compaction(true);
+        // Corruption hardening:
+        //   - direct I/O for flush+compaction bypasses the page cache so
+        //     a kernel torn-write can't yield a half-written SST;
+        //   - bytes_per_sync forces periodic fsync during big sequential
+        //     writes, bounding any torn-write blast radius to ~1 MB;
+        //   - paranoid_file_checks validates SST checksums on first read
+        //     so bad blocks surface immediately, not weeks later when a
+        //     compaction stumbles on them.
+        db_opts.set_use_direct_io_for_flush_and_compaction(true);
+        db_opts.set_bytes_per_sync(1024 * 1024);
+        db_opts.set_wal_bytes_per_sync(1024 * 1024);
+        db_opts.set_paranoid_checks(true);
 
         db_opts.enable_statistics();
         db_opts.set_stats_dump_period_sec(600);
@@ -134,7 +159,62 @@ impl UnifiedRocksDb {
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)
             .context("opening rocksdb with column families")?;
 
-        Ok(Self { db: Arc::new(db) })
+        // Quarantine directory for corrupt SSTs evicted by self-heal.
+        let quarantine = path.join("quarantine");
+        if !quarantine.exists() {
+            let _ = std::fs::create_dir_all(&quarantine);
+        }
+
+        Ok(Self {
+            db: Arc::new(db),
+            root: path.to_path_buf(),
+        })
+    }
+
+    /// Self-heal helper: when a write returns a `Corruption: ... in
+    /// /path/NNNNNN.sst` error, parse the file path out of the message,
+    /// move the SST into `<root>/quarantine/`, and force a compaction on
+    /// the affected CF so RocksDB drops its reference to the dead file.
+    /// The lost keys refill from the gRPC stream over the next few hours
+    /// (program_index / owner_atas) or the next 2 days (tx_index / sfa_index).
+    /// Returns Ok(true) if a file was quarantined, Ok(false) if the error
+    /// wasn't a corruption error we can act on.
+    pub fn try_quarantine_corrupt_sst(&self, err: &str, cf_hint: &str) -> bool {
+        if !err.contains("Corruption") || !err.contains(".sst") {
+            return false;
+        }
+        // Match the SST path inside `in /abs/path/NNNNNN.sst offset ...`
+        let Some(idx) = err.find(" in ") else { return false };
+        let tail = &err[idx + 4..];
+        let Some(end) = tail.find(".sst") else { return false };
+        let sst_path = std::path::PathBuf::from(&tail[..end + 4]);
+        let Some(file_name) = sst_path.file_name() else { return false };
+
+        let dest = self.root.join("quarantine").join(file_name);
+        let renamed = match std::fs::rename(&sst_path, &dest) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // already gone
+            Err(e) => {
+                tracing::error!(file = %sst_path.display(), error = %e,
+                    "self-heal: failed to quarantine corrupt SST");
+                return false;
+            }
+        };
+
+        tracing::warn!(
+            file = %sst_path.display(),
+            cf = cf_hint,
+            "self-heal: quarantined corrupt SST, forcing compaction"
+        );
+        crate::metrics::ROCKSDB_QUARANTINED.inc();
+
+        // Force-compact the affected CF so RocksDB stops referencing the
+        // removed file. Best-effort; a CF mismatch is fine, RocksDB will
+        // discover the missing file via paranoid_checks on the next access.
+        if let Some(cf) = self.db.cf_handle(cf_hint) {
+            self.db.compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+        }
+        renamed
     }
 
     fn slot_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
@@ -228,6 +308,33 @@ impl UnifiedRocksDb {
         Ok(self
             .db
             .get_cf(&self.cf(CF_SLOT_INDEX), slot.to_be_bytes())?)
+    }
+
+    pub fn first_slot_index(&self) -> Option<Slot> {
+        let cf = self.cf(CF_SLOT_INDEX);
+        let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        iter.next()
+            .and_then(|r| r.ok())
+            .and_then(|(k, _)| k.as_ref().try_into().ok().map(Slot::from_be_bytes))
+    }
+
+    pub fn scan_slot_index_range(&self, start: Slot, end: Slot) -> Result<Vec<Slot>> {
+        let cf = self.cf(CF_SLOT_INDEX);
+        let mut iter = self.db.iterator_cf(
+            &cf,
+            rocksdb::IteratorMode::From(&start.to_be_bytes(), rocksdb::Direction::Forward),
+        );
+        let mut slots = Vec::with_capacity(((end - start) / 3).min(50_000) as usize);
+        while let Some(Ok((key, _))) = iter.next() {
+            if let Ok(bytes) = <[u8; 8]>::try_from(key.as_ref()) {
+                let slot = Slot::from_be_bytes(bytes);
+                if slot > end {
+                    break;
+                }
+                slots.push(slot);
+            }
+        }
+        Ok(slots)
     }
 
     pub fn put_tx_index(&self, signature: &[u8; 64], data: &[u8]) -> Result<()> {
@@ -588,6 +695,79 @@ impl UnifiedRocksDb {
         Ok(dropped)
     }
 
+    /// Delete slot_index entries before cutoff_slot.
+    pub fn prune_slot_index_before(&self, cutoff_slot: Slot) -> Result<u64> {
+        let cf = self.cf(CF_SLOT_INDEX);
+        let start = 0u64.to_be_bytes();
+        let end = cutoff_slot.to_be_bytes();
+        self.db.delete_range_cf(&cf, start, end)?;
+        Ok(cutoff_slot)
+    }
+
+    /// Delete tx_index entries that reference slots before cutoff_slot.
+    /// tx_index key = signature[64], value starts with slot_le(8).
+    /// Full scan required since keys aren't slot-ordered.
+    pub fn prune_tx_index_before(&self, cutoff_slot: Slot) -> Result<u64> {
+        let cf = self.cf(CF_TX_INDEX);
+        let mut iter = self.db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut dropped = 0u64;
+
+        while iter.valid() {
+            let Some(key) = iter.key() else { break };
+            let Some(value) = iter.value() else {
+                iter.next();
+                continue;
+            };
+
+            // Detect format: JSON backfill always starts `{"`; binary prost
+            // starts with the slot u64 LE whose LSB collides with `{` 1/256.
+            let slot = if value.starts_with(b"{\"") {
+                serde_json::from_slice::<serde_json::Value>(value)
+                    .ok()
+                    .and_then(|v| v.get("slot").and_then(|s| s.as_u64()))
+                    .unwrap_or(u64::MAX)
+            } else if value.len() >= 8 {
+                u64::from_le_bytes(value[0..8].try_into().unwrap_or([0; 8]))
+            } else {
+                u64::MAX
+            };
+
+            if slot < cutoff_slot {
+                batch.delete_cf(&cf, key);
+                dropped += 1;
+                // Flush batch periodically
+                if dropped % 100_000 == 0 {
+                    self.db.write(batch)?;
+                    batch = rocksdb::WriteBatch::default();
+                }
+            }
+
+            iter.next();
+        }
+
+        if batch.len() > 0 {
+            self.db.write(batch)?;
+        }
+        Ok(dropped)
+    }
+
+    /// Estimate total RocksDB data size in bytes.
+    pub fn estimated_size_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for name in ALL_CFS {
+            let cf = self.cf(name);
+            if let Ok(Some(size)) =
+                self.db.property_int_value_cf(&cf, "rocksdb.estimate-live-data-size")
+            {
+                total += size;
+            }
+        }
+        total
+    }
+
     pub fn update_metrics(&self) {
         for name in ALL_CFS {
             let cf = self.cf(name);
@@ -628,6 +808,7 @@ impl Clone for UnifiedRocksDb {
     fn clone(&self) -> Self {
         Self {
             db: Arc::clone(&self.db),
+            root: self.root.clone(),
         }
     }
 }

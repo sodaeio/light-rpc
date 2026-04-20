@@ -138,7 +138,12 @@ impl StorageWriter {
         .unwrap_or_default();
 
         if let Err(e) = self.rocks.put_slot_index(slot, &slot_data) {
-            error!(slot, error = %e, "failed to write slot index");
+            let s = e.to_string();
+            if self.rocks.try_quarantine_corrupt_sst(&s, "slot_index") {
+                let _ = self.rocks.put_slot_index(slot, &slot_data);
+            } else {
+                error!(slot, error = %s, "failed to write slot index");
+            }
         }
 
         // tx_index value: see rpc::tx_format for the layout.
@@ -156,7 +161,12 @@ impl StorageWriter {
 
             let sig_bytes: &[u8; 64] = tx.signature.as_ref().try_into().unwrap_or(&[0u8; 64]);
             if let Err(e) = self.rocks.put_tx_index(sig_bytes, &value) {
-                error!(slot, error = %e, "failed to write tx index");
+                let s = e.to_string();
+                if self.rocks.try_quarantine_corrupt_sst(&s, "tx_index") {
+                    let _ = self.rocks.put_tx_index(sig_bytes, &value);
+                } else {
+                    error!(slot, error = %s, "failed to write tx index");
+                }
             }
         }
 
@@ -169,7 +179,12 @@ impl StorageWriter {
         }
         if !sfa_entries.is_empty() {
             if let Err(e) = self.rocks.put_sfa_batch(&sfa_entries) {
-                error!(slot, error = %e, "failed to write sfa index");
+                let s = e.to_string();
+                if self.rocks.try_quarantine_corrupt_sst(&s, "sfa_index") {
+                    let _ = self.rocks.put_sfa_batch(&sfa_entries);
+                } else {
+                    error!(slot, error = %s, "failed to write sfa index");
+                }
             }
         }
 
@@ -300,7 +315,19 @@ impl StorageWriter {
         if !prog_refs.is_empty() {
             match AccountProcessor::write_program_accounts(&self.rocks, &prog_refs) {
                 Ok(count) => debug!(count, "wrote program accounts to rocksdb"),
-                Err(e) => error!(error = %e, "failed to write program accounts"),
+                Err(e) => {
+                    let s = e.to_string();
+                    if self.rocks.try_quarantine_corrupt_sst(&s, "program_index") {
+                        // Retry once after quarantine; still log if it fails.
+                        if let Err(e2) =
+                            AccountProcessor::write_program_accounts(&self.rocks, &prog_refs)
+                        {
+                            error!(error = %e2, "failed to write program accounts after self-heal");
+                        }
+                    } else {
+                        error!(error = %s, "failed to write program accounts");
+                    }
+                }
             }
             let pubkeys: Vec<[u8; 32]> = prog_refs.iter().map(|u| u.pubkey.to_bytes()).collect();
             let _ = self
@@ -348,12 +375,22 @@ impl StorageWriter {
             }
             if !atas.is_empty() {
                 if let Err(e) = self.rocks.put_owner_atas_batch(&atas) {
-                    error!(error = %e, "failed to write owner_atas");
+                    let s = e.to_string();
+                    if self.rocks.try_quarantine_corrupt_sst(&s, "owner_atas") {
+                        let _ = self.rocks.put_owner_atas_batch(&atas);
+                    } else {
+                        error!(error = %s, "failed to write owner_atas");
+                    }
                 }
             }
             for (mint, updates) in by_mint {
                 if let Err(e) = self.rocks.update_mint_top_holders(&mint, &updates) {
-                    error!(error = %e, "failed to update mint_top_holders");
+                    let s = e.to_string();
+                    if self.rocks.try_quarantine_corrupt_sst(&s, "mint_top_holders") {
+                        let _ = self.rocks.update_mint_top_holders(&mint, &updates);
+                    } else {
+                        error!(error = %s, "failed to update mint_top_holders");
+                    }
                 }
             }
             let pubkeys: Vec<[u8; 32]> =

@@ -12,7 +12,7 @@ use richat_proto::richat::GrpcSubscribeRequest;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::SourceConfig;
 use crate::metrics;
@@ -105,38 +105,71 @@ impl SlotAccumulator {
 pub struct StreamSource {
     config: SourceConfig,
     sink: mpsc::Sender<SourceMessage>,
+    /// RocksDB handle — used only during gap recovery to write backfilled
+    /// blocks directly (slot_index, tx_index, sfa_index) without going
+    /// through the writer pipeline.
+    rocks: Option<crate::storage::rocks::UnifiedRocksDb>,
 }
 
 impl StreamSource {
     pub fn new(config: SourceConfig, sink: mpsc::Sender<SourceMessage>) -> Self {
-        Self { config, sink }
+        Self {
+            config,
+            sink,
+            rocks: None,
+        }
     }
 
-    /// Run the stream source with automatic reconnection.
+    pub fn with_rocks(mut self, rocks: crate::storage::rocks::UnifiedRocksDb) -> Self {
+        self.rocks = Some(rocks);
+        self
+    }
+
+    /// Run with multi-source failover. Tries primary, then each fallback
+    /// in order. If all fail, attempts snapshot recovery before retrying.
     pub async fn run(self) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(60);
 
-        loop {
-            info!(endpoint = %self.config.endpoint, "connecting to gRPC source");
+        // Build endpoint list: primary + fallbacks
+        let mut endpoints = vec![self.config.endpoint.clone()];
+        endpoints.extend(self.config.fallback_endpoints.iter().cloned());
+        let mut current_idx = 0;
 
-            match self.run_stream().await {
+        loop {
+            let endpoint = &endpoints[current_idx % endpoints.len()];
+            info!(endpoint, idx = current_idx % endpoints.len(), "connecting to gRPC source");
+
+            // No outer wrapping timeout: connect/subscribe/per-message reads
+            // each have their own timeouts inside `run_stream_endpoint`, and
+            // a wrapping timeout would kill a healthy long-running stream.
+            // Gap detection lives in the inner loop and triggers snapshot
+            // recovery without dropping the connection.
+            match self.run_stream_endpoint(endpoint).await {
                 Ok(()) => {
                     info!("stream ended cleanly, reconnecting");
                     backoff = Duration::from_secs(1);
                 }
                 Err(e) => {
-                    error!(error = %e, "stream error, reconnecting in {:?}", backoff);
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(max_backoff);
+                    error!(error = %e, endpoint, "stream error");
+                    current_idx += 1;
+                    if current_idx % endpoints.len() == 0 {
+                        warn!("all {} endpoints failed, attempting snapshot recovery", endpoints.len());
+                        match self.try_snapshot_recovery().await {
+                            Ok(slot) => info!(slot, "snapshot recovery succeeded"),
+                            Err(e) => warn!(error = %e, "snapshot recovery failed"),
+                        }
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
                 }
             }
         }
     }
 
-    async fn run_stream(&self) -> Result<()> {
+    async fn run_stream_endpoint(&self, endpoint: &str) -> Result<()> {
         let grpc_config = ConfigGrpcClient {
-            endpoint: self.config.endpoint.clone(),
+            endpoint: endpoint.to_string(),
             x_token: self.config.x_token.as_ref().map(|t| t.as_bytes().to_vec()),
             max_decoding_message_size: self.config.max_message_size,
             connect_timeout: Some(Duration::from_secs(self.config.connect_timeout_secs)),
@@ -147,36 +180,89 @@ impl StreamSource {
             ..Default::default()
         };
 
-        let mut client = grpc_config
-            .connect()
-            .await
-            .context("failed to connect to gRPC source")?;
+        let mut client = tokio::time::timeout(
+            Duration::from_secs(self.config.connect_timeout_secs),
+            grpc_config.connect(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("gRPC connect timed out"))?
+        .context("failed to connect to gRPC source")?;
 
-        let stream = client
-            .subscribe_richat(GrpcSubscribeRequest {
+        let stream = tokio::time::timeout(
+            Duration::from_secs(self.config.request_timeout_secs),
+            client.subscribe_richat(GrpcSubscribeRequest {
                 replay_from_slot: None,
                 filter: None,
-            })
-            .await
-            .context("failed to subscribe")?
-            .into_parsed();
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("gRPC subscribe timed out"))?
+        .context("failed to subscribe")?
+        .into_parsed();
 
         tokio::pin!(stream);
         let mut tracker = CommitmentTracker::new();
         let mut accumulators: BTreeMap<Slot, SlotAccumulator> = BTreeMap::new();
-        let mut stats_interval = tokio::time::interval(Duration::from_secs(10));
+        // stats_interval removed: inline timer + timeout on stream.next()
+        // replaced select!-based interval that got starved.
         let mut blocks_count: u64 = 0;
         let mut accounts_count: u64 = 0;
         let mut txs_count: u64 = 0;
+        let mut last_block_time = std::time::Instant::now();
+        let mut last_stats_time = std::time::Instant::now();
+        let gap_threshold = Duration::from_secs(self.config.gap_threshold_secs);
+        let mut msg_count: u64 = 0;
 
         loop {
-            tokio::select! {
-                msg = stream.next() => {
-                    let update: SubscribeUpdate = match msg {
-                        Some(Ok(update)) => update,
-                        Some(Err(e)) => return Err(e.into()),
-                        None => return Ok(()),
-                    };
+            // Periodic stats + gap check — runs inline every 10s rather
+            // than in a select branch that gets starved by the stream.
+            if last_stats_time.elapsed() >= Duration::from_secs(10) {
+                let gap_secs = last_block_time.elapsed().as_secs();
+                info!(
+                    blocks = blocks_count,
+                    accounts = accounts_count,
+                    transactions = txs_count,
+                    processed = tracker.processed_slot(),
+                    confirmed = tracker.confirmed_slot(),
+                    finalized = tracker.finalized_slot(),
+                    accumulators = accumulators.len(),
+                    gap_secs,
+                    msg_count,
+                    "stream stats"
+                );
+                last_stats_time = std::time::Instant::now();
+
+                if last_block_time.elapsed() > gap_threshold {
+                    warn!(
+                        gap_secs,
+                        "no blocks for {gap_secs}s, attempting snapshot recovery"
+                    );
+                    match self.try_snapshot_recovery().await {
+                        Ok(slot) => {
+                            info!(slot, "snapshot recovery complete");
+                            last_block_time = std::time::Instant::now();
+                        }
+                        Err(e) => {
+                            error!(error = %e, "snapshot recovery failed");
+                        }
+                    }
+                }
+            }
+
+            // Use timeout to guarantee the loop yields for stats+gap checks
+            // even if the stream is delivering messages continuously.
+            let msg = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+            let update: SubscribeUpdate = match msg {
+                Ok(Some(Ok(update))) => {
+                    msg_count += 1;
+                    update
+                }
+                Ok(Some(Err(e))) => return Err(e.into()),
+                Ok(None) => return Ok(()),
+                Err(_timeout) => continue, // loops back to inline stats check
+            };
+
+            {
 
                     match update.update_oneof {
                         Some(UpdateOneof::Account(account_update)) => {
@@ -303,6 +389,7 @@ impl StreamSource {
                                 let block = Arc::new(block_data);
 
                                 blocks_count += 1;
+                                last_block_time = std::time::Instant::now();
                                 metrics::INGESTED_BLOCKS.inc();
 
                                 if self.sink.send(SourceMessage::Block { slot, block }).await.is_err() {
@@ -356,21 +443,44 @@ impl StreamSource {
 
                         _ => {}
                     }
-                }
-
-                _ = stats_interval.tick() => {
-                    info!(
-                        blocks = blocks_count,
-                        accounts = accounts_count,
-                        transactions = txs_count,
-                        processed = tracker.processed_slot(),
-                        confirmed = tracker.confirmed_slot(),
-                        finalized = tracker.finalized_slot(),
-                        accumulators = accumulators.len(),
-                        "stream stats"
-                    );
-                }
             }
         }
+    }
+
+    /// Recover account state from local snapshot files (zero RPC calls).
+    /// Block/tx/sig history comes from gRPC stream replay or Jetstreamer
+    /// backfill (separate tool).
+    async fn try_snapshot_recovery(&self) -> Result<Slot> {
+        use super::snapshot;
+
+        let snap_dir = std::path::Path::new(&self.config.snapshot_dir);
+        let info = match snapshot::find_latest_snapshot(snap_dir) {
+            Ok(info) => info,
+            Err(e) => {
+                warn!(error = %e, dir = %snap_dir.display(), "no snapshot files found");
+                return Ok(0);
+            }
+        };
+
+        info!(
+            slot = info.slot,
+            path = %info.path.display(),
+            incremental = info.is_incremental,
+            "loading snapshot for account recovery"
+        );
+
+        let path = info.path.clone();
+        let slot = info.slot;
+        let accounts = tokio::task::spawn_blocking(move || {
+            snapshot::parse_snapshot_accounts(&path)
+        })
+        .await??;
+
+        if let Some(ref rocks) = self.rocks {
+            let count = snapshot::apply_snapshot_to_rocks(rocks, &accounts, slot)?;
+            info!(accounts = count, slot, "snapshot applied to rocks");
+        }
+
+        Ok(slot)
     }
 }

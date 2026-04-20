@@ -17,7 +17,7 @@ impl PgStorage {
     pub async fn connect(config: &PostgresConfig) -> Result<Self> {
         let connect_opts = PgConnectOptions::from_str(&config.url)
             .context("parsing postgres url")?
-            .application_name("light-indexer")
+            .application_name("light-rpc")
             .log_statements(tracing::log::LevelFilter::Trace)
             .log_slow_statements(
                 tracing::log::LevelFilter::Warn,

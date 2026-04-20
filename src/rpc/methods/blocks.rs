@@ -201,15 +201,104 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     // Pre-encoded static JSON — jsonrpsee emits verbatim.
     static VERSION_RAW: std::sync::LazyLock<Box<serde_json::value::RawValue>> =
         std::sync::LazyLock::new(|| {
-            serde_json::value::RawValue::from_string(
-                r#"{"solana-core":"2.2.4","feature-set":0}"#.to_string(),
-            )
+            serde_json::value::RawValue::from_string(format!(
+                r#"{{"solana-core":"2.2.4","feature-set":0,"light-rpc":"{}"}}"#,
+                env!("CARGO_PKG_VERSION"),
+            ))
             .unwrap()
         });
     module.register_async_method("getVersion", |_, _, _| async move {
         Ok::<Box<serde_json::value::RawValue>, jsonrpsee::types::ErrorObjectOwned>(
             VERSION_RAW.clone(),
         )
+    })?;
+
+    // --- Trivial methods for Solana RPC parity ---
+
+    // Mainnet genesis hash is a fixed constant.
+    static GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+    module.register_async_method("getGenesisHash", |_, _, _| async move {
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(GENESIS_HASH))
+    })?;
+
+    module.register_async_method("getMinimumBalanceForRentExemption", |params, _, _| async move {
+        let p: Vec<serde_json::Value> = params.parse()?;
+        let data_len = p.first().and_then(|v| v.as_u64()).unwrap_or(0);
+        let lamports = (128 + data_len) * 6960;
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(lamports))
+    })?;
+
+    module.register_async_method("getEpochInfo", |params, ctx, _| async move {
+        let commitment = parse_commitment(&params);
+        let slot = ctx.reader.get_slot(commitment);
+        // Mainnet epoch schedule: 432,000 slots per epoch
+        let slots_per_epoch: u64 = 432_000;
+        let epoch = slot / slots_per_epoch;
+        let slot_index = slot % slots_per_epoch;
+        let block_height = ctx.reader.get_block_height(commitment).ok().flatten().unwrap_or(slot);
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+            "epoch": epoch,
+            "slotIndex": slot_index,
+            "slotsInEpoch": slots_per_epoch,
+            "absoluteSlot": slot,
+            "blockHeight": block_height,
+            "transactionCount": null,
+        }))
+    })?;
+
+    module.register_async_method("getEpochSchedule", |_, _, _| async move {
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+            "slotsPerEpoch": 432_000,
+            "leaderScheduleSlotOffset": 432_000,
+            "warmup": false,
+            "firstNormalEpoch": 0,
+            "firstNormalSlot": 0,
+        }))
+    })?;
+
+    module.register_async_method("getHealth", |_, ctx, _| async move {
+        let age = ctx.reader.cache().finalized_slot_age_secs();
+        if age < 120 {
+            Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!("ok"))
+        } else {
+            Err(err(-32005, &format!("Node is behind by {age} seconds")))
+        }
+    })?;
+
+    module.register_async_method("getIdentity", |_, _, _| async move {
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+            "identity": "light-rpc"
+        }))
+    })?;
+
+    module.register_async_method("getFirstAvailableBlock", |_, ctx, _| async move {
+        let first = ctx.reader.get_first_available_slot();
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(first))
+    })?;
+
+    module.register_async_method("getBlocks", |params, ctx, _| async move {
+        let p: Vec<serde_json::Value> = params.parse()?;
+        let start: Slot = p.first().and_then(|v| v.as_u64())
+            .ok_or_else(|| err(-32602, "Invalid start slot"))?;
+        let end: Slot = p.get(1).and_then(|v| v.as_u64())
+            .unwrap_or_else(|| ctx.reader.cache().finalized_slot());
+        if end.saturating_sub(start) > 500_000 {
+            return Err(err(-32602, "Slot range too large (max 500,000)"));
+        }
+        let slots = ctx.reader.get_blocks_in_range(start, end)
+            .map_err(|e| err(-32603, &e.to_string()))?;
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(slots))
+    })?;
+
+    module.register_async_method("getBlocksWithLimit", |params, ctx, _| async move {
+        let p: Vec<serde_json::Value> = params.parse()?;
+        let start: Slot = p.first().and_then(|v| v.as_u64())
+            .ok_or_else(|| err(-32602, "Invalid start slot"))?;
+        let limit = p.get(1).and_then(|v| v.as_u64()).unwrap_or(500_000).min(500_000);
+        let end = start + limit;
+        let slots = ctx.reader.get_blocks_in_range(start, end)
+            .map_err(|e| err(-32603, &e.to_string()))?;
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(slots))
     })?;
 
     Ok(())
