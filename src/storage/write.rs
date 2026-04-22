@@ -19,7 +19,6 @@ pub struct StorageWriter {
     files: BlockFileStorage,
     pg_tx: mpsc::Sender<PgWriteJob>,
     broadcast_tx: broadcast::Sender<WriteToReadMessage>,
-    #[cfg(feature = "clickhouse")]
     ch_tx: Option<mpsc::Sender<super::clickhouse::ClickHouseWriteJob>>,
 }
 
@@ -50,12 +49,10 @@ impl StorageWriter {
             files,
             pg_tx,
             broadcast_tx,
-            #[cfg(feature = "clickhouse")]
             ch_tx: None,
         }
     }
 
-    #[cfg(feature = "clickhouse")]
     pub fn with_clickhouse(
         mut self,
         ch_tx: mpsc::Sender<super::clickhouse::ClickHouseWriteJob>,
@@ -190,7 +187,6 @@ impl StorageWriter {
 
         // gSFA/gTFA are served from sfa_index + owner_atas; PG write dropped.
 
-        #[cfg(feature = "clickhouse")]
         self.send_to_clickhouse(slot, block);
 
         let _ = self.broadcast_tx.send(WriteToReadMessage::NewBlock {
@@ -203,7 +199,6 @@ impl StorageWriter {
         debug!(slot, elapsed_ms = elapsed.as_millis(), "block persisted");
     }
 
-    #[cfg(feature = "clickhouse")]
     fn send_to_clickhouse(&self, slot: Slot, block: &Arc<BlockWithData>) {
         use super::clickhouse::{
             ClickHouseBlockBatch, ClickHouseWriteJob, Pubkey32, Sig64, TransactionRow,
@@ -231,14 +226,14 @@ impl StorageWriter {
                 .remove(&sig_bytes)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|a| Pubkey32(a.to_vec()))
+                .map(Pubkey32)
                 .collect::<Vec<_>>();
             let addr_count = addresses.len();
             let fee = block.fees.get(idx).copied().unwrap_or(0);
             rows.push(TransactionRow {
                 slot,
                 tx_index: idx as u32,
-                signature: Sig64(sig_bytes.to_vec()),
+                signature: Sig64(sig_bytes),
                 block_time,
                 err: tx.err.is_some(),
                 fee,

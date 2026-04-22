@@ -97,9 +97,11 @@ impl UnifiedRocksDb {
         let path = Path::new(&config.path);
         std::fs::create_dir_all(path).context("creating rocksdb directory")?;
 
-        // Shared block cache across all CFs. 32 GiB: hot blocks + indexes
-        // stay hot in RAM on our 377 GiB host.
-        let cache = Cache::new_lru_cache(32 * 1024 * 1024 * 1024);
+        // Shared block cache across all CFs. 64 GiB on a 377 GiB host with a
+        // 192 GiB cgroup — enough headroom for the 32-shard LRUs + memtables
+        // + page cache. Doubled from 32 GiB to flatten cold-tail latency on
+        // tx_index lookups for never-queried wallets.
+        let cache = Cache::new_lru_cache(64 * 1024 * 1024 * 1024);
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);

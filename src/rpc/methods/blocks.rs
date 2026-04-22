@@ -203,7 +203,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .first()
             .and_then(|v| v.as_u64())
             .ok_or_else(|| err(-32602, "Invalid slot"))?;
-        match ctx.reader.get_block_time(slot) {
+        match ctx.reader.get_block_time(slot).await {
             Ok(Some(t)) => Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(t)),
             Ok(None) => Ok(serde_json::Value::Null),
             Err(e) => Err(err(-32603, &e.to_string())),
@@ -312,6 +312,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let slots = ctx
             .reader
             .get_blocks_in_range(start, end)
+            .await
             .map_err(|e| err(-32603, &e.to_string()))?;
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(slots))
     })?;
@@ -331,6 +332,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let slots = ctx
             .reader
             .get_blocks_in_range(start, end)
+            .await
             .map_err(|e| err(-32603, &e.to_string()))?;
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(slots))
     })?;

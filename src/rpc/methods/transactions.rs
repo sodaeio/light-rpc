@@ -28,7 +28,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         }
 
         let null_raw = || serde_json::value::RawValue::from_string("null".into()).unwrap();
-        match ctx.reader.get_transaction(&sig_bytes) {
+        match ctx.reader.get_transaction(&sig_bytes).await {
             Ok(Some(info)) => {
                 Ok(serde_json::value::to_raw_value(&info).unwrap_or_else(|_| null_raw()))
             }
@@ -59,6 +59,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         match ctx
             .reader
             .get_signatures_for_address(&address, before_slot, limit)
+            .await
         {
             Ok(sigs) => {
                 let finalized = ctx.reader.cache().finalized_slot();
