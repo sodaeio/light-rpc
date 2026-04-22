@@ -57,7 +57,6 @@ pub struct StorageConfig {
     pub pipeline: PipelineConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
-    #[cfg(feature = "clickhouse")]
     #[serde(default)]
     pub clickhouse: Option<crate::storage::clickhouse::ClickHouseConfig>,
 }

@@ -2377,6 +2377,7 @@ dependencies = [
  "richat-proto",
  "rocksdb",
  "serde",
+ "serde-big-array",
  "serde_bytes",
  "serde_json",
  "serde_yaml",

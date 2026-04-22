@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use clickhouse::Client;
 use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -107,7 +108,7 @@ pub struct ClickHouseConfig {
 }
 
 fn default_db() -> String {
-    "light_indexer".to_string()
+    "light_rpc".to_string()
 }
 
 pub struct ClickHouseStore {
@@ -380,7 +381,7 @@ impl ClickHouseStore {
                     verified     Bool
                 ) ENGINE = MergeTree
                 ORDER BY (group_key, group_value, asset_id)
-                SETTINGS index_granularity = 1024
+                SETTINGS index_granularity = 1024, allow_nullable_key = 1
                 "#,
             )
             .execute()
@@ -543,13 +544,16 @@ impl ClickHouseStore {
 // FixedString(N) → Vec<u8> with serde_bytes (serde arrays cap at 32).
 // Writer enforces lengths (32 for pubkeys, 64 for signatures).
 
+// Fixed byte arrays mapped to FixedString(N) columns by the clickhouse-rs
+// 0.15 row derive. Sig64 needs serde-big-array because serde does not derive
+// for arrays larger than 32.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(transparent)]
-pub struct Pubkey32(#[serde(with = "serde_bytes")] pub Vec<u8>);
+pub struct Pubkey32(pub [u8; 32]);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(transparent)]
-pub struct Sig64(#[serde(with = "serde_bytes")] pub Vec<u8>);
+pub struct Sig64(#[serde(with = "BigArray")] pub [u8; 64]);
 
 #[derive(clickhouse::Row, Serialize)]
 pub struct TransactionRow {

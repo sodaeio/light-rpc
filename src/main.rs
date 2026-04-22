@@ -129,7 +129,6 @@ async fn run(config: Config) -> Result<()> {
         broadcast_tx,
     );
 
-    #[cfg(feature = "clickhouse")]
     {
         use light_rpc::storage::clickhouse::{clickhouse_writer_loop, ClickHouseStore};
         if let Some(ch_cfg) = &config.storage.clickhouse {

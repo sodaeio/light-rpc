@@ -1,7 +1,8 @@
 //! ClickHouse read fallback for historical queries.
 //!
 //! When RocksDB misses (data pruned beyond retention window), these
-//! functions query ClickHouse. All behind `#[cfg(feature = "clickhouse")]`.
+//! functions query ClickHouse. Compiled in unconditionally; the live
+//! connection is None when storage.clickhouse is absent from config.
 //!
 //! Tables used:
 //!   transactions    — getTransaction, getBlock

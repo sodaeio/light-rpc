@@ -205,7 +205,6 @@ pub struct StorageReader {
     /// Bounded: prior unbounded DashMap OOM'd under random-key load.
     encoded_account_lru: Vec<EncodedAccountShard>,
     /// ClickHouse client for historical query fallback (rocks miss → CH).
-    #[cfg(feature = "clickhouse")]
     ch_client: Option<clickhouse::Client>,
 }
 
@@ -243,12 +242,10 @@ impl StorageReader {
                     ))
                 })
                 .collect(),
-            #[cfg(feature = "clickhouse")]
             ch_client: None,
         }
     }
 
-    #[cfg(feature = "clickhouse")]
     pub fn with_clickhouse(mut self, client: clickhouse::Client) -> Self {
         self.ch_client = Some(client);
         self
@@ -627,44 +624,29 @@ impl StorageReader {
         self.rocks.first_slot_index().unwrap_or(0)
     }
 
-    pub fn get_blocks_in_range(&self, start: Slot, end: Slot) -> Result<Vec<Slot>> {
-        self.rocks.scan_slot_index_range(start, end)
-    }
-
-    pub async fn get_blocks_in_range_with_fallback(
-        &self,
-        start: Slot,
-        end: Slot,
-    ) -> Result<Vec<Slot>> {
-        // `mut` is only needed under --features clickhouse for the fallback
-        // reassignment; allow it so the no-feature build doesn't warn.
-        #[allow(unused_mut)]
-        let mut slots = self.rocks.scan_slot_index_range(start, end)?;
-        #[cfg(feature = "clickhouse")]
+    /// Slots in [start, end] that we have indexed. Falls through to ClickHouse
+    /// when the local slot_index window is empty (queries past retention).
+    pub async fn get_blocks_in_range(&self, start: Slot, end: Slot) -> Result<Vec<Slot>> {
+        let slots = self.rocks.scan_slot_index_range(start, end)?;
         if slots.is_empty() {
             if let Some(ref ch) = self.ch_client {
-                slots = super::clickhouse_read::get_blocks_in_range(ch, start, end).await?;
+                return super::clickhouse_read::get_blocks_in_range(ch, start, end).await;
             }
         }
         Ok(slots)
     }
 
-    pub fn get_block_time(&self, slot: Slot) -> Result<Option<UnixTimestamp>> {
+    /// Block time for a slot. Memory cache → slot_index → ClickHouse fallback.
+    pub async fn get_block_time(&self, slot: Slot) -> Result<Option<UnixTimestamp>> {
         if let Some(block) = self.cache.get_block(slot) {
             return Ok(block.info.block_time);
         }
         if let Some(data) = self.rocks.get_slot_index(slot)? {
             let info: serde_json::Value = serde_json::from_slice(&data)?;
-            return Ok(info.get("block_time").and_then(|v| v.as_i64()));
+            if let Some(bt) = info.get("block_time").and_then(|v| v.as_i64()) {
+                return Ok(Some(bt));
+            }
         }
-        Ok(None)
-    }
-
-    pub async fn get_block_time_with_fallback(&self, slot: Slot) -> Result<Option<UnixTimestamp>> {
-        if let Some(bt) = self.get_block_time(slot)? {
-            return Ok(Some(bt));
-        }
-        #[cfg(feature = "clickhouse")]
         if let Some(ref ch) = self.ch_client {
             return super::clickhouse_read::get_block_time(ch, slot).await;
         }
@@ -726,7 +708,10 @@ impl StorageReader {
         self.cache.is_blockhash_valid(blockhash)
     }
 
-    pub fn get_transaction(&self, signature: &[u8; 64]) -> Result<Option<serde_json::Value>> {
+    /// tx_cache → tx_index → ClickHouse fallback.
+    /// Hot path is sync-fast (no .await yields); cold path goes async only if
+    /// rocks misses and CH is enabled.
+    pub async fn get_transaction(&self, signature: &[u8; 64]) -> Result<Option<serde_json::Value>> {
         let s = shard_of(signature[0]);
         if let Some(cached) = self.tx_cache[s].lock().get(signature).cloned() {
             return Ok(Some((*cached).clone()));
@@ -738,24 +723,6 @@ impl StorageReader {
                 .put(*signature, Arc::new(decoded.clone()));
             return Ok(Some(decoded));
         }
-        Ok(None)
-    }
-
-    /// getTransaction with ClickHouse fallback for pruned data.
-    pub async fn get_transaction_with_fallback(
-        &self,
-        signature: &[u8; 64],
-    ) -> Result<Option<serde_json::Value>> {
-        // Try RocksDB first (hot path)
-        if let Some(tx) = self.get_transaction(signature)? {
-            return Ok(Some(tx));
-        }
-        // Try memory-cached prebuilt
-        if let Some(raw) = self.get_transaction_prebuilt(signature) {
-            return Ok(Some(serde_json::from_str(raw.get())?));
-        }
-        // ClickHouse fallback (cold path)
-        #[cfg(feature = "clickhouse")]
         if let Some(ref ch) = self.ch_client {
             return super::clickhouse_read::get_transaction(ch, signature).await;
         }
@@ -822,7 +789,9 @@ impl StorageReader {
         Ok(results)
     }
 
-    pub fn get_signatures_for_address(
+    /// sfa_index prefix scan, then ClickHouse appended for older entries
+    /// when the local result is short of `limit` (queries past retention).
+    pub async fn get_signatures_for_address(
         &self,
         address: &solana_pubkey::Pubkey,
         before_slot: Option<Slot>,
@@ -844,21 +813,7 @@ impl StorageReader {
                 }
             }
         }
-        Ok(results)
-    }
 
-    /// gSFA with ClickHouse fallback — if rocks returns fewer than limit,
-    /// query CH for older entries to fill the gap.
-    pub async fn get_signatures_for_address_with_fallback(
-        &self,
-        address: &solana_pubkey::Pubkey,
-        before_slot: Option<Slot>,
-        limit: usize,
-    ) -> Result<Vec<TransactionInfo>> {
-        #[allow(unused_mut)]
-        let mut results = self.get_signatures_for_address(address, before_slot, limit)?;
-
-        #[cfg(feature = "clickhouse")]
         if results.len() < limit {
             if let Some(ref ch) = self.ch_client {
                 let remaining = limit - results.len();
@@ -942,15 +897,27 @@ impl StorageReader {
 
         let finalized = self.cache.finalized_slot();
         let confirmed = self.cache.confirmed_slot();
+
+        // Batch-hydrate in one multi_get_cf round-trip instead of N sequential
+        // point lookups. Keeps a parallel Vec of sig_bytes so we can zip the
+        // results back to the accumulator entries in slot order.
+        let sig_bytes_vec: Vec<[u8; 64]> = all
+            .iter()
+            .filter_map(|(_, sig)| sig.signature.as_ref().try_into().ok())
+            .collect();
+        let hydrated = self.get_transactions_batch(&sig_bytes_vec)?;
+
         let mut results = Vec::with_capacity(all.len());
+        let mut idx = 0;
         for (slot, sig) in all {
-            let sig_bytes: [u8; 64] = match sig.signature.as_ref().try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let tx = self
-                .get_transaction(&sig_bytes)?
+            if <&[u8; 64]>::try_from(sig.signature.as_ref()).is_err() {
+                continue;
+            }
+            let tx = hydrated
+                .get(idx)
+                .and_then(|opt| opt.clone())
                 .unwrap_or(serde_json::Value::Null);
+            idx += 1;
             let status = if slot <= finalized {
                 "finalized"
             } else if slot <= confirmed {
