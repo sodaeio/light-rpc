@@ -1,5 +1,6 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc};
@@ -12,6 +13,25 @@ use super::accounts::AccountProcessor;
 use super::files::BlockFileStorage;
 use super::postgres::PgStorage;
 use super::rocks::UnifiedRocksDb;
+
+/// Throttle corruption-error logs to ~once per 30s. RocksDB MANIFEST may
+/// reference a quarantined SST until a future compaction reorganizes the
+/// affected level; until then every write retries the same dangling
+/// reference, which would otherwise flood the log.
+static LAST_CORRUPTION_LOG: AtomicU64 = AtomicU64::new(0);
+fn should_log_corruption() -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_CORRUPTION_LOG.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 30 {
+        return false;
+    }
+    LAST_CORRUPTION_LOG
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
 
 /// Source →[mpsc]→ StorageWriter →[broadcast]→ StorageReaders.
 pub struct StorageWriter {
@@ -102,7 +122,6 @@ impl StorageWriter {
                     }
                 }
 
-                // Periodic flush for partial account batches
                 _ = tokio::time::sleep(flush_interval) => {
                     if !account_buffer.is_empty()
                         && last_account_flush.elapsed() >= flush_interval
@@ -118,14 +137,12 @@ impl StorageWriter {
     async fn handle_block(&self, slot: Slot, block: &Arc<BlockWithData>) {
         let start = Instant::now();
 
-        // 1. Write encoded block to file storage
         if !block.encoded_block.is_empty() {
             if let Err(e) = self.files.write_block(slot, &block.encoded_block) {
                 error!(slot, error = %e, "failed to write block file");
             }
         }
 
-        // 2. Index slot metadata in RocksDB
         let slot_data = serde_json::to_vec(&serde_json::json!({
             "block_time": block.info.block_time,
             "block_height": block.info.block_height,
@@ -136,15 +153,16 @@ impl StorageWriter {
 
         if let Err(e) = self.rocks.put_slot_index(slot, &slot_data) {
             let s = e.to_string();
-            if self.rocks.try_quarantine_corrupt_sst(&s, "slot_index") {
-                let _ = self.rocks.put_slot_index(slot, &slot_data);
-            } else {
+            if !self.rocks.try_quarantine_corrupt_sst(&s, "slot_index")
+                && should_log_corruption()
+            {
                 error!(slot, error = %s, "failed to write slot index");
             }
         }
 
-        // tx_index value: see rpc::tx_format for the layout.
+        // tx_index value layout: see rpc::tx_format.
         let block_time = block.info.block_time.unwrap_or(0);
+        let mut tx_entries: Vec<([u8; 64], Vec<u8>)> = Vec::with_capacity(block.transactions.len());
         for tx in &block.transactions {
             let err_bytes = tx.err.as_deref().map(|s| s.as_bytes()).unwrap_or(&[]);
             let err_len = err_bytes.len().min(u8::MAX as usize) as u8;
@@ -156,19 +174,19 @@ impl StorageWriter {
             value.extend_from_slice(&err_bytes[..err_len as usize]);
             value.extend_from_slice(&tx.payload);
 
-            let sig_bytes: &[u8; 64] = tx.signature.as_ref().try_into().unwrap_or(&[0u8; 64]);
-            if let Err(e) = self.rocks.put_tx_index(sig_bytes, &value) {
-                let s = e.to_string();
-                if self.rocks.try_quarantine_corrupt_sst(&s, "tx_index") {
-                    let _ = self.rocks.put_tx_index(sig_bytes, &value);
-                } else {
-                    error!(slot, error = %s, "failed to write tx index");
-                }
+            let sig_bytes: [u8; 64] = tx.signature.as_ref().try_into().unwrap_or([0u8; 64]);
+            tx_entries.push((sig_bytes, value));
+        }
+        if let Err(e) = self.rocks.put_tx_index_batch(&tx_entries) {
+            let s = e.to_string();
+            if !self.rocks.try_quarantine_corrupt_sst(&s, "tx_index")
+                && should_log_corruption()
+            {
+                error!(slot, error = %s, "failed to write tx index batch");
             }
         }
 
-        // address → signatures (RocksDB). bincode is ~5× faster than serde_json
-        // to deserialize on read; the value is hot in gSFA / gTFA.
+        // bincode here: ~5× faster to deserialize on the gSFA/gTFA read path.
         let mut sfa_entries = Vec::new();
         for (address, sigs) in &block.address_signatures {
             let data = bincode::serialize(sigs).unwrap_or_default();
@@ -177,15 +195,13 @@ impl StorageWriter {
         if !sfa_entries.is_empty() {
             if let Err(e) = self.rocks.put_sfa_batch(&sfa_entries) {
                 let s = e.to_string();
-                if self.rocks.try_quarantine_corrupt_sst(&s, "sfa_index") {
-                    let _ = self.rocks.put_sfa_batch(&sfa_entries);
-                } else {
+                if !self.rocks.try_quarantine_corrupt_sst(&s, "sfa_index")
+                    && should_log_corruption()
+                {
                     error!(slot, error = %s, "failed to write sfa index");
                 }
             }
         }
-
-        // gSFA/gTFA are served from sfa_index + owner_atas; PG write dropped.
 
         self.send_to_clickhouse(slot, block);
 
@@ -287,8 +303,6 @@ impl StorageWriter {
         let mut ta_updates = Vec::new();
         let mut prog_refs = Vec::new();
 
-        // Classify: mints and token accounts get moved into PG jobs,
-        // program accounts stay as references for RocksDB batch write
         let updates = std::mem::take(buffer);
         for update in &updates {
             match update.classify() {
@@ -298,20 +312,19 @@ impl StorageWriter {
             }
         }
 
-        // Program accounts → RocksDB (fast, local, synchronous)
         if !prog_refs.is_empty() {
             match AccountProcessor::write_program_accounts(&self.rocks, &prog_refs) {
                 Ok(count) => debug!(count, "wrote program accounts to rocksdb"),
                 Err(e) => {
                     let s = e.to_string();
-                    if self.rocks.try_quarantine_corrupt_sst(&s, "program_index") {
-                        // Retry once after quarantine; still log if it fails.
-                        if let Err(e2) =
-                            AccountProcessor::write_program_accounts(&self.rocks, &prog_refs)
-                        {
-                            error!(error = %e2, "failed to write program accounts after self-heal");
-                        }
-                    } else {
+                    // Quarantine on corruption but don't retry — RocksDB's
+                    // compaction may still reference the moved file via its
+                    // MANIFEST until a future compaction re-organizes the
+                    // affected level. Retrying immediately tight-loops on
+                    // the same dangling reference.
+                    if !self.rocks.try_quarantine_corrupt_sst(&s, "program_index")
+                        && should_log_corruption()
+                    {
                         error!(error = %s, "failed to write program accounts");
                     }
                 }
@@ -322,7 +335,6 @@ impl StorageWriter {
                 .send(WriteToReadMessage::AccountsUpdated { pubkeys });
         }
 
-        // Token mints → PG (via bounded channel, non-blocking)
         if !mint_updates.is_empty() {
             for m in &mint_updates {
                 if m.data.len() >= 45 {
@@ -337,11 +349,8 @@ impl StorageWriter {
             let _ = self.pg_tx.try_send(PgWriteJob::TokenMints(owned));
         }
 
-        // Token accounts → PG (via bounded channel, non-blocking)
         if !ta_updates.is_empty() {
-            // Index owner → token_account for gTFA. SPL Token Account layout
-            // puts the owner wallet at bytes [32..64] of account data and the
-            // amount at [64..72] LE.
+            // SPL Token Account layout: owner at [32..64], amount LE at [64..72].
             let mut atas: Vec<([u8; 32], [u8; 32])> = Vec::with_capacity(ta_updates.len());
             let mut by_mint: std::collections::HashMap<[u8; 32], Vec<(u64, [u8; 32])>> =
                 std::collections::HashMap::new();
@@ -363,9 +372,9 @@ impl StorageWriter {
             if !atas.is_empty() {
                 if let Err(e) = self.rocks.put_owner_atas_batch(&atas) {
                     let s = e.to_string();
-                    if self.rocks.try_quarantine_corrupt_sst(&s, "owner_atas") {
-                        let _ = self.rocks.put_owner_atas_batch(&atas);
-                    } else {
+                    if !self.rocks.try_quarantine_corrupt_sst(&s, "owner_atas")
+                        && should_log_corruption()
+                    {
                         error!(error = %s, "failed to write owner_atas");
                     }
                 }
@@ -373,12 +382,11 @@ impl StorageWriter {
             for (mint, updates) in by_mint {
                 if let Err(e) = self.rocks.update_mint_top_holders(&mint, &updates) {
                     let s = e.to_string();
-                    if self
+                    if !self
                         .rocks
                         .try_quarantine_corrupt_sst(&s, "mint_top_holders")
+                        && should_log_corruption()
                     {
-                        let _ = self.rocks.update_mint_top_holders(&mint, &updates);
-                    } else {
                         error!(error = %s, "failed to update mint_top_holders");
                     }
                 }
@@ -393,9 +401,8 @@ impl StorageWriter {
     }
 }
 
-/// Isolated PostgreSQL writer task. Runs on its own, drains PgWriteJob
-/// messages from the bounded channel. If PG is slow, the channel fills
-/// and the write worker drops jobs (accounts are last-write-wins anyway).
+/// PG writer drain loop. Bounded channel; writers drop on overflow since
+/// account writes are last-write-wins.
 pub async fn pg_writer_loop(pg: PgStorage, mut rx: mpsc::Receiver<PgWriteJob>) {
     info!("pg writer started");
 

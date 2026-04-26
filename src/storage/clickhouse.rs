@@ -1,6 +1,5 @@
-//! ClickHouse historical store. Base `transactions` table plus derived
-//! MVs for gSFA / gSFA_hot / sig status, and a direct token-owner table.
-//! Feature-gated behind `clickhouse`.
+//! ClickHouse historical store: base `transactions` table, MVs for
+//! gSFA / gSFA_hot / sig status, and a direct token-owner table.
 
 use anyhow::{Context, Result};
 use clickhouse::Client;
@@ -102,7 +101,7 @@ pub struct ClickHouseConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
-    /// If true, historical reads route to ClickHouse. Writes always dual.
+    /// Route historical reads to ClickHouse. Writes are always dual.
     #[serde(default)]
     pub read_enabled: bool,
 }
@@ -156,9 +155,7 @@ impl ClickHouseStore {
             .execute()
             .await?;
 
-        // Base table: daily partitions, 365d row TTL, 60d column TTL on
-        // wide payloads. Codecs: Delta/T64/DoubleDelta on numerics, ZSTD
-        // on text. Skip indices: bloom on signature, minmax on fee/cu.
+        // 365d row TTL, 60d column TTL on wide payloads.
         self.client
             .query(
                 r#"
@@ -191,8 +188,8 @@ impl ClickHouseStore {
             .execute()
             .await?;
 
-        // gSFA cold MV: (address, slot, tx_index), 365d. index_granularity
-        // = 1024 trades primary-index size for random point-lookup latency.
+        // gSFA cold MV. index_granularity=1024 trades primary-index size for
+        // random point-lookup latency.
         self.client
             .query(
                 r#"
@@ -215,7 +212,6 @@ impl ClickHouseStore {
             .execute()
             .await?;
 
-        // gSFA hot MV: 14d TTL, daily partitions.
         self.client
             .query(
                 r#"
@@ -238,7 +234,6 @@ impl ClickHouseStore {
             .execute()
             .await?;
 
-        // sig status: ReplacingMergeTree(slot) on signature.
         self.client
             .query(
                 r#"
@@ -258,8 +253,8 @@ impl ClickHouseStore {
             .execute()
             .await?;
 
-        // Token-owner -> signatures. Direct writes (not derived — needs
-        // token-account resolution at ingest). Bloom on mint.
+        // Token-owner → signatures. Written directly; the MV path can't see
+        // the owner without joining token-account state.
         self.client
             .query(
                 r#"
@@ -281,8 +276,7 @@ impl ClickHouseStore {
             .execute()
             .await?;
 
-        // Program -> signatures. Populated directly by the ingester;
-        // one row per (program, tx) touch.
+        // Program → signatures: one row per (program, tx) touch.
         self.client
             .query(
                 r#"
@@ -303,12 +297,8 @@ impl ClickHouseStore {
             .execute()
             .await?;
 
-        // DAS migration scaffolding. The intent is that DAS reads
-        // (getAssetsByOwner / byCreator / byGroup / byAuthority, searchAssets)
-        // move off Postgres and serve from these tables. Writes must be
-        // populated either by extending the ingester (when we own the DAS
-        // pipeline) or by a Kafka/CDC stream from the existing DAS indexer.
-
+        // DAS asset tables. Reads currently land on Postgres; these migrate
+        // them to ClickHouse once the write path is wired up.
         self.client
             .query(
                 r#"
@@ -402,7 +392,6 @@ impl ClickHouseStore {
             .execute()
             .await?;
 
-        // Daily program-activity aggregates.
         self.client
             .query(
                 r#"
@@ -541,12 +530,7 @@ impl ClickHouseStore {
     }
 }
 
-// FixedString(N) → Vec<u8> with serde_bytes (serde arrays cap at 32).
-// Writer enforces lengths (32 for pubkeys, 64 for signatures).
-
-// Fixed byte arrays mapped to FixedString(N) columns by the clickhouse-rs
-// 0.15 row derive. Sig64 needs serde-big-array because serde does not derive
-// for arrays larger than 32.
+// Sig64 needs serde-big-array because serde does not derive for arrays > 32.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(transparent)]
 pub struct Pubkey32(pub [u8; 32]);

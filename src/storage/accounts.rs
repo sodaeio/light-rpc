@@ -1,7 +1,6 @@
 use super::rocks::{StoredAccountEntry, UnifiedRocksDb};
 use crate::types::*;
 
-/// Serialized account data stored in RocksDB.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredAccount {
     pub owner: [u8; 32],
@@ -33,11 +32,9 @@ impl StoredAccount {
     }
 }
 
-/// Classify and route account updates to the correct storage backend.
 pub struct AccountProcessor;
 
 impl AccountProcessor {
-    /// Separate a batch of account updates by kind.
     pub fn classify_batch(
         updates: &[AccountUpdate],
     ) -> (
@@ -60,8 +57,7 @@ impl AccountProcessor {
         (mints, token_accounts, program_accounts)
     }
 
-    /// Write program accounts to RocksDB. No read-before-write — the gRPC
-    /// stream delivers accounts in slot order so newer data always wins.
+    /// No read-before-write: stream order guarantees newer data wins.
     pub fn write_program_accounts(
         db: &UnifiedRocksDb,
         accounts: &[&AccountUpdate],

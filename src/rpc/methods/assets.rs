@@ -116,7 +116,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
     module.register_async_method("searchAssets", |params, ctx, _| async move {
         let p: serde_json::Value = params.parse()?;
-        // searchAssets supports ownerAddress, creatorAddress, grouping, etc.
         let page = p.get("page").and_then(|v| v.as_i64()).unwrap_or(1);
         let limit = p.get("limit").and_then(|v| v.as_i64()).unwrap_or(1000);
 
@@ -156,7 +155,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let id_str = p.get("id").and_then(|v| v.as_str()).ok_or_else(|| err(-32602, "Missing 'id'"))?;
         let id_bytes = bs58::decode(id_str).into_vec().map_err(|_| err(-32602, "Invalid id encoding"))?;
 
-        // Query cl_items for merkle proof
         let asset = ctx.reader.pg().get_asset(&id_bytes).await
             .map_err(|e| err(-32603, &e.to_string()))?;
 

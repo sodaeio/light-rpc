@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub type Slot = u64;
 pub type UnixTimestamp = i64;
 
-/// Well-known Solana program IDs (avoids pulling in heavy SPL crates).
+/// Hard-coded program IDs — avoids pulling in the SPL crates.
 pub mod programs {
     use solana_pubkey::Pubkey;
     use std::str::FromStr;
@@ -81,8 +81,8 @@ pub struct TransactionEntry {
     pub err: Option<String>,
     /// prost-encoded SubscribeUpdateTransactionInfo.
     pub payload: bytes::Bytes,
-    /// Agave-shape JSON, pre-built at ingest. Hot-path getTransaction and
-    /// getBlock(full) clone this Arc rather than re-decoding the prost payload.
+    /// Pre-built agave-shape JSON. getTransaction / getBlock(full) clone this
+    /// Arc instead of re-decoding the prost payload.
     pub prebuilt: Arc<Box<serde_json::value::RawValue>>,
 }
 

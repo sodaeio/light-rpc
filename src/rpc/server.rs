@@ -110,8 +110,6 @@ impl RpcServer {
             .allow_headers([axum::http::header::CONTENT_TYPE])
             .allow_origin(Any);
 
-        // Only compress responses big enough that gzip setup isn't net-loss.
-        // Tiny getSlot responses stay uncompressed.
         let compression = CompressionLayer::new()
             .gzip(true)
             .br(true)
@@ -130,9 +128,7 @@ impl RpcServer {
             .parse()
             .context("parsing rpc endpoint address")?;
 
-        // One listener per worker via SO_REUSEPORT. Kernel hashes inbound
-        // connections by 5-tuple so cross-worker accept-queue contention is
-        // gone. Matches the scaling pattern used by nginx/envoy.
+        // SO_REUSEPORT: one listener per worker, kernel sharded by 5-tuple.
         let n_listeners = num_cpus::get().clamp(1, 32);
         info!(%addr, listeners = n_listeners, "rpc server starting");
 
@@ -186,7 +182,6 @@ async fn handle_jsonrpc(
     let method = extract_method(&body).unwrap_or("unknown").to_string();
     metrics::RPC_REQUESTS.with_label_values(&[&method]).inc();
 
-    // Detect batch
     let trimmed = body.trim_start();
     if trimmed.starts_with('[') {
         let requests: Vec<serde_json::Value> = match serde_json::from_str(trimmed) {

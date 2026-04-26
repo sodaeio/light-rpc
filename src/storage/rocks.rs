@@ -2,13 +2,32 @@ use anyhow::{Context, Result};
 use rocksdb::{
     BlockBasedIndexType, BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor,
     DBCompressionType, DBWithThreadMode, MultiThreaded, Options, SliceTransform, WriteBatch,
+    WriteOptions,
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::RocksDbConfig;
 use crate::metrics;
+use crate::source::snapshot::SnapshotAccount;
+use crate::storage::accounts::StoredAccount;
 use crate::types::*;
+
+static SPL_TOKEN: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+    bs58::decode("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        .into_vec()
+        .unwrap()
+        .try_into()
+        .unwrap()
+});
+static SPL_TOKEN_2022: std::sync::LazyLock<[u8; 32]> = std::sync::LazyLock::new(|| {
+    bs58::decode("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+        .into_vec()
+        .unwrap()
+        .try_into()
+        .unwrap()
+});
 
 const CF_SLOT_INDEX: &str = "slot_index";
 const CF_TX_INDEX: &str = "tx_index";
@@ -36,14 +55,11 @@ fn apply_cf_compaction_tuning(opts: &mut Options) {
 
 fn apply_cf_compaction_tuning_with(opts: &mut Options, l0_trigger: i32) {
     opts.set_level_zero_file_num_compaction_trigger(l0_trigger);
-    // Wider headroom so a brief compaction lull doesn't stall writes:
-    //   slowdown at 64 (was 20), stop at 256 (was 36).
-    // With ratelimiter capping write rate anyway, a deeper L0 queue is fine
-    // and avoids the "ingest dies until compaction catches up" failure mode.
-    opts.set_level_zero_slowdown_writes_trigger(64);
-    opts.set_level_zero_stop_writes_trigger(256);
-    // Larger SSTs = fewer files to track, fewer compaction jobs, lower
-    // open-file pressure, and larger sequential reads during compaction.
+    // Generous L0 triggers: cold-start writes ~1B keys at high rate; if we
+    // stall on L0 backlog, the entire tokio runtime can hang waiting on
+    // sync put_cf calls. Compactor catches up post-cold-start.
+    opts.set_level_zero_slowdown_writes_trigger(2000);
+    opts.set_level_zero_stop_writes_trigger(8000);
     opts.set_target_file_size_base(128 * 1024 * 1024);
     opts.set_target_file_size_multiplier(2);
     opts.set_max_bytes_for_level_base(1024 * 1024 * 1024);
@@ -51,9 +67,6 @@ fn apply_cf_compaction_tuning_with(opts: &mut Options, l0_trigger: i32) {
     opts.set_level_compaction_dynamic_level_bytes(true);
     opts.set_bottommost_compression_type(DBCompressionType::Zstd);
     opts.set_bottommost_zstd_max_train_bytes(0, true);
-    // More parallel sub-compactions per L0→L1 job so a 200+ GB backlog
-    // (e.g. post-repair) drains in minutes, not hours.
-    opts.set_max_subcompactions(4);
 }
 
 fn build_block_opts(
@@ -73,7 +86,7 @@ fn build_block_opts(
     bo.set_pin_top_level_index_and_filter(true);
     bo.set_pin_l0_filter_and_index_blocks_in_cache(true);
     if with_bloom {
-        // 15 bits/key: FP ~0.04% vs 0.9% at 10. ~60 bytes/million keys overhead.
+        // 15 bits/key: FP ~0.04% (vs 0.9% at 10).
         bo.set_bloom_filter(15.0, false);
         if prefix_bloom {
             bo.set_whole_key_filtering(false);
@@ -86,9 +99,7 @@ type DB = DBWithThreadMode<MultiThreaded>;
 
 pub struct UnifiedRocksDb {
     db: Arc<DB>,
-    /// Root rocksdb directory — used to relocate corrupt SST files to
-    /// `<root>/quarantine/` so the indexer self-heals on checksum errors
-    /// instead of waiting for an operator to drop a CF or repair the DB.
+    /// Used by the self-heal path to move corrupt SSTs to `<root>/quarantine/`.
     root: std::path::PathBuf,
 }
 
@@ -97,43 +108,63 @@ impl UnifiedRocksDb {
         let path = Path::new(&config.path);
         std::fs::create_dir_all(path).context("creating rocksdb directory")?;
 
-        // Shared block cache across all CFs. 64 GiB on a 377 GiB host with a
-        // 192 GiB cgroup — enough headroom for the 32-shard LRUs + memtables
-        // + page cache. Doubled from 32 GiB to flatten cold-tail latency on
-        // tx_index lookups for never-queried wallets.
+        // Restore any quarantined SSTs back to the DB root. The runtime
+        // self-heal moves corrupt files to quarantine to keep the live
+        // process going, but MANIFEST may still reference them on next
+        // open — so without this the next startup crashloops on the
+        // dangling reference. If a file is still corrupt at read time,
+        // self-heal will quarantine it again during normal operation.
+        let quarantine = path.join("quarantine");
+        if quarantine.exists() {
+            if let Ok(entries) = std::fs::read_dir(&quarantine) {
+                for entry in entries.flatten() {
+                    let from = entry.path();
+                    let Some(name) = from.file_name() else { continue };
+                    let to = path.join(name);
+                    match std::fs::rename(&from, &to) {
+                        Ok(()) => tracing::warn!(file = %from.display(), "restored quarantined SST for DB open"),
+                        Err(e) => tracing::error!(file = %from.display(), error = %e, "failed to restore quarantined SST"),
+                    }
+                }
+            }
+        }
+
+        // 64 GiB shared block cache. Sized for cold tx_index lookups on
+        // never-queried wallets without crowding memtables + page cache.
         let cache = Cache::new_lru_cache(64 * 1024 * 1024 * 1024);
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        // Write buffer tuning: 128 MB × 4. Larger than the original 64×2
-        // for burst ingest headroom, but not 256×8 — bigger memtables
-        // slow range scans (measured gSFA regression at that size).
-        db_opts.set_write_buffer_size(128 * 1024 * 1024);
-        db_opts.set_max_write_buffer_number(4);
+        // 512 MB × 6: large memtables = fewer L0 flushes during cold-start, so
+        // compactor has fewer/larger files to merge. Steady-state RAM ceiling
+        // ~3 GB per active CF. Bigger memtables can regress gSFA range scans
+        // (queries on a CF whose memtable hasn't flushed yet must scan it),
+        // but cold-start dominates ingest cost on this deployment.
+        db_opts.set_write_buffer_size(512 * 1024 * 1024);
+        db_opts.set_max_write_buffer_number(6);
         db_opts.set_max_open_files(config.max_open_files);
         db_opts.set_allow_concurrent_memtable_write(true);
         let parallelism = std::thread::available_parallelism()
             .map(|n| n.get() as i32)
             .unwrap_or(4);
         db_opts.increase_parallelism(parallelism);
-        // Was parallelism.max(4) — too low on a 48-core box. Allow up to 16
-        // background jobs (compactions + flushes) so a write burst can drain
-        // L0 in parallel before it stalls writes.
-        db_opts.set_max_background_jobs(parallelism.clamp(8, 16));
+        // Was clamp(8, 16) — too low: capped total background workers below
+        // (subcompactions × active_cfs), so manual full compaction ran 1-thread.
+        db_opts.set_max_background_jobs(parallelism.max(8));
+        // DBOptions setting (CFOptions value of the same name doesn't reach
+        // the compactor). Splits a single big L0→L1 compaction into N parallel
+        // sub-jobs sharing the per-CF keyspace.
+        db_opts.set_max_subcompactions(parallelism as u32);
         db_opts.set_periodic_compaction_seconds(3600);
 
-        // 200 MB/s — tune up on enterprise SSDs.
-        db_opts.set_ratelimiter(200 * 1024 * 1024, 100_000, 10);
+        // 2 GB/s: NVMe can sustain this; the old 200 MB/s cap throttled
+        // compactor → L0 grew faster than it could drain.
+        db_opts.set_ratelimiter(2 * 1024 * 1024 * 1024, 100_000, 10);
 
-        // Corruption hardening:
-        //   - direct I/O for flush+compaction bypasses the page cache so
-        //     a kernel torn-write can't yield a half-written SST;
-        //   - bytes_per_sync forces periodic fsync during big sequential
-        //     writes, bounding any torn-write blast radius to ~1 MB;
-        //   - paranoid_file_checks validates SST checksums on first read
-        //     so bad blocks surface immediately, not weeks later when a
-        //     compaction stumbles on them.
+        // Direct I/O on flush+compaction bypasses the page cache so a torn
+        // kernel write can't surface a half-written SST. paranoid_file_checks
+        // validates SST checksums on first read.
         db_opts.set_use_direct_io_for_flush_and_compaction(true);
         db_opts.set_bytes_per_sync(1024 * 1024);
         db_opts.set_wal_bytes_per_sync(1024 * 1024);
@@ -161,7 +192,6 @@ impl UnifiedRocksDb {
         let db = DB::open_cf_descriptors(&db_opts, path, cfs)
             .context("opening rocksdb with column families")?;
 
-        // Quarantine directory for corrupt SSTs evicted by self-heal.
         let quarantine = path.join("quarantine");
         if !quarantine.exists() {
             let _ = std::fs::create_dir_all(&quarantine);
@@ -173,19 +203,13 @@ impl UnifiedRocksDb {
         })
     }
 
-    /// Self-heal helper: when a write returns a `Corruption: ... in
-    /// /path/NNNNNN.sst` error, parse the file path out of the message,
-    /// move the SST into `<root>/quarantine/`, and force a compaction on
-    /// the affected CF so RocksDB drops its reference to the dead file.
-    /// The lost keys refill from the gRPC stream over the next few hours
-    /// (program_index / owner_atas) or the next 2 days (tx_index / sfa_index).
-    /// Returns Ok(true) if a file was quarantined, Ok(false) if the error
-    /// wasn't a corruption error we can act on.
+    /// Quarantine a corrupt SST surfaced by `Corruption: ... in /path/N.sst`,
+    /// then force-compact the CF so RocksDB drops its reference. Lost keys
+    /// refill from the stream. Returns true iff a file was quarantined.
     pub fn try_quarantine_corrupt_sst(&self, err: &str, cf_hint: &str) -> bool {
         if !err.contains("Corruption") || !err.contains(".sst") {
             return false;
         }
-        // Match the SST path inside `in /abs/path/NNNNNN.sst offset ...`
         let Some(idx) = err.find(" in ") else {
             return false;
         };
@@ -199,9 +223,12 @@ impl UnifiedRocksDb {
         };
 
         let dest = self.root.join("quarantine").join(file_name);
-        let renamed = match std::fs::rename(&sst_path, &dest) {
+        // Concurrent callers race on the same bad SST. Only the first rename
+        // moves a file; NotFound on subsequent renames means another thread
+        // already quarantined it.
+        let moved_now = match std::fs::rename(&sst_path, &dest) {
             Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true, // already gone
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
             Err(e) => {
                 tracing::error!(file = %sst_path.display(), error = %e,
                     "self-heal: failed to quarantine corrupt SST");
@@ -216,13 +243,10 @@ impl UnifiedRocksDb {
         );
         crate::metrics::ROCKSDB_QUARANTINED.inc();
 
-        // Force-compact the affected CF so RocksDB stops referencing the
-        // removed file. Best-effort; a CF mismatch is fine, RocksDB will
-        // discover the missing file via paranoid_checks on the next access.
         if let Some(cf) = self.db.cf_handle(cf_hint) {
             self.db.compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
         }
-        renamed
+        moved_now
     }
 
     fn slot_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
@@ -237,7 +261,7 @@ impl UnifiedRocksDb {
     fn tx_index_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
         let mut opts = Options::default();
         opts.set_compression_type(DBCompressionType::Lz4);
-        // Write-heavy: keep L0 very thin for read latency.
+        // Thin L0: write-heavy CF served via point lookups.
         apply_cf_compaction_tuning_with(&mut opts, 1);
         let block_opts = build_block_opts(cache, 16 * 1024, true, false);
         opts.set_block_based_table_factory(&block_opts);
@@ -276,9 +300,7 @@ impl UnifiedRocksDb {
     }
 
     fn owner_atas_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
-        // Key [owner(32) | token_account_pubkey(32)] → empty. Prefix scan
-        // by owner to list the owner's token accounts. Same shape as
-        // program_index but keyed on token-account owner.
+        // Key: [owner(32) | token_account(32)] → empty. Prefix scan by owner.
         let mut opts = Options::default();
         opts.set_compression_type(DBCompressionType::Lz4);
         opts.set_prefix_extractor(SliceTransform::create_fixed_prefix(32));
@@ -290,8 +312,8 @@ impl UnifiedRocksDb {
     }
 
     fn mint_top_holders_cf_opts(cache: &Cache) -> ColumnFamilyDescriptor {
-        // Key mint(32) → bincode Vec<(amount u64, pubkey [u8;32])> sorted DESC,
-        // capped at MINT_TOP_HOLDERS_K. Point lookup CF.
+        // Key: mint(32) → bincode Vec<(amount u64, pubkey [u8;32])>, sorted
+        // DESC, capped at MINT_TOP_HOLDERS_K.
         let mut opts = Options::default();
         opts.set_compression_type(DBCompressionType::Lz4);
         apply_cf_compaction_tuning_with(&mut opts, 1);
@@ -303,8 +325,6 @@ impl UnifiedRocksDb {
     fn cf(&self, name: &str) -> Arc<BoundColumnFamily<'_>> {
         self.db.cf_handle(name).expect("column family must exist")
     }
-
-    // --- Block pipeline operations ---
 
     pub fn put_slot_index(&self, slot: Slot, data: &[u8]) -> Result<()> {
         self.db
@@ -350,6 +370,22 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
+    /// Bulk-insert tx_index entries via a single WriteBatch. Per-tx put_cf
+    /// in a loop is the hot path bottleneck — a 5000-tx block becomes one
+    /// batch commit instead of 5000 FFI calls.
+    pub fn put_tx_index_batch(&self, entries: &[([u8; 64], Vec<u8>)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let cf = self.cf(CF_TX_INDEX);
+        let mut batch = WriteBatch::default();
+        for (sig, data) in entries {
+            batch.put_cf(&cf, sig, data);
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
     pub fn get_tx_index(&self, signature: &[u8; 64]) -> Result<Option<Vec<u8>>> {
         Ok(self.db.get_cf(&self.cf(CF_TX_INDEX), signature)?)
     }
@@ -366,8 +402,7 @@ impl UnifiedRocksDb {
             .collect())
     }
 
-    /// Write address → signature entries for a slot.
-    /// Key format: [address(32) | slot(8 BE)]
+    /// Key: [address(32) | slot(8 BE)] → bincode Vec<SignatureEntry>.
     pub fn put_sfa_batch(&self, entries: &[(solana_pubkey::Pubkey, Slot, Vec<u8>)]) -> Result<()> {
         let cf = self.cf(CF_SFA_INDEX);
         let mut batch = WriteBatch::default();
@@ -381,10 +416,9 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Iterate signatures for an address in reverse slot order, counting
-    /// decoded signatures (not slots) toward `limit`. For hot addresses
-    /// like the Token Program a single slot holds hundreds of sigs, so
-    /// the slot-limited variant wastes most of the work.
+    /// Reverse slot scan, counting decoded signatures toward `limit`.
+    /// Hot addresses (Token Program) pack hundreds of sigs per slot, so
+    /// `iter_sfa`'s slot-counted limit wastes most of the work.
     pub fn iter_sfa_limited(
         &self,
         address: &solana_pubkey::Pubkey,
@@ -420,7 +454,6 @@ impl UnifiedRocksDb {
             let remaining = sig_limit - total;
             let take = remaining.min(sigs.len());
             total += take;
-            // Keep only the suffix we need; skip the rest of this slot's blob.
             if take == sigs.len() {
                 results.push((slot, sigs));
             } else {
@@ -431,8 +464,7 @@ impl UnifiedRocksDb {
         Ok(results)
     }
 
-    /// Legacy: returns (slot, raw_bytes) pairs. `sig_limit`-counting variant
-    /// (`iter_sfa_limited`) should be preferred for new code.
+    /// Returns (slot, raw_bytes) pairs. Prefer `iter_sfa_limited`.
     pub fn iter_sfa(
         &self,
         address: &solana_pubkey::Pubkey,
@@ -467,8 +499,6 @@ impl UnifiedRocksDb {
         Ok(results)
     }
 
-    // --- Account pipeline operations ---
-
     pub fn put_account(&self, pubkey: &[u8; 32], data: &[u8]) -> Result<()> {
         self.db.put_cf(&self.cf(CF_ACCOUNTS), pubkey, data)?;
         Ok(())
@@ -489,7 +519,7 @@ impl UnifiedRocksDb {
             .collect()
     }
 
-    /// Store program index entry. Key: [program_id(32) | pubkey(32)] → empty
+    /// Key: [program_id(32) | pubkey(32)] → empty.
     pub fn put_program_index(&self, program_id: &[u8; 32], pubkey: &[u8; 32]) -> Result<()> {
         let mut key = Vec::with_capacity(64);
         key.extend_from_slice(program_id);
@@ -498,7 +528,6 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Record that `pubkey` is a token account owned by `owner`.
     pub fn put_owner_ata(&self, owner: &[u8; 32], pubkey: &[u8; 32]) -> Result<()> {
         let mut key = Vec::with_capacity(64);
         key.extend_from_slice(owner);
@@ -530,9 +559,7 @@ impl UnifiedRocksDb {
         }
     }
 
-    /// Merge `updates` into the per-mint top-K, persist if changed.
-    /// `updates` is `(amount, token_account_pubkey)` for each freshly-written
-    /// token account belonging to `mint`.
+    /// Merge `(amount, token_account)` updates into the per-mint top-K.
     pub fn update_mint_top_holders(
         &self,
         mint: &[u8; 32],
@@ -546,7 +573,6 @@ impl UnifiedRocksDb {
             Some(bytes) => bincode::deserialize(&bytes).unwrap_or_default(),
             None => Vec::new(),
         };
-        // Replace existing entries for the same pubkeys, then add new ones.
         for (amount, pk) in updates {
             current.retain(|(_, existing)| existing != pk);
             if *amount > 0 {
@@ -560,7 +586,101 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// List token account pubkeys owned by `owner` via prefix scan.
+    /// Bulk apply a snapshot batch: writes accounts, program_index, and owner_atas
+    /// in a single WriteBatch with WAL disabled. Per-account RMW for
+    /// mint_top_holders is deferred — token-account (mint, amount, pubkey)
+    /// triples accumulate in `mint_agg`, then `flush_mint_top_holders`
+    /// commits one entry per mint at the end. This collapses ~150M per-account
+    /// read-modify-writes into ~num_unique_mints write-only ops.
+    pub fn apply_snapshot_batch(
+        &self,
+        accounts: &[SnapshotAccount],
+        slot: Slot,
+        mint_agg: &mut HashMap<[u8; 32], Vec<(u64, [u8; 32])>>,
+    ) -> Result<()> {
+        let cf_acc = self.cf(CF_ACCOUNTS);
+        let cf_prog = self.cf(CF_PROGRAM_INDEX);
+        let cf_atas = self.cf(CF_OWNER_ATAS);
+        let mut batch = WriteBatch::default();
+        let mut prog_key = [0u8; 64];
+        let mut ata_key = [0u8; 64];
+
+        for acc in accounts {
+            let stored = StoredAccount {
+                owner: acc.owner,
+                lamports: acc.lamports,
+                data: acc.data.clone(),
+                executable: acc.executable,
+                rent_epoch: acc.rent_epoch,
+                slot,
+            }
+            .serialize();
+            batch.put_cf(&cf_acc, acc.pubkey, stored);
+
+            prog_key[..32].copy_from_slice(&acc.owner);
+            prog_key[32..].copy_from_slice(&acc.pubkey);
+            batch.put_cf(&cf_prog, prog_key, []);
+
+            // SPL Token / Token-2022 account: 165-byte payload, owner is the token program.
+            if acc.data.len() == 165 && (acc.owner == *SPL_TOKEN || acc.owner == *SPL_TOKEN_2022) {
+                let mut owner_pk = [0u8; 32];
+                owner_pk.copy_from_slice(&acc.data[32..64]);
+                ata_key[..32].copy_from_slice(&owner_pk);
+                ata_key[32..].copy_from_slice(&acc.pubkey);
+                batch.put_cf(&cf_atas, ata_key, []);
+
+                let amount = u64::from_le_bytes(acc.data[64..72].try_into().unwrap_or([0; 8]));
+                if amount > 0 {
+                    let mut mint = [0u8; 32];
+                    mint.copy_from_slice(&acc.data[0..32]);
+                    let entry = mint_agg.entry(mint).or_default();
+                    entry.push((amount, acc.pubkey));
+                    // Cap growth at 2K to bound RAM on hot mints; trimmed to top-K below.
+                    if entry.len() >= MINT_TOP_HOLDERS_K * 2 {
+                        entry.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                        entry.truncate(MINT_TOP_HOLDERS_K);
+                    }
+                }
+            }
+        }
+
+        let mut wo = WriteOptions::default();
+        wo.disable_wal(true);
+        self.db.write_opt(batch, &wo)?;
+        Ok(())
+    }
+
+    /// True if the accounts CF has no entries — the canonical "cold-start
+    /// needed" probe. Snapshots populate accounts (and related CFs) but not
+    /// slot_index, so checking slot_index for cold-start would re-trigger
+    /// a full reapply on every restart.
+    pub fn accounts_empty(&self) -> bool {
+        let cf = self.cf(CF_ACCOUNTS);
+        let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
+        iter.next().is_none()
+    }
+
+    /// Flush a per-mint top-K aggregate to RocksDB in a single batch.
+    /// Pair with `apply_snapshot_batch`: call once at end of cold-start.
+    pub fn flush_mint_top_holders(
+        &self,
+        mut agg: HashMap<[u8; 32], Vec<(u64, [u8; 32])>>,
+    ) -> Result<usize> {
+        let cf = self.cf(CF_MINT_TOP_HOLDERS);
+        let mut batch = WriteBatch::default();
+        let count = agg.len();
+        for (mint, holders) in agg.iter_mut() {
+            holders.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            holders.truncate(MINT_TOP_HOLDERS_K);
+            let encoded = bincode::serialize(holders)?;
+            batch.put_cf(&cf, mint, encoded);
+        }
+        let mut wo = WriteOptions::default();
+        wo.disable_wal(true);
+        self.db.write_opt(batch, &wo)?;
+        Ok(count)
+    }
+
     pub fn get_owner_atas(&self, owner: &[u8; 32], cap: usize) -> Result<Vec<[u8; 32]>> {
         let cf = self.cf(CF_OWNER_ATAS);
         let mut iter = self.db.raw_iterator_cf(&cf);
@@ -578,7 +698,6 @@ impl UnifiedRocksDb {
         Ok(out)
     }
 
-    /// Get all accounts owned by a program via prefix scan.
     pub fn get_program_accounts(&self, program_id: &[u8; 32]) -> Result<Vec<([u8; 32], Vec<u8>)>> {
         let cf_prog = self.cf(CF_PROGRAM_INDEX);
         let cf_acct = self.cf(CF_ACCOUNTS);
@@ -616,7 +735,6 @@ impl UnifiedRocksDb {
         Ok(results)
     }
 
-    /// Batch write accounts and their program indexes atomically.
     pub fn write_account_batch(&self, accounts: &[StoredAccountEntry]) -> Result<()> {
         let mut batch = WriteBatch::default();
         let cf_acct = self.cf(CF_ACCOUNTS);
@@ -639,7 +757,6 @@ impl UnifiedRocksDb {
         &self.db
     }
 
-    /// Blocking full-range compaction across all CFs.
     pub fn compact_all(&self) -> Result<()> {
         for name in ALL_CFS {
             let cf = self.cf(name);
@@ -648,8 +765,7 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Delete sfa_index entries older than `cutoff_slot`, walking the CF
-    /// once and issuing one DeleteRange per distinct address.
+    /// One DeleteRange per distinct address; walks the CF once.
     pub fn prune_sfa_before(&self, cutoff_slot: Slot) -> Result<u64> {
         let cf = self.cf(CF_SFA_INDEX);
         let mut iter = self.db.raw_iterator_cf(&cf);
@@ -672,7 +788,6 @@ impl UnifiedRocksDb {
             }
             last_address = Some(address);
 
-            // Range: [address | 0] .. [address | cutoff]
             let mut start = Vec::with_capacity(40);
             start.extend_from_slice(&address);
             start.extend_from_slice(&0u64.to_be_bytes());
@@ -697,7 +812,6 @@ impl UnifiedRocksDb {
         Ok(dropped)
     }
 
-    /// Delete slot_index entries before cutoff_slot.
     pub fn prune_slot_index_before(&self, cutoff_slot: Slot) -> Result<u64> {
         let cf = self.cf(CF_SLOT_INDEX);
         let start = 0u64.to_be_bytes();
@@ -706,9 +820,8 @@ impl UnifiedRocksDb {
         Ok(cutoff_slot)
     }
 
-    /// Delete tx_index entries that reference slots before cutoff_slot.
     /// tx_index key = signature[64], value starts with slot_le(8).
-    /// Full scan required since keys aren't slot-ordered.
+    /// Full scan: keys aren't slot-ordered.
     pub fn prune_tx_index_before(&self, cutoff_slot: Slot) -> Result<u64> {
         let cf = self.cf(CF_TX_INDEX);
         let mut iter = self.db.raw_iterator_cf(&cf);
@@ -724,8 +837,8 @@ impl UnifiedRocksDb {
                 continue;
             };
 
-            // Detect format: JSON backfill always starts `{"`; binary prost
-            // starts with the slot u64 LE whose LSB collides with `{` 1/256.
+            // JSON backfill values start `{"`; prost values start with
+            // slot u64 LE whose LSB collides with `{` once per 256.
             let slot = if value.starts_with(b"{\"") {
                 serde_json::from_slice::<serde_json::Value>(value)
                     .ok()
@@ -740,7 +853,6 @@ impl UnifiedRocksDb {
             if slot < cutoff_slot {
                 batch.delete_cf(&cf, key);
                 dropped += 1;
-                // Flush batch periodically
                 if dropped.is_multiple_of(100_000) {
                     self.db.write(batch)?;
                     batch = rocksdb::WriteBatch::default();
@@ -756,7 +868,6 @@ impl UnifiedRocksDb {
         Ok(dropped)
     }
 
-    /// Estimate total RocksDB data size in bytes.
     pub fn estimated_size_bytes(&self) -> u64 {
         let mut total = 0u64;
         for name in ALL_CFS {

@@ -1,14 +1,4 @@
-//! ClickHouse read fallback for historical queries.
-//!
-//! When RocksDB misses (data pruned beyond retention window), these
-//! functions query ClickHouse. Compiled in unconditionally; the live
-//! connection is None when storage.clickhouse is absent from config.
-//!
-//! Tables used:
-//!   transactions    — getTransaction, getBlock
-//!   gsfa_mv         — getSignaturesForAddress
-//!   gsfa_hot_mv     — getSignaturesForAddress (recent, faster)
-//!   sig_status_mv   — getSignatureStatuses
+//! ClickHouse fallback for queries past the RocksDB retention window.
 
 use anyhow::Result;
 use clickhouse::Client;
@@ -39,7 +29,6 @@ pub struct ChSlot {
     pub slot: u64,
 }
 
-/// Fetch a transaction by signature from ClickHouse.
 pub async fn get_transaction(
     client: &Client,
     signature: &[u8; 64],
@@ -73,7 +62,6 @@ pub async fn get_transaction(
     })))
 }
 
-/// Fetch signatures for an address from ClickHouse gsfa_mv.
 pub async fn get_signatures_for_address(
     client: &Client,
     address: &[u8; 32],
@@ -105,7 +93,6 @@ pub async fn get_signatures_for_address(
     Ok(rows)
 }
 
-/// Fetch block time for a slot from ClickHouse.
 pub async fn get_block_time(client: &Client, slot: Slot) -> Result<Option<i64>> {
     let rows: Vec<ChTransaction> = client
         .query(
@@ -119,7 +106,6 @@ pub async fn get_block_time(client: &Client, slot: Slot) -> Result<Option<i64>> 
     Ok(rows.into_iter().next().map(|r| r.block_time))
 }
 
-/// Fetch slots that have transactions in a range.
 pub async fn get_blocks_in_range(client: &Client, start: Slot, end: Slot) -> Result<Vec<Slot>> {
     let rows: Vec<ChSlot> = client
         .query(

@@ -13,7 +13,6 @@ pub type RpcResult = Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwne
 
 const API_VERSION: &str = "2.2.4";
 
-/// Wrap a value in a Solana-compatible RpcResponse with context
 pub fn rpc_response(slot: u64, value: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "context": { "slot": slot, "apiVersion": API_VERSION },
@@ -44,23 +43,13 @@ pub fn rpc_resp<T: serde::Serialize + Clone>(slot: u64, value: T) -> RpcResp<T> 
     }
 }
 
-/// Build the unified RPC module with all method handlers registered.
 pub fn build_rpc_module(context: RpcContext) -> Result<RpcModule<RpcContext>> {
     let mut module = RpcModule::new(context);
 
-    // Block / history methods (replaces Alpamayo)
     blocks::register(&mut module)?;
-
-    // Transaction methods
     transactions::register(&mut module)?;
-
-    // Account state methods (replaces DAS getAccountInfo/getProgramAccounts)
     accounts::register(&mut module)?;
-
-    // Token methods (replaces DAS getTokenAccounts etc)
     tokens::register(&mut module)?;
-
-    // Asset methods (DAS-specific: getAsset, getAssetsByOwner, etc)
     assets::register(&mut module)?;
 
     tracing::info!(

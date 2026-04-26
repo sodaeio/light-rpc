@@ -18,7 +18,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let owner_bytes = bs58::decode(owner_str)
             .into_vec()
             .map_err(|_| err(-32602, "Invalid encoding"))?;
-        // Second param can be {mint, programId}, third is config with encoding
+        // Second arg may be {mint, programId}; third holds the config object.
         let encoding = p
             .get(2)
             .and_then(|v| v.get("encoding"))

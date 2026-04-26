@@ -1,13 +1,7 @@
 use crate::{Slot, SlotStatus};
 use std::collections::BTreeMap;
 
-/// Tracks commitment progression for all in-flight slots.
-///
-/// Solana commitment levels advance monotonically:
-///   processed → confirmed → finalized (or dead)
-///
-/// This tracker enforces state machine transitions and maintains
-/// the highest slot at each commitment level.
+/// Per-slot commitment state machine: processed → confirmed → finalized (or dead).
 pub struct CommitmentTracker {
     slots: BTreeMap<Slot, SlotStatus>,
     processed: Slot,
@@ -37,7 +31,6 @@ impl CommitmentTracker {
         self.finalized
     }
 
-    /// Record a slot as processed (first seen from the stream).
     pub fn set_processed(&mut self, slot: Slot) {
         self.slots
             .entry(slot)
@@ -47,12 +40,11 @@ impl CommitmentTracker {
         }
     }
 
-    /// Mark a slot as dead (fork discarded by consensus).
     pub fn set_dead(&mut self, slot: Slot) {
         self.slots.insert(slot, SlotStatus::Dead);
     }
 
-    /// Advance a slot to confirmed. Returns true if this is a valid transition.
+    /// Returns false if `slot` is already confirmed/finalized/dead.
     pub fn set_confirmed(&mut self, slot: Slot) -> bool {
         match self.slots.get(&slot) {
             Some(SlotStatus::Confirmed | SlotStatus::Finalized) => return false,
@@ -66,7 +58,7 @@ impl CommitmentTracker {
         true
     }
 
-    /// Advance a slot to finalized. Returns true if this is a valid transition.
+    /// Returns false if `slot` is already finalized or dead.
     pub fn set_finalized(&mut self, slot: Slot) -> bool {
         match self.slots.get(&slot) {
             Some(SlotStatus::Finalized) => return false,
@@ -85,7 +77,6 @@ impl CommitmentTracker {
         self.slots.get(&slot).copied()
     }
 
-    /// Remove all tracked slots below the finalized watermark.
     fn gc(&mut self) {
         if self.finalized > 0 {
             self.slots = self.slots.split_off(&self.finalized);

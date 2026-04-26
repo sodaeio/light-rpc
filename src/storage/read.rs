@@ -24,16 +24,15 @@ fn shard_of(key_byte: u8) -> usize {
 
 pub struct MemoryCache {
     blocks: RwLock<BTreeMap<Slot, Arc<BlockWithData>>>,
-    /// arc_swap of an immutable BTreeMap. Reads are wait-free pointer loads.
-    /// Writers RCU-clone the map, mutate, and atomically swap.
+    /// RCU pattern: writers clone, mutate, swap; reads are wait-free.
     recent_blockhashes: arc_swap::ArcSwap<BTreeMap<Slot, Arc<str>>>,
-    /// signature → (slot, tx index within block). Lets getTransaction hit the
-    /// memory-cached block's pre-built RawValue without touching RocksDB.
+    /// sig → (slot, tx index). Routes getTransaction to the cached block's
+    /// pre-built RawValue without touching RocksDB.
     sig_index: dashmap::DashMap<[u8; 64], (Slot, u32)>,
     processed_slot: AtomicU64,
     confirmed_slot: AtomicU64,
     finalized_slot: AtomicU64,
-    /// Unix timestamp (seconds) of the most recent finalized-slot update.
+    /// Unix-seconds timestamp of the last finalized-slot update.
     finalized_slot_updated_at: AtomicU64,
 }
 
@@ -108,8 +107,7 @@ impl MemoryCache {
         self.recent_blockhashes.load().get(&slot).cloned()
     }
 
-    /// Most recent blockhash at or below `slot`. Needed by getLatestBlockhash
-    /// when the commitment slot was skipped (no block produced that slot).
+    /// Most recent blockhash at or below `slot`. Handles skipped slots in gLBH.
     pub fn get_blockhash_at_or_below(&self, slot: Slot) -> Option<(Arc<str>, Slot)> {
         self.recent_blockhashes
             .load()
@@ -188,11 +186,8 @@ impl Default for MemoryCache {
 type EncodedAccountShard =
     parking_lot::Mutex<lru::LruCache<([u8; 32], u8), Arc<Box<serde_json::value::RawValue>>>>;
 
-/// Unified storage reader. Each method picks the optimal storage path internally:
-///   - Memory cache for recent blocks/slots
-///   - RocksDB for account point lookups and block indexes
-///   - PostgreSQL for token queries, program accounts, and DAS assets
-///   - Block files for historical block data
+/// Routes each query through the appropriate backend (memory cache, RocksDB,
+/// PostgreSQL, block files, ClickHouse).
 pub struct StorageReader {
     cache: Arc<MemoryCache>,
     rocks: UnifiedRocksDb,
@@ -202,9 +197,8 @@ pub struct StorageReader {
     mint_meta_cache: dashmap::DashMap<[u8; 32], (i32, u64)>,
     account_lru:
         Vec<parking_lot::Mutex<lru::LruCache<[u8; 32], Arc<super::accounts::StoredAccount>>>>,
-    /// Bounded: prior unbounded DashMap OOM'd under random-key load.
+    /// Bounded LRU; an unbounded map OOMs under random-key load.
     encoded_account_lru: Vec<EncodedAccountShard>,
-    /// ClickHouse client for historical query fallback (rocks miss → CH).
     ch_client: Option<clickhouse::Client>,
 }
 
@@ -323,8 +317,6 @@ impl StorageReader {
         }
     }
 
-    // -- Private helpers (RocksDB point lookups) --
-
     fn rocks_get_account(&self, pubkey: &[u8; 32]) -> Option<StoredAccount> {
         let s = shard_of(pubkey[0]);
         if let Some(arc) = self.account_lru[s].lock().get(pubkey).cloned() {
@@ -346,8 +338,7 @@ impl StorageReader {
         match encoding {
             "base58" => serde_json::json!([bs58::encode(data).into_string(), "base58"]),
             "base64+zstd" => {
-                // Skip zstd for small payloads — the compression overhead
-                // dwarfs any size win and bloats compressed bytes slightly.
+                // Below 5 KiB zstd overhead exceeds the size win.
                 if data.len() < 5000 {
                     serde_json::json!([base64_simd::STANDARD.encode_to_string(data), "base64"])
                 } else {
@@ -365,7 +356,6 @@ impl StorageReader {
     fn account_to_json(account: &StoredAccount, encoding: &str) -> serde_json::Value {
         let owner_str = bs58::encode(&account.owner).into_string();
 
-        // jsonParsed: attempt to parse known program data
         if encoding == "jsonParsed" {
             if let Some(parsed) = Self::try_parse_account(account, &owner_str) {
                 return serde_json::json!({
@@ -377,7 +367,7 @@ impl StorageReader {
                     "space": account.data.len(),
                 });
             }
-            // Fall through to base64 if parsing fails
+            // Fall through to base64.
         }
 
         serde_json::json!({
@@ -390,7 +380,7 @@ impl StorageReader {
         })
     }
 
-    /// Try to parse known account types (SPL Token mint/account) into jsonParsed format.
+    /// jsonParsed support for SPL Token mints and accounts.
     fn try_parse_account(account: &StoredAccount, owner: &str) -> Option<serde_json::Value> {
         let is_token_program = owner == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
             || owner == "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
@@ -406,7 +396,6 @@ impl StorageReader {
             "spl-token-2022"
         };
 
-        // SPL Token Account (165 bytes)
         if data.len() == 165 {
             let mint = bs58::encode(&data[0..32]).into_string();
             let acct_owner = bs58::encode(&data[32..64]).into_string();
@@ -446,7 +435,6 @@ impl StorageReader {
             }));
         }
 
-        // SPL Token Mint (82 bytes)
         if data.len() == 82 {
             let has_mint_authority = data[0] == 1;
             let mint_authority = if has_mint_authority {
@@ -483,33 +471,23 @@ impl StorageReader {
         None
     }
 
-    /// Reconstruct 165-byte SPL token account binary from parsed PG fields.
+    /// Rebuild the 165-byte SPL token-account binary from parsed PG columns.
     fn reconstruct_token_account_data(row: &super::postgres::TokenAccountRow) -> Vec<u8> {
         let mut data = vec![0u8; 165];
-        // mint (0..32)
         let mint_len = row.mint.len().min(32);
         data[..mint_len].copy_from_slice(&row.mint[..mint_len]);
-        // owner (32..64)
         let owner_len = row.owner.len().min(32);
         data[32..32 + owner_len].copy_from_slice(&row.owner[..owner_len]);
-        // amount (64..72)
         data[64..72].copy_from_slice(&(row.amount as u64).to_le_bytes());
-        // delegate COption (72..108)
         if let Some(ref delegate) = row.delegate {
             data[72..76].copy_from_slice(&1u32.to_le_bytes());
             let d_len = delegate.len().min(32);
             data[76..76 + d_len].copy_from_slice(&delegate[..d_len]);
         }
-        // state (108)
         data[108] = if row.frozen { 2 } else { 1 };
-        // is_native COption (109..121) — 0 = not native
-        // delegated_amount (121..129) — only if delegate present
-        // close_authority COption (129..165) — skip
         data
     }
 
-    /// Format token account as Solana-compatible RpcKeyedAccount.
-    /// Supports all encoding formats just like agave.
     fn token_account_to_json(
         row: &super::postgres::TokenAccountRow,
         encoding: &str,
@@ -608,8 +586,6 @@ impl StorageReader {
         })
     }
 
-    // -- Public API: Block / History --
-
     pub fn get_slot(&self, commitment: Commitment) -> Slot {
         match commitment {
             Commitment::Processed => self.cache.processed_slot(),
@@ -618,14 +594,11 @@ impl StorageReader {
         }
     }
 
-    /// Cheap path for getBlockTime: hit memory first, else read `slot_index`
-    /// CF directly — no block file load, no tx decode.
     pub fn get_first_available_slot(&self) -> Slot {
         self.rocks.first_slot_index().unwrap_or(0)
     }
 
-    /// Slots in [start, end] that we have indexed. Falls through to ClickHouse
-    /// when the local slot_index window is empty (queries past retention).
+    /// Falls through to ClickHouse when the local slot_index window misses.
     pub async fn get_blocks_in_range(&self, start: Slot, end: Slot) -> Result<Vec<Slot>> {
         let slots = self.rocks.scan_slot_index_range(start, end)?;
         if slots.is_empty() {
@@ -636,7 +609,6 @@ impl StorageReader {
         Ok(slots)
     }
 
-    /// Block time for a slot. Memory cache → slot_index → ClickHouse fallback.
     pub async fn get_block_time(&self, slot: Slot) -> Result<Option<UnixTimestamp>> {
         if let Some(block) = self.cache.get_block(slot) {
             return Ok(block.info.block_time);
@@ -694,13 +666,10 @@ impl StorageReader {
 
     pub fn get_latest_blockhash(&self, commitment: Commitment) -> Option<(Arc<str>, Slot)> {
         let slot = self.get_slot(commitment);
-        // Exact match first.
         if let Some(h) = self.cache.get_blockhash(slot) {
             return Some((h, slot));
         }
-        // Fall back to the most recent blockhash at or below `slot` — handles
-        // the common case where the commitment slot was skipped and no block
-        // was produced. Without this, gLBH spuriously errors on skips.
+        // Skipped commitment slot: fall back to most recent blockhash ≤ slot.
         self.cache.get_blockhash_at_or_below(slot)
     }
 
@@ -708,9 +677,8 @@ impl StorageReader {
         self.cache.is_blockhash_valid(blockhash)
     }
 
-    /// tx_cache → tx_index → ClickHouse fallback.
-    /// Hot path is sync-fast (no .await yields); cold path goes async only if
-    /// rocks misses and CH is enabled.
+    /// tx_cache → tx_index → ClickHouse. Hot path stays sync; the cold path
+    /// goes async only on rocks miss with CH configured.
     pub async fn get_transaction(&self, signature: &[u8; 64]) -> Result<Option<serde_json::Value>> {
         let s = shard_of(signature[0]);
         if let Some(cached) = self.tx_cache[s].lock().get(signature).cloned() {
@@ -729,9 +697,8 @@ impl StorageReader {
         Ok(None)
     }
 
-    /// Hot-path getTransaction via the memory-cached pre-built RawValue.
-    /// Splices `slot` + `blockTime` into the block-shape prebuilt bytes at
-    /// response time — no re-decode, no Value tree allocation.
+    /// Hot-path getTransaction. Splices slot + blockTime into the cached
+    /// prebuilt bytes; no re-decode, no Value allocation.
     pub fn get_transaction_prebuilt(
         &self,
         signature: &[u8; 64],
@@ -789,8 +756,8 @@ impl StorageReader {
         Ok(results)
     }
 
-    /// sfa_index prefix scan, then ClickHouse appended for older entries
-    /// when the local result is short of `limit` (queries past retention).
+    /// sfa_index prefix scan; ClickHouse fills the tail when local results
+    /// fall short of `limit`.
     pub async fn get_signatures_for_address(
         &self,
         address: &solana_pubkey::Pubkey,
@@ -845,11 +812,7 @@ impl StorageReader {
         Ok(results)
     }
 
-    /// gTFA served entirely from RocksDB:
-    ///   1. prefix-scan owner_atas → token account pubkeys
-    ///   2. iter_sfa each address (owner + ATAs) with a per-iter cap of `limit`
-    ///   3. sort-merge by slot DESC, truncate to `limit`
-    ///   4. hydrate each signature via tx_index
+    /// Bound on token accounts considered per gTFA call.
     const GTFA_ATA_CAP: usize = 2048;
 
     pub async fn get_transactions_for_address(
@@ -866,9 +829,7 @@ impl StorageReader {
         let atas = self.rocks.get_owner_atas(&owner_key, Self::GTFA_ATA_CAP)?;
         let addresses: Vec<[u8; 32]> = std::iter::once(owner_key).chain(atas).collect();
 
-        // For whale scale (up to ~2k addresses), do per-address iter_sfa in
-        // parallel on the blocking pool. Each task is a short RocksDB prefix
-        // scan; fan-out cuts wall time ~N× up to `max_blocking_threads`.
+        // Fan out per-address iter_sfa onto the blocking pool.
         let mut handles = Vec::with_capacity(addresses.len());
         for addr in addresses.iter().copied() {
             let rocks = self.rocks.clone();
@@ -898,9 +859,7 @@ impl StorageReader {
         let finalized = self.cache.finalized_slot();
         let confirmed = self.cache.confirmed_slot();
 
-        // Batch-hydrate in one multi_get_cf round-trip instead of N sequential
-        // point lookups. Keeps a parallel Vec of sig_bytes so we can zip the
-        // results back to the accumulator entries in slot order.
+        // One multi_get_cf round-trip; results zip back in slot order.
         let sig_bytes_vec: Vec<[u8; 64]> = all
             .iter()
             .filter_map(|(_, sig)| sig.signature.as_ref().try_into().ok())
@@ -936,26 +895,19 @@ impl StorageReader {
         Ok(results)
     }
 
-    // -- Public API: Account State --
-    // RocksDB first for point lookups, PG fallback for program scans
-
     pub async fn get_account_info(
         &self,
         pubkey: &[u8; 32],
         encoding: &str,
     ) -> Result<Option<serde_json::Value>> {
-        // Native program / sysvar registry (System, Vote, Stake, etc.)
-        // These never flow through the gRPC stream.
         if let Some(stored) = super::native::lookup(pubkey) {
             return Ok(Some(Self::account_to_json(&stored, encoding)));
         }
 
-        // RocksDB first (fast point lookup)
         if let Some(stored) = self.rocks_get_account(pubkey) {
             return Ok(Some(Self::account_to_json(&stored, encoding)));
         }
 
-        // PG program_accounts table
         if let Some(row) = self.pg.get_program_account_by_pubkey(pubkey).await? {
             let stored = StoredAccount {
                 owner: row.owner.try_into().unwrap_or([0u8; 32]),
@@ -968,22 +920,21 @@ impl StorageReader {
             return Ok(Some(Self::account_to_json(&stored, encoding)));
         }
 
-        // PG tokens table (SPL token mints are stored here, not in program_accounts)
+        // SPL mints live in `tokens`, not `program_accounts`.
         if let Some(mint_row) = self.pg.get_token_mint(pubkey).await? {
             let supply = mint_row.supply.to_string().parse::<u64>().unwrap_or(0);
             let mut data = vec![0u8; 82];
-            // Reconstruct SPL mint binary layout from parsed fields
             if let Some(ref auth) = mint_row.mint_authority {
-                data[0] = 1; // COption::Some
+                data[0] = 1;
                 if auth.len() == 32 {
                     data[4..36].copy_from_slice(auth);
                 }
             }
             data[36..44].copy_from_slice(&supply.to_le_bytes());
             data[44] = mint_row.decimals as u8;
-            data[45] = 1; // is_initialized
+            data[45] = 1;
             if let Some(ref freeze) = mint_row.freeze_authority {
-                data[46] = 1; // COption::Some
+                data[46] = 1;
                 if freeze.len() == 32 {
                     data[50..82].copy_from_slice(freeze);
                 }
@@ -991,7 +942,7 @@ impl StorageReader {
 
             let stored = StoredAccount {
                 owner: mint_row.token_program.try_into().unwrap_or([0u8; 32]),
-                lamports: 496630637030, // typical rent-exempt for mint
+                lamports: 496630637030,
                 data,
                 executable: false,
                 rent_epoch: u64::MAX,
@@ -1003,7 +954,7 @@ impl StorageReader {
         Ok(None)
     }
 
-    /// Pre-serialized variant — jsonrpsee emits the `RawValue` verbatim.
+    /// Pre-serialized variant; jsonrpsee emits the RawValue verbatim.
     pub async fn get_account_info_raw(
         &self,
         pubkey: &[u8; 32],
@@ -1037,8 +988,6 @@ impl StorageReader {
         pubkeys: &[[u8; 32]],
         encoding: &str,
     ) -> Vec<Option<serde_json::Value>> {
-        // Split into three populations: native-registry hits (free),
-        // rocksdb batch hits (one multi_get round-trip), and PG fallbacks.
         let mut results: Vec<Option<serde_json::Value>> = vec![None; pubkeys.len()];
         let mut rocks_idx: Vec<usize> = Vec::with_capacity(pubkeys.len());
 
@@ -1108,8 +1057,6 @@ impl StorageReader {
             .collect())
     }
 
-    // -- Public API: Tokens (PostgreSQL) --
-
     pub async fn get_token_accounts_by_owner(
         &self,
         owner: &[u8],
@@ -1121,8 +1068,7 @@ impl StorageReader {
         };
 
         // RocksDB-first: prefix-scan owner_atas, batch-fetch accounts,
-        // parse the SPL token layout inline. No PG round-trip on the
-        // hot path.
+        // parse the SPL layout inline.
         let atas = self.rocks.get_owner_atas(&owner_key, 10_000)?;
         if !atas.is_empty() {
             let bytes = self.rocks.get_accounts_batch(&atas);
@@ -1144,7 +1090,7 @@ impl StorageReader {
             }
         }
 
-        // Fallback: fresh deployment with owner_atas unpopulated.
+        // Fallback for fresh deployments with owner_atas unpopulated.
         let rows = self.pg.get_token_accounts_by_owner(owner).await?;
         Ok(rows
             .iter()
@@ -1247,8 +1193,7 @@ impl StorageReader {
         };
         let decimals = self.mint_decimals_cached(&mint_key, mint).await;
         let mut holders = self.rocks.get_mint_top_holders(&mint_key)?;
-        // Empty top-holders means we haven't seen any token account writes for
-        // this mint yet — fall back to PG until ingest backfills.
+        // Empty result = mint hasn't seen a TA write yet; fall back to PG.
         if holders.is_empty() {
             let rows = self.pg.get_token_largest_accounts(mint, limit).await?;
             return Ok(rows
@@ -1284,9 +1229,7 @@ impl StorageReader {
     }
 
     fn mint_meta_put(&self, mint: [u8; 32], decimals: i32, slot: u64) {
-        // Bound the mint meta cache at 200k entries (~5 MB). Past that, drop
-        // half on insert — typical hot set is <10k, cold entries are cheap
-        // to re-fetch from PG.
+        // Cap at 200k entries; halve on overflow.
         if self.mint_meta_cache.len() >= 200_000 {
             let victims: Vec<[u8; 32]> = self
                 .mint_meta_cache
@@ -1315,8 +1258,6 @@ impl StorageReader {
             "uiAmountString": format!("{ui_amount}"),
         })
     }
-
-    // -- Public API: DAS Assets (PostgreSQL) --
 
     pub async fn get_asset(&self, id: &[u8]) -> Result<Option<serde_json::Value>> {
         let asset = match self.pg.get_asset(id).await? {

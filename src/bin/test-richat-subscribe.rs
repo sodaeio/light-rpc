@@ -1,12 +1,8 @@
-//! Standalone richat subscribe probe.
-//!
-//! Mirrors light-indexer's subscribe_richat call exactly. Useful for
-//! diagnosing whether the issue is in light-indexer or upstream richat
-//! when the indexer's stream times out at 90s with no data.
+//! Standalone richat subscribe probe — mirrors the indexer's subscribe call
+//! to isolate whether stream stalls originate locally or upstream.
 //!
 //! Usage:
-//!     cargo run --release --bin test-richat-subscribe -- http://45.154.33.73:10100
-//!     cargo run --release --bin test-richat-subscribe -- http://127.0.0.1:10200 --duration 30
+//!     cargo run --release --bin test-richat-subscribe -- <endpoint> [--duration N]
 
 use std::time::{Duration, Instant};
 
@@ -22,7 +18,7 @@ async fn main() -> Result<()> {
     let endpoint = args
         .get(1)
         .cloned()
-        .unwrap_or_else(|| "http://45.154.33.73:10100".to_string());
+        .unwrap_or_else(|| "http://127.0.0.1:10100".to_string());
     let duration_secs: u64 = args
         .iter()
         .position(|a| a == "--duration")
@@ -152,8 +148,7 @@ async fn main() -> Result<()> {
     println!("by kind:         {by_kind:?}");
     if total == 0 && first_msg_at.is_none() {
         println!();
-        println!("⚠️  ZERO messages received during the entire window.");
-        println!("    light-indexer would also see this (90s timeout → reconnect loop).");
+        println!("ZERO messages received during the entire window.");
     }
     Ok(())
 }

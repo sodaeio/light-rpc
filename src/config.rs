@@ -20,11 +20,22 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SourceConfig {
-    /// Primary gRPC endpoint.
-    pub endpoint: String,
+    /// Primary gRPC endpoint. Required unless `quic` is set.
+    #[serde(default)]
+    pub endpoint: Option<String>,
     /// Fallback gRPC endpoints. Tried in order when primary fails.
+    /// gRPC only — ignored when `quic` is set.
     #[serde(default)]
     pub fallback_endpoints: Vec<String>,
+    /// QUIC firehose source. When set, gRPC `endpoint`/`fallback_endpoints`
+    /// are ignored. Field shape mirrors sesame leaf's `client:` block.
+    #[serde(default)]
+    pub quic: Option<richat_client::quic::ConfigQuicClient>,
+    /// gRPC subscribe protocol. "yellowstone" = Dragon's Mouth (default,
+    /// works with sesame leaves). "richat" = native richat protocol (use
+    /// only when connecting to a richat-native server, e.g. richat-plugin-agave).
+    #[serde(default)]
+    pub grpc_mode: GrpcMode,
     pub x_token: Option<String>,
     #[serde(default)]
     pub commitment: Commitment,
@@ -39,6 +50,14 @@ pub struct SourceConfig {
     /// Local directory containing Solana snapshot files for account state recovery.
     #[serde(default = "default_snapshot_dir")]
     pub snapshot_dir: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GrpcMode {
+    #[default]
+    Yellowstone,
+    Richat,
 }
 
 fn default_gap_threshold() -> u64 {
@@ -61,9 +80,9 @@ pub struct StorageConfig {
     pub clickhouse: Option<crate::storage::clickhouse::ClickHouseConfig>,
 }
 
-/// Controls how long historical data is kept. Pruning runs every 10 min.
-/// Account state (accounts, owner_atas, program_index, mint_top_holders)
-/// is always kept — those are current state, not history.
+/// History retention. Pruning runs every 10 min.
+/// Account-state CFs (accounts, owner_atas, program_index, mint_top_holders)
+/// are never pruned.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetentionConfig {
     /// Max days to keep slot_index entries. 0 = keep forever.
@@ -264,6 +283,13 @@ impl ThreadConfig {
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let config: Config = Figment::new().merge(Yaml::file(path)).extract()?;
+        match (&config.source.endpoint, &config.source.quic) {
+            (None, None) => anyhow::bail!("source: must set either `endpoint` (gRPC) or `quic`"),
+            (Some(_), Some(_)) => {
+                anyhow::bail!("source: set only one of `endpoint` (gRPC) or `quic`, not both")
+            }
+            _ => {}
+        }
         Ok(config)
     }
 }

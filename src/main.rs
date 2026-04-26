@@ -146,27 +146,37 @@ async fn run(config: Config) -> Result<()> {
         }
     }
 
-    tokio::spawn(async move {
-        if let Err(e) = writer.run(source_rx).await {
-            error!(error = %e, "storage writer failed");
-        }
-    });
+    // Writer runs on its own OS thread + single-thread runtime. Its put_cf
+    // calls are synchronous and block when RocksDB throttles writes; running
+    // on a dedicated thread keeps that blocking off the main worker pool, so
+    // the source/RPC tasks aren't starved while compaction is heavy.
+    std::thread::Builder::new()
+        .name("li-writer".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("writer runtime");
+            rt.block_on(async move {
+                if let Err(e) = writer.run(source_rx).await {
+                    error!(error = %e, "storage writer failed");
+                }
+            });
+        })
+        .expect("spawn writer thread");
 
-    // Cold-start: if RocksDB is empty and snapshot recovery is configured,
-    // load a full snapshot so account-state queries work from first request.
-    let rocks_for_source = rocks.clone();
-    if rocks.first_slot_index().is_none() {
+    if rocks.accounts_empty() {
         let snap_dir = &config.source.snapshot_dir;
-        info!("empty database — attempting cold-start snapshot load from {snap_dir}");
+        info!("empty database, attempting cold-start snapshot load from {snap_dir}");
         match cold_start_snapshot(snap_dir, &rocks).await {
             Ok((slot, count)) => info!(slot, accounts = count, "cold-start snapshot loaded"),
             Err(e) => {
-                warn!(error = %e, "cold-start snapshot failed (no files?), starting from stream")
+                warn!(error = %e, "cold-start snapshot failed, starting from stream")
             }
         }
     }
 
-    let source = StreamSource::new(config.source, source_tx).with_rocks(rocks_for_source);
+    let source = StreamSource::new(config.source, source_tx);
     tokio::spawn(async move {
         if let Err(e) = source.run().await {
             error!(error = %e, "stream source failed");
@@ -188,25 +198,17 @@ async fn run(config: Config) -> Result<()> {
     server.run().await.context("rpc server failed")
 }
 
-/// Cold-start: download full snapshot, stream-parse AppendVec accounts,
-/// batch-write to all RocksDB CFs. ~30-60 min for 200M mainnet accounts.
+/// Stream-parses AppendVec accounts from the latest local snapshot set
+/// (full + optional matching incremental) into every RocksDB CF.
+/// Auto-compactions run concurrent with the apply — RocksDB is tuned
+/// (large memtables, generous L0 stop_trigger) so writes never stall.
 async fn cold_start_snapshot(snapshot_dir: &str, rocks: &UnifiedRocksDb) -> Result<(u64, usize)> {
     use light_rpc::source::snapshot;
 
     let dir = std::path::Path::new(snapshot_dir);
-    let info = snapshot::find_latest_snapshot(dir)?;
-    let slot = info.slot;
-
-    info!(slot, path = %info.path.display(), "parsing snapshot for cold start");
-
-    let path = info.path.clone();
-    let accounts =
-        tokio::task::spawn_blocking(move || snapshot::parse_snapshot_accounts(&path)).await??;
-
-    info!(total = accounts.len(), "applying snapshot to rocksdb");
-    let applied = snapshot::apply_snapshot_to_rocks(rocks, &accounts, slot)?;
-
-    Ok((slot, applied))
+    let set = snapshot::find_latest_snapshot(dir)?;
+    let rocks = rocks.clone();
+    tokio::task::spawn_blocking(move || snapshot::apply_snapshot_set(&rocks, &set)).await?
 }
 
 async fn run_retention_loop(
@@ -218,7 +220,6 @@ async fn run_retention_loop(
 ) {
     use std::time::Duration;
 
-    // Wait for first finalized slot
     loop {
         if cache.finalized_slot() > 0 {
             break;
@@ -228,7 +229,7 @@ async fn run_retention_loop(
 
     let interval_secs = retention.prune_interval_secs.max(60);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-    let slots_per_day: u64 = 216_000; // ~2.5 slots/s × 86400
+    let slots_per_day: u64 = 216_000;
 
     loop {
         ticker.tick().await;
@@ -237,7 +238,6 @@ async fn run_retention_loop(
             continue;
         }
 
-        // PG partitions (existing logic)
         match pg.ensure_address_partitions(current, 4).await {
             Ok(_) => {}
             Err(e) => error!(error = %e, "failed to ensure partitions"),
@@ -252,7 +252,6 @@ async fn run_retention_loop(
             }
         }
 
-        // sfa_index retention
         if retention.sfa_index_days > 0 {
             let cutoff = current.saturating_sub(retention.sfa_index_days * slots_per_day);
             if cutoff > 0 {
@@ -273,25 +272,32 @@ async fn run_retention_loop(
             }
         }
 
-        // slot_index retention
         if retention.slot_index_days > 0 {
             let cutoff = current.saturating_sub(retention.slot_index_days * slots_per_day);
             if cutoff > 0 {
                 let r = rocks.clone();
-                let _ =
-                    tokio::task::spawn_blocking(move || match r.prune_slot_index_before(cutoff) {
+                let _ = tokio::task::spawn_blocking(move || {
+                    match r.prune_slot_index_before(cutoff) {
                         Ok(_) => info!(
                             cutoff,
                             days = retention.slot_index_days,
                             "pruned slot_index"
                         ),
-                        Err(e) => error!(error = %e, "slot_index prune failed"),
-                    })
-                    .await;
+                        Err(e) => {
+                            // Quarantine on corruption; suppress the noisy
+                            // log on subsequent prunes hitting the same
+                            // dangling MANIFEST reference.
+                            let s = e.to_string();
+                            if !r.try_quarantine_corrupt_sst(&s, "slot_index") {
+                                error!(error = %s, "slot_index prune failed");
+                            }
+                        }
+                    }
+                })
+                .await;
             }
         }
 
-        // tx_index retention
         if retention.tx_index_days > 0 {
             let cutoff = current.saturating_sub(retention.tx_index_days * slots_per_day);
             if cutoff > 0 {
@@ -304,13 +310,17 @@ async fn run_retention_loop(
                             days = retention.tx_index_days,
                             "pruned tx_index"
                         ),
-                        Err(e) => error!(error = %e, "tx_index prune failed"),
+                        Err(e) => {
+                            let s = e.to_string();
+                            if !r.try_quarantine_corrupt_sst(&s, "tx_index") {
+                                error!(error = %s, "tx_index prune failed");
+                            }
+                        }
                     })
                     .await;
             }
         }
 
-        // Disk limit check
         if retention.max_disk_gb > 0 {
             let size_bytes = rocks.estimated_size_bytes();
             let size_gb = size_bytes / (1024 * 1024 * 1024);
@@ -320,7 +330,6 @@ async fn run_retention_loop(
                     limit_gb = retention.max_disk_gb,
                     "RocksDB exceeds disk limit, aggressive pruning needed"
                 );
-                // Halve the retention window and re-prune
                 let emergency_days = retention.tx_index_days / 2;
                 let cutoff = current.saturating_sub(emergency_days.max(1) * slots_per_day);
                 let r = rocks.clone();

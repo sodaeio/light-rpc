@@ -5,10 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::BlockStorageConfig;
 use crate::Slot;
 
-/// Circular file storage for encoded blocks.
-///
-/// Blocks are written sequentially to pre-allocated files with LZ4 compression.
-/// A fixed number of blocks are retained; older blocks are overwritten.
+/// Sharded LZ4-compressed file store for encoded blocks. Bounded ring;
+/// oldest entries are overwritten once `max_blocks` is reached.
 pub struct BlockFileStorage {
     dir: PathBuf,
     max_blocks: usize,
@@ -16,7 +14,6 @@ pub struct BlockFileStorage {
     use_lz4: bool,
 }
 
-/// Location of a stored block within the file storage.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct BlockLocation {
     pub file_id: u64,
@@ -41,7 +38,6 @@ impl BlockFileStorage {
     }
 
     fn block_path(&self, slot: Slot) -> PathBuf {
-        // Shard into subdirectories by slot / 10000
         let shard = slot / 10_000;
         let shard_dir = self.dir.join(format!("s{shard}"));
         shard_dir.join(format!("{slot}.blk"))
@@ -78,7 +74,6 @@ impl BlockFileStorage {
             .with_context(|| format!("reading block file {}", path.display()))?;
 
         if self.use_lz4 {
-            // Decompress — max decompressed size 128MB
             let decompressed = lz4::block::decompress(&compressed, Some(128 * 1024 * 1024))?;
             Ok(decompressed)
         } else {
@@ -94,7 +89,6 @@ impl BlockFileStorage {
         self.head.load(Ordering::Relaxed)
     }
 
-    /// Create a handle for the writer (shares the same directory).
     pub fn clone_for_writer(&self) -> Self {
         Self {
             dir: self.dir.clone(),

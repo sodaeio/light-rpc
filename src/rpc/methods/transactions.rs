@@ -21,8 +21,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .try_into()
             .map_err(|_| err(-32602, "Invalid signature length"))?;
 
-        // Hot path: memory-cached prebuilt (last ~64 slots). Splices slot +
-        // blockTime into the stored per-tx RawValue at response time.
+        // Hot path: memory-cached prebuilt (~64 most recent slots).
         if let Some(raw) = ctx.reader.get_transaction_prebuilt(&sig_bytes) {
             return Ok::<Box<serde_json::value::RawValue>, jsonrpsee::types::ErrorObjectOwned>(raw);
         }
@@ -84,7 +83,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                         })
                     })
                     .collect();
-                // getSignaturesForAddress returns array directly, no context wrapper
                 Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(results))
             }
             Err(e) => Err(err(-32603, &e.to_string())),
@@ -128,7 +126,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let slot = ctx.reader.cache().processed_slot();
         let finalized = ctx.reader.cache().finalized_slot();
 
-        // Decode all sigs first; keep track of originals for null-slot fallback.
         let decoded: Vec<Option<[u8; 64]>> = sigs
             .iter()
             .map(|v| {

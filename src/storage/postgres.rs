@@ -94,8 +94,7 @@ impl PgStorage {
                 autovacuum_analyze_scale_factor = 0.02,
                 autovacuum_vacuum_cost_delay = 10
             )",
-            // idx_token_accounts_owner must be built manually — see MIGRATIONS.md.
-
+            // idx_token_accounts_owner is built manually; see MIGRATIONS.md.
         ];
 
         for stmt in statements {
@@ -113,8 +112,7 @@ impl PgStorage {
     }
 
     async fn bootstrap_address_partitions(&self) -> Result<()> {
-        // Use slot_metas (has idx_slot_desc); MAX(slot) on the legacy
-        // table is a full seq scan.
+        // Read off slot_metas; MAX(slot) on the legacy table is a seq scan.
         let latest: Option<i64> =
             sqlx::query_scalar("SELECT slot FROM slot_metas ORDER BY slot DESC LIMIT 1")
                 .fetch_optional(&self.pool)
@@ -262,9 +260,6 @@ impl PgStorage {
         Ok(dropped)
     }
 
-    // --- Write operations (called from pg_writer_loop) ---
-
-    /// Batch upsert token mints using UNNEST arrays — single round-trip.
     pub async fn upsert_token_mints(&self, mints: &[AccountUpdate]) -> Result<()> {
         if mints.is_empty() {
             return Ok(());
@@ -335,7 +330,6 @@ impl PgStorage {
         Ok(())
     }
 
-    /// Batch upsert token accounts using UNNEST arrays — single round-trip.
     pub async fn upsert_token_accounts(&self, accounts: &[AccountUpdate]) -> Result<()> {
         if accounts.is_empty() {
             return Ok(());
@@ -426,7 +420,6 @@ impl PgStorage {
         Ok(())
     }
 
-    /// Batch insert address transactions using UNNEST — single round-trip.
     #[allow(clippy::type_complexity)]
     pub async fn insert_address_transactions(
         &self,
@@ -479,8 +472,6 @@ impl PgStorage {
             .await?;
         Ok(())
     }
-
-    // --- Read operations ---
 
     pub async fn get_latest_slot(&self) -> Result<Option<Slot>> {
         let row: Option<(i64,)> = sqlx::query_as("SELECT MAX(slot) FROM slot_metas")
@@ -557,7 +548,7 @@ impl PgStorage {
         Ok(rows)
     }
 
-    /// Guards against custodial wallets with millions of ATAs.
+    /// Cap to bound custodial wallets with millions of ATAs.
     const GTFA_ATA_CAP: i64 = 2048;
 
     pub async fn get_transactions_for_owner_with_atas(
@@ -680,8 +671,6 @@ impl PgStorage {
         .await?;
         Ok(rows)
     }
-
-    // --- DAS Asset queries ---
 
     pub async fn get_asset(&self, id: &[u8]) -> Result<Option<AssetRow>> {
         let row: Option<AssetRow> = sqlx::query_as(
@@ -879,8 +868,6 @@ impl Clone for PgStorage {
     }
 }
 
-// Row types matching the DAS schema
-
 #[derive(sqlx::FromRow)]
 pub struct TokenAccountRow {
     pub pubkey: Vec<u8>,
@@ -934,7 +921,6 @@ pub struct AssetRow {
     pub burnt: bool,
     pub slot_updated: Option<i64>,
     pub seq: Option<i64>,
-    // from asset_data join
     pub chain_data: Option<serde_json::Value>,
     pub metadata_url: Option<String>,
     pub metadata: Option<serde_json::Value>,
