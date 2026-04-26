@@ -320,7 +320,8 @@ impl StorageReader {
     fn rocks_get_account(&self, pubkey: &[u8; 32]) -> Option<StoredAccount> {
         let s = shard_of(pubkey[0]);
         if let Some(arc) = self.account_lru[s].lock().get(pubkey).cloned() {
-            return Some((*arc).clone());
+            let stored = (*arc).clone();
+            return (!stored.is_closed()).then_some(stored);
         }
         let stored = self
             .rocks
@@ -331,7 +332,7 @@ impl StorageReader {
         self.account_lru[s]
             .lock()
             .put(*pubkey, Arc::new(stored.clone()));
-        Some(stored)
+        (!stored.is_closed()).then_some(stored)
     }
 
     fn encode_account_data(data: &[u8], encoding: &str) -> serde_json::Value {
@@ -917,7 +918,9 @@ impl StorageReader {
                 rent_epoch: row.rent_epoch as u64,
                 slot: row.slot_updated as u64,
             };
-            return Ok(Some(Self::account_to_json(&stored, encoding)));
+            if !stored.is_closed() {
+                return Ok(Some(Self::account_to_json(&stored, encoding)));
+            }
         }
 
         // SPL mints live in `tokens`, not `program_accounts`.
@@ -1006,10 +1009,10 @@ impl StorageReader {
             for (j, val) in batch_vals.into_iter().enumerate() {
                 let idx = rocks_idx[j];
                 match val.and_then(|b| super::accounts::StoredAccount::deserialize(&b)) {
-                    Some(stored) => {
+                    Some(stored) if !stored.is_closed() => {
                         results[idx] = Some(Self::account_to_json(&stored, encoding));
                     }
-                    None => missing.push(idx),
+                    _ => missing.push(idx),
                 }
             }
             if !missing.is_empty() {
@@ -1028,7 +1031,9 @@ impl StorageReader {
                                 rent_epoch: row.rent_epoch as u64,
                                 slot: row.slot_updated as u64,
                             };
-                            results[idx] = Some(Self::account_to_json(&stored, encoding));
+                            if !stored.is_closed() {
+                                results[idx] = Some(Self::account_to_json(&stored, encoding));
+                            }
                         }
                     }
                 }

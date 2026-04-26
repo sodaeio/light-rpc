@@ -1,7 +1,7 @@
 use anyhow::Result;
 use jsonrpsee::RpcModule;
 
-use super::rpc_response;
+use super::{commitment_from, rpc_response, slot_for};
 use crate::rpc::server::RpcContext;
 
 fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
@@ -29,7 +29,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     .and_then(|v| v.as_str())
             })
             .unwrap_or("base64");
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 2));
 
         match ctx
             .reader
@@ -63,7 +63,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                     .and_then(|v| v.as_str())
             })
             .unwrap_or("base64");
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 2));
 
         match ctx
             .reader
@@ -87,7 +87,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let mint_bytes = bs58::decode(mint_str)
             .into_vec()
             .map_err(|_| err(-32602, "Invalid encoding"))?;
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 1));
 
         match ctx.reader.get_token_supply(&mint_bytes).await {
             Ok(Some(supply)) => {
@@ -111,7 +111,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .as_slice()
             .try_into()
             .map_err(|_| err(-32602, "Invalid mint length"))?;
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 1));
 
         let reader = std::sync::Arc::clone(&ctx.reader);
         let arc = ctx

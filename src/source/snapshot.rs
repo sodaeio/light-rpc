@@ -165,8 +165,8 @@ fn apply_one_parallel(
         for _ in 0..workers {
             let rx = rx.clone();
             let rocks = rocks.clone();
-            let total = total.clone();
-            let next_log = next_log.clone();
+            let total = Arc::clone(&total);
+            let next_log = Arc::clone(&next_log);
             handles.push(s.spawn(move || -> Result<MintAgg> {
                 let mut local_agg: MintAgg = std::collections::HashMap::new();
                 let mut accounts: Vec<SnapshotAccount> = Vec::new();
@@ -215,7 +215,7 @@ fn apply_one_parallel(
             entry.read_to_end(&mut data)?;
             tx.send(data).ok();
             files += 1;
-            if files % 5000 == 0 {
+            if files.is_multiple_of(5000) {
                 info!(files, "tar reader progress");
             }
         }
@@ -282,7 +282,7 @@ pub fn stream_snapshot_accounts(
         }
 
         files_parsed += 1;
-        if files_parsed % 1000 == 0 {
+        if files_parsed.is_multiple_of(1000) {
             info!(files = files_parsed, accounts = total, "parsing snapshot");
         }
     }

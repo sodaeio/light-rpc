@@ -30,6 +30,13 @@ impl StoredAccount {
     pub fn deserialize(data: &[u8]) -> Option<Self> {
         bincode::deserialize(data).ok()
     }
+
+    /// Agave evicts zero-lamport accounts; mirror that on read so closed
+    /// accounts surface as `null` instead of the zeroed remnant we may
+    /// still have in CF_ACCOUNTS.
+    pub fn is_closed(&self) -> bool {
+        self.lamports == 0
+    }
 }
 
 pub struct AccountProcessor;
@@ -59,6 +66,16 @@ impl AccountProcessor {
 
     /// No read-before-write: stream order guarantees newer data wins.
     pub fn write_program_accounts(
+        db: &UnifiedRocksDb,
+        accounts: &[&AccountUpdate],
+    ) -> anyhow::Result<usize> {
+        Self::write_accounts(db, accounts)
+    }
+
+    /// Persist every kind to CF_ACCOUNTS so getAccountInfo / gMA serve the
+    /// stream's latest state. Token mints/accounts are also routed to their
+    /// aggregator CFs by the caller — this is the canonical-state write.
+    pub fn write_accounts(
         db: &UnifiedRocksDb,
         accounts: &[&AccountUpdate],
     ) -> anyhow::Result<usize> {

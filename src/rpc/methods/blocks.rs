@@ -4,7 +4,7 @@ use anyhow::Result;
 use jsonrpsee::types::Params;
 use jsonrpsee::RpcModule;
 
-use super::rpc_response;
+use super::{commitment_from, rpc_response, slot_for};
 use crate::rpc::server::RpcContext;
 use crate::types::*;
 
@@ -185,7 +185,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("isBlockhashValid", |params, ctx, _| async move {
         let p: Vec<serde_json::Value> = params.parse()?;
         let blockhash = p.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 1));
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(
             slot,
             serde_json::json!(ctx.reader.is_blockhash_valid(&blockhash)),

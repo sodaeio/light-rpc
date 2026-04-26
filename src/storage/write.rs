@@ -272,6 +272,7 @@ impl StorageWriter {
         };
 
         if ch_tx.try_send(ClickHouseWriteJob::Block(batch)).is_err() {
+            metrics::CLICKHOUSE_DROP.inc();
             tracing::warn!(slot, "clickhouse channel full, dropping batch");
         }
     }
@@ -279,7 +280,9 @@ impl StorageWriter {
     async fn handle_slot_status(&self, slot: Slot, _parent_slot: Option<Slot>, status: SlotStatus) {
         let msg = match status {
             SlotStatus::Confirmed => {
-                let _ = self.pg_tx.try_send(PgWriteJob::SlotUpdate(slot));
+                if self.pg_tx.try_send(PgWriteJob::SlotUpdate(slot)).is_err() {
+                    metrics::PG_DROP.with_label_values(&["slot"]).inc();
+                }
                 WriteToReadMessage::BlockConfirmed { slot }
             }
             SlotStatus::Finalized => WriteToReadMessage::SlotFinalized { slot },
@@ -295,41 +298,48 @@ impl StorageWriter {
             return;
         }
 
-        // Dedup by pubkey, keep highest slot.
-        buffer.sort_by(|a, b| a.pubkey.cmp(&b.pubkey).then(b.slot.cmp(&a.slot)));
+        // Dedup by pubkey, keep newest (slot, write_version). Same-slot
+        // updates need write_version DESC — without it dedup_by_key keeps
+        // the earliest intra-slot state (stream order), losing the final
+        // value for accounts written multiple times per slot (DEX vaults,
+        // fee payers).
+        buffer.sort_by(|a, b| {
+            a.pubkey
+                .cmp(&b.pubkey)
+                .then(b.slot.cmp(&a.slot))
+                .then(b.write_version.cmp(&a.write_version))
+        });
         buffer.dedup_by_key(|u| u.pubkey);
 
         let mut mint_updates = Vec::new();
         let mut ta_updates = Vec::new();
-        let mut prog_refs = Vec::new();
 
         let updates = std::mem::take(buffer);
+        let mut all_refs: Vec<&AccountUpdate> = Vec::with_capacity(updates.len());
         for update in &updates {
+            all_refs.push(update);
             match update.classify() {
                 AccountKind::TokenMint => mint_updates.push(update),
                 AccountKind::TokenAccount => ta_updates.push(update),
-                AccountKind::ProgramAccount => prog_refs.push(update),
+                AccountKind::ProgramAccount => {}
             }
         }
 
-        if !prog_refs.is_empty() {
-            match AccountProcessor::write_program_accounts(&self.rocks, &prog_refs) {
-                Ok(count) => debug!(count, "wrote program accounts to rocksdb"),
+        // Canonical write: every update lands in CF_ACCOUNTS so reads see
+        // the stream's latest state. Aggregator paths below are additive.
+        if !all_refs.is_empty() {
+            match AccountProcessor::write_accounts(&self.rocks, &all_refs) {
+                Ok(count) => debug!(count, "wrote accounts to rocksdb"),
                 Err(e) => {
                     let s = e.to_string();
-                    // Quarantine on corruption but don't retry — RocksDB's
-                    // compaction may still reference the moved file via its
-                    // MANIFEST until a future compaction re-organizes the
-                    // affected level. Retrying immediately tight-loops on
-                    // the same dangling reference.
-                    if !self.rocks.try_quarantine_corrupt_sst(&s, "program_index")
+                    if !self.rocks.try_quarantine_corrupt_sst(&s, "accounts")
                         && should_log_corruption()
                     {
-                        error!(error = %s, "failed to write program accounts");
+                        error!(error = %s, "failed to write accounts");
                     }
                 }
             }
-            let pubkeys: Vec<[u8; 32]> = prog_refs.iter().map(|u| u.pubkey.to_bytes()).collect();
+            let pubkeys: Vec<[u8; 32]> = all_refs.iter().map(|u| u.pubkey.to_bytes()).collect();
             let _ = self
                 .broadcast_tx
                 .send(WriteToReadMessage::AccountsUpdated { pubkeys });
@@ -346,7 +356,9 @@ impl StorageWriter {
                 }
             }
             let owned: Vec<AccountUpdate> = mint_updates.into_iter().cloned().collect();
-            let _ = self.pg_tx.try_send(PgWriteJob::TokenMints(owned));
+            if self.pg_tx.try_send(PgWriteJob::TokenMints(owned)).is_err() {
+                metrics::PG_DROP.with_label_values(&["mints"]).inc();
+            }
         }
 
         if !ta_updates.is_empty() {
@@ -396,7 +408,13 @@ impl StorageWriter {
                 .broadcast_tx
                 .send(WriteToReadMessage::AccountsUpdated { pubkeys });
             let owned: Vec<AccountUpdate> = ta_updates.into_iter().cloned().collect();
-            let _ = self.pg_tx.try_send(PgWriteJob::TokenAccounts(owned));
+            if self
+                .pg_tx
+                .try_send(PgWriteJob::TokenAccounts(owned))
+                .is_err()
+            {
+                metrics::PG_DROP.with_label_values(&["token_accounts"]).inc();
+            }
         }
     }
 }

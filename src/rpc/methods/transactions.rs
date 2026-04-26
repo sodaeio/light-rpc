@@ -1,7 +1,7 @@
 use anyhow::Result;
 use jsonrpsee::RpcModule;
 
-use super::rpc_response;
+use super::{commitment_from, rpc_response, slot_for};
 use crate::rpc::server::RpcContext;
 
 fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
@@ -123,7 +123,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("getSignatureStatuses", |params, ctx, _| async move {
         let p: Vec<serde_json::Value> = params.parse()?;
         let sigs = p.first().and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 1));
         let finalized = ctx.reader.cache().finalized_slot();
 
         let decoded: Vec<Option<[u8; 64]>> = sigs
