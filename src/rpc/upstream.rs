@@ -2,8 +2,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::time::Duration;
 
-/// Forwards unsupported RPC methods (sendTransaction, simulateTransaction)
-/// to an upstream Solana validator RPC.
+/// Proxies allow-listed methods (e.g. sendTransaction) to an upstream RPC.
 #[derive(Clone)]
 pub struct UpstreamForwarder {
     client: reqwest::Client,

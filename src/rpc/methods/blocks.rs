@@ -4,7 +4,7 @@ use anyhow::Result;
 use jsonrpsee::types::Params;
 use jsonrpsee::RpcModule;
 
-use super::rpc_response;
+use super::{commitment_from, rpc_response, slot_for};
 use crate::rpc::server::RpcContext;
 use crate::types::*;
 
@@ -12,9 +12,8 @@ fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObject::owned(code, msg.to_string(), None::<()>)
 }
 
-/// Build the getBlock response as raw JSON bytes and insert into the shard
-/// cache. Returns None when the slot is missing. Called exactly once per
-/// (slot, cfg_hash) under the block coalescer.
+/// Builds + caches the raw getBlock response. Called exactly once per
+/// (slot, cfg_hash) via the block coalescer.
 fn build_block_raw(
     reader: &crate::storage::read::StorageReader,
     slot: Slot,
@@ -99,8 +98,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        // Config fingerprint: (tx_details, include_rewards) fold into a u64.
-        // Common configs are ~10 combinations, so a tiny hash suffices.
         let cfg_hash: u64 = {
             let mut h: u64 = include_rewards as u64;
             for b in tx_details.as_bytes() {
@@ -120,8 +117,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             );
         }
 
-        // Singleflight on (slot, cfg_hash) — N concurrent first-time callers
-        // share one build pass.
         let reader = std::sync::Arc::clone(&ctx.reader);
         let block_cache = std::sync::Arc::clone(&ctx.block_cache);
         let tx_details_owned = tx_details.to_string();
@@ -190,7 +185,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("isBlockhashValid", |params, ctx, _| async move {
         let p: Vec<serde_json::Value> = params.parse()?;
         let blockhash = p.first().and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 1));
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(
             slot,
             serde_json::json!(ctx.reader.is_blockhash_valid(&blockhash)),
@@ -210,7 +205,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         }
     })?;
 
-    // Pre-encoded static JSON — jsonrpsee emits verbatim.
     static VERSION_RAW: std::sync::LazyLock<Box<serde_json::value::RawValue>> =
         std::sync::LazyLock::new(|| {
             serde_json::value::RawValue::from_string(format!(
@@ -225,9 +219,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
         )
     })?;
 
-    // --- Trivial methods for Solana RPC parity ---
-
-    // Mainnet genesis hash is a fixed constant.
     static GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
     module.register_async_method("getGenesisHash", |_, _, _| async move {
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!(GENESIS_HASH))
@@ -246,7 +237,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
     module.register_async_method("getEpochInfo", |params, ctx, _| async move {
         let commitment = parse_commitment(&params);
         let slot = ctx.reader.get_slot(commitment);
-        // Mainnet epoch schedule: 432,000 slots per epoch
         let slots_per_epoch: u64 = 432_000;
         let epoch = slot / slots_per_epoch;
         let slot_index = slot % slots_per_epoch;

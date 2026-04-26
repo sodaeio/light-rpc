@@ -1,8 +1,8 @@
-//! tx_index storage layout (written by storage::write):
+//! tx_index value layout:
 //!   [u64 slot LE][u32 tx_index LE][i64 block_time LE][u8 err_len][err][proto]
-//! proto is SubscribeUpdateTransactionInfo. err_len caps at 255; longer
-//! error debug strings are truncated at write time — impacts debug display
-//! only, not the proto-decoded err reported in getTransaction.meta.err.
+//! `proto` is SubscribeUpdateTransactionInfo. `err_len` is u8; the human-
+//! readable err string is truncated past 255 bytes (does not affect
+//! `meta.err` in the response, which decodes from the proto).
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -15,9 +15,8 @@ use yellowstone_grpc_proto::prost::Message;
 const HEADER_LEN: usize = 21;
 
 pub fn decode_tx_index(bytes: &[u8]) -> Result<Value> {
-    // Backfilled txs are stored as compact serde_json: always starts `{"`.
-    // Stream prost values start with a u64 slot LE, whose LSB is `{` 1/256
-    // of the time — so check two bytes to disambiguate, not one.
+    // Backfilled values are JSON, starting `{"`. Stream prost values start
+    // with slot u64 LE; checking two bytes disambiguates against `{` collisions.
     if bytes.starts_with(b"{\"") {
         return serde_json::from_slice(bytes).map_err(|e| anyhow!("json tx_index: {e}"));
     }
@@ -52,8 +51,8 @@ pub fn decode_tx_index(bytes: &[u8]) -> Result<Value> {
     ))
 }
 
-/// Decode a raw `SubscribeUpdateTransactionInfo` payload (no tx_index header)
-/// into the agave `{transaction, meta, version}` shape used by getBlock.
+/// Decode a raw `SubscribeUpdateTransactionInfo` (no tx_index header) into
+/// the `{transaction, meta, version}` shape used by getBlock.
 pub fn decode_payload(payload: &[u8], err_str: Option<String>) -> Result<Value> {
     let info = SubscribeUpdateTransactionInfo::decode(payload)?;
     let mut v = build_rpc_shape(0, None, err_str, info);
@@ -64,9 +63,8 @@ pub fn decode_payload(payload: &[u8], err_str: Option<String>) -> Result<Value> 
     Ok(v)
 }
 
-/// Build the per-tx agave shape (`{transaction, meta, version}`) directly
-/// from a parsed proto — no re-decode. Used at ingest to attach a pre-built
-/// `Arc<Box<RawValue>>` to every `TransactionEntry`.
+/// Build the `{transaction, meta, version}` shape from an already-parsed
+/// proto. Called at ingest to populate `TransactionEntry::prebuilt`.
 pub fn prebuild_tx_value(info: SubscribeUpdateTransactionInfo, err_str: Option<String>) -> Value {
     let mut v = build_rpc_shape(0, None, err_str, info);
     if let Value::Object(ref mut map) = v {
@@ -76,8 +74,7 @@ pub fn prebuild_tx_value(info: SubscribeUpdateTransactionInfo, err_str: Option<S
     v
 }
 
-/// Build the getTransaction-shape JSON (with slot + blockTime) directly
-/// from a parsed proto. Used by getTransaction lookups on memory-cached txs.
+/// Variant of `prebuild_tx_value` that includes slot + blockTime.
 pub fn prebuild_gettx_value(
     info: SubscribeUpdateTransactionInfo,
     slot: u64,
@@ -203,7 +200,7 @@ fn inner_ixs_json(groups: &[InnerInstructions]) -> Value {
 }
 
 fn meta_json(meta: &TransactionStatusMeta, err_str: Option<String>) -> Value {
-    // Proto err field is bincode(TransactionError); re-encode to agave JSON.
+    // proto.err is bincode(TransactionError); re-encode to agave JSON.
     let err = match (&meta.err, err_str.as_ref()) {
         (Some(TransactionError { err }), _) if !err.is_empty() => {
             match bincode::deserialize::<solana_transaction_error::TransactionError>(err) {

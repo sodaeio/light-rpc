@@ -3,6 +3,17 @@
 source:
   # Richat / Yellowstone gRPC endpoint
   endpoint: "http://127.0.0.1:10000"
+  # Or, for QUIC firehose (sesame leaf-shaped). Set this OR `endpoint`, not both.
+  # quic:
+  #   endpoint: "127.0.0.1:10301"
+  #   server_name: "localhost"
+  #   insecure: true
+  #   expected_rtt: 100
+  #   max_stream_bandwidth: 12500000
+  #   max_idle_timeout: 30s
+  #   recv_streams: 4
+  #   max_backlog: null
+  #   cert: null
   x_token: ~
   commitment: finalized
   connect_timeout_secs: 10

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use jsonrpsee::RpcModule;
 
-use super::{rpc_resp, rpc_response};
+use super::{commitment_from, rpc_resp, rpc_response, slot_for};
 use crate::rpc::server::RpcContext;
 
 fn err(code: i32, msg: &str) -> jsonrpsee::types::ErrorObjectOwned {
@@ -28,7 +28,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .and_then(|v| v.as_str())
             .unwrap_or("base64")
             .to_string();
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 1));
 
         let raw = match ctx
             .reader
@@ -67,7 +67,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             }
         }
 
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 1));
         let accounts = ctx.reader.get_multiple_accounts(&keys, encoding).await;
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(slot, serde_json::json!(accounts)))
     })?;
@@ -84,11 +84,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .try_into()
             .map_err(|_| err(-32602, "Invalid pubkey length"))?;
 
-        // Denylist check: pathologically large programs (Token, System,
-        // ATA, etc.) would return gigabyte-scale payloads and DoS the
-        // service. Refuse with a helpful hint pointing at the typed
-        // alternative (`getTokenAccountsByOwner`). Industry standard
-        // across every production Solana RPC provider.
+        // GPA on Token/System/etc. would return GB-scale payloads.
         if ctx.gpa_blocked.contains(&program_bytes) {
             return Err(err(
                 -32602,
@@ -110,9 +106,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .and_then(|o| o.get("withContext"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // Cursor-based pagination: client passes the last pubkey it received
-        // as `after`; we skip all keys ≤ that pubkey so the next page starts
-        // right after it.
+        // Cursor: client echoes the last pubkey received as `after`.
         let after: Option<[u8; 32]> = opts
             .and_then(|o| o.get("after"))
             .and_then(|v| v.as_str())
@@ -130,7 +124,6 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .await
         {
             Ok(mut accounts) => {
-                // Apply cursor: drop everything up to and including `after`.
                 if let Some(cursor) = after {
                     let cursor_str = bs58::encode(cursor).into_string();
                     if let Some(pos) = accounts
@@ -142,7 +135,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
                 }
                 accounts.truncate(limit);
                 if with_context {
-                    let slot = ctx.reader.cache().processed_slot();
+                    let slot = slot_for(&ctx, commitment_from(&p, 1));
                     Ok::<_, jsonrpsee::types::ErrorObjectOwned>(rpc_response(
                         slot,
                         serde_json::json!(accounts),
@@ -167,7 +160,7 @@ pub fn register(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .try_into()
             .map_err(|_| err(-32602, "Invalid pubkey length"))?;
 
-        let slot = ctx.reader.cache().processed_slot();
+        let slot = slot_for(&ctx, commitment_from(&p, 1));
         let lamports = match ctx.reader.get_account_info(&pubkey_bytes, "base64").await {
             Ok(Some(a)) => a["lamports"].as_u64().unwrap_or(0),
             _ => 0,

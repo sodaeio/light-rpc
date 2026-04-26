@@ -48,6 +48,26 @@ pub static SOURCE_MALFORMED: LazyLock<IntCounter> = LazyLock::new(|| {
     counter
 });
 
+pub static PG_DROP: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new("li_pg_drop_total", "PG write jobs dropped (channel full)"),
+        &["kind"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+pub static CLICKHOUSE_DROP: LazyLock<IntCounter> = LazyLock::new(|| {
+    let counter = IntCounter::new(
+        "li_clickhouse_drop_total",
+        "ClickHouse write jobs dropped (channel full)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
 pub static LATEST_SLOT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
         Opts::new("li_latest_slot", "Latest slot by commitment level"),

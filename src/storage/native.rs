@@ -1,11 +1,5 @@
-//! Hardcoded native program and sysvar accounts.
-//!
-//! These accounts are validator-internal state and never appear in the gRPC
-//! account update stream. Without this registry, a query for them would miss
-//! since they're not in RocksDB or PostgreSQL.
-//!
-//! Values captured from mainnet. Dynamic sysvars (Clock, EpochSchedule) change
-//! per slot but their lamports/owner/executable fields are stable.
+//! Native programs and sysvars don't flow through the account update stream;
+//! getAccountInfo for them is served from this static mainnet registry.
 
 use base64::Engine;
 use std::collections::HashMap;
@@ -63,7 +57,6 @@ fn build_registry() -> Vec<NativeEntry> {
     let sysvar_parent = pk("11111111111111111111111111111111");
 
     vec![
-        // System Program
         NativeEntry {
             pubkey: pk("11111111111111111111111111111111"),
             lamports: 1,
@@ -71,7 +64,6 @@ fn build_registry() -> Vec<NativeEntry> {
             executable: true,
             data: b64("c29sYW5hX3N5c3RlbV9wcm9ncmFt"),
         },
-        // Vote Program
         NativeEntry {
             pubkey: pk("Vote111111111111111111111111111111111111111"),
             lamports: 1,
@@ -79,7 +71,6 @@ fn build_registry() -> Vec<NativeEntry> {
             executable: true,
             data: b64("c29sYW5hX3ZvdGVfcHJvZ3JhbQ=="),
         },
-        // BPF Loader Upgradeable
         NativeEntry {
             pubkey: bpf_upgradeable,
             lamports: 1,
@@ -87,7 +78,6 @@ fn build_registry() -> Vec<NativeEntry> {
             executable: true,
             data: b64("c29sYW5hX2JwZl9sb2FkZXJfdXBncmFkZWFibGVfcHJvZ3JhbQ=="),
         },
-        // Compute Budget
         NativeEntry {
             pubkey: pk("ComputeBudget111111111111111111111111111111"),
             lamports: 1,
@@ -95,7 +85,6 @@ fn build_registry() -> Vec<NativeEntry> {
             executable: true,
             data: b64("Y29tcHV0ZV9idWRnZXRfcHJvZ3JhbQ=="),
         },
-        // Stake Program (upgraded to BPF)
         NativeEntry {
             pubkey: pk("Stake11111111111111111111111111111111111111"),
             lamports: 1_141_440,
@@ -103,7 +92,6 @@ fn build_registry() -> Vec<NativeEntry> {
             executable: true,
             data: b64("AgAAAFHW83CdNkiAbBM/KbbTGo51AzqfNvqotBJrLfsRYocN"),
         },
-        // Address Lookup Table
         NativeEntry {
             pubkey: pk("AddressLookupTab1e1111111111111111111111111"),
             lamports: 1_141_440,
@@ -111,7 +99,6 @@ fn build_registry() -> Vec<NativeEntry> {
             executable: true,
             data: b64("AgAAADtKXMfRSUXkVugHTEht+fDZAO8WZH0jhJ0wNdftoyOf"),
         },
-        // Config Program
         NativeEntry {
             pubkey: pk("Config1111111111111111111111111111111111111"),
             lamports: 1_141_440,
@@ -119,7 +106,6 @@ fn build_registry() -> Vec<NativeEntry> {
             executable: true,
             data: b64("AgAAAKeepvf6/N81xCQjn/tKO2u2Qt7HM6w45+yDq1ky4kn4"),
         },
-        // Sysvar parent meta-account
         NativeEntry {
             pubkey: pk("Sysvar1111111111111111111111111111111111111"),
             lamports: 57_760_221,

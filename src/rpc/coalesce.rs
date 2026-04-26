@@ -1,15 +1,5 @@
-//! Singleflight: collapses concurrent identical requests into one backend
-//! fetch. Hot keys (USDC mint info, well-known program account info) get
-//! hammered by every wallet on the network; with this in front of storage,
-//! N concurrent callers wait on one fetch and all receive a clone of the
-//! same Arc.
-//!
-//! Keys are method-specific (e.g. `("gAI", pubkey, encoding)`); the value is
-//! whatever the handler returns (typically `serde_json::Value`).
-//!
-//! The deduplicator is intentionally bounded: at most `MAX_INFLIGHT` distinct
-//! in-flight keys at once, after which new keys bypass and run uncoalesced.
-//! This is fine — coalescing is opportunistic.
+//! Singleflight: concurrent identical requests share one backend fetch.
+//! Bounded at MAX_INFLIGHT distinct keys; overflow bypasses uncoalesced.
 
 use std::hash::Hash;
 use std::sync::Arc;
@@ -42,11 +32,8 @@ where
         Self::default()
     }
 
-    /// Run `fetch` once per concurrent set of identical `key`s.
-    ///
-    /// First caller installs an OnceCell, drives the future, and stores the
-    /// result. Concurrent callers see the OnceCell, await it, and clone the
-    /// resulting Arc.
+    /// First caller installs a OnceCell and runs `fetch`; concurrent callers
+    /// await the cell and clone the Arc.
     #[allow(clippy::clone_on_ref_ptr)]
     pub async fn run<F, Fut>(&self, key: K, fetch: F) -> Arc<V>
     where
@@ -68,9 +55,6 @@ where
             .await
             .clone();
 
-        // Best-effort eviction so the map doesn't grow unbounded across
-        // distinct keys. The next caller for this key just installs a fresh
-        // cell, which is correct.
         self.inflight.remove(&key);
         value
     }

@@ -1,6 +1,6 @@
 [package]
 name = "light-rpc"
-version = "0.2.2"
+version = "0.2.4"
 edition = "2021"
 publish = false
 
@@ -75,6 +75,7 @@ dashmap = "6.1"
 base64-simd = "0.8"
 itoa = "1.0"
 rayon = "1.10"
+crossbeam-channel = "0.5"
 num_cpus = "1.16"
 chrono = "0.4"
 parking_lot = "0.12"

@@ -6,7 +6,7 @@ A unified Solana indexer and RPC server. Single binary that replaces the need fo
 
 ## What it does
 
-light-rpc subscribes to a Solana validator's gRPC stream (via [Richat](https://github.com/lamports-dev/richat)) and indexes everything into a tiered storage system. It then serves the full Solana JSON-RPC API from one HTTP endpoint — no validator node required.
+light-rpc subscribes to a Solana validator's stream (Yellowstone Dragon's Mouth gRPC, native [Richat](https://github.com/lamports-dev/richat) gRPC, or QUIC firehose) and indexes everything into a tiered storage system. It then serves the full Solana JSON-RPC API from one HTTP endpoint — no validator node required. Cold start can rebuild full account state from a local Solana snapshot (`source.snapshot_dir`).
 
 ```
 Validator (Richat gRPC)
@@ -98,12 +98,14 @@ Methods like `sendTransaction` and `simulateTransaction` are forwarded to a conf
 
 ```
 data/
-├── rocksdb/              # Unified RocksDB (5 column families)
+├── rocksdb/              # Unified RocksDB (7 column families)
 │   ├── slot_index        # slot → block metadata (time, height, hash)
 │   ├── tx_index          # signature → transaction location
 │   ├── sfa_index         # address + slot → signatures (prefix scan)
-│   ├── accounts          # pubkey → serialized account data
-│   └── program_index     # program_id + pubkey → (prefix scan)
+│   ├── accounts          # pubkey → serialized account data (all kinds)
+│   ├── program_index     # program_id + pubkey → (prefix scan)
+│   ├── owner_atas        # owner + token_account → (SPL ATA enumeration)
+│   └── mint_top_holders  # mint → top-K (amount, token_account)
 │
 └── blocks/               # LZ4-compressed block files
     └── s{shard}/         # sharded by slot / 10000
@@ -120,10 +122,16 @@ PostgreSQL stores relational data that benefits from SQL queries:
 
 ```yaml
 source:
-  endpoint: "http://127.0.0.1:10000"    # Richat gRPC endpoint
+  # gRPC endpoint (Yellowstone Dragon's Mouth or Richat). Set exactly one
+  # of `endpoint` or `quic`.
+  endpoint: "http://127.0.0.1:10000"
+  grpc_mode: yellowstone                 # "yellowstone" (default) or "richat"
+  # quic:                                # QUIC firehose (richat-client::quic)
+  #   endpoint: "127.0.0.1:10101"
   x_token: ~                             # Optional auth token
   commitment: finalized
   max_message_size: 67108864             # 64MB
+  snapshot_dir: "/tmp/light-rpc-snapshots"  # Local Solana snapshot dir for cold-start
 
 storage:
   rocksdb:
@@ -205,6 +213,12 @@ Prometheus metrics are served on the configured metrics endpoint (default `:9090
 | `li_pg_write_seconds` | histogram | PostgreSQL batch write latency |
 | `li_memory_cached_blocks` | gauge | Blocks currently in memory cache |
 | `li_pipeline_channel_size{channel}` | gauge | Pipeline channel utilization |
+| `li_pg_drop_total{kind}` | counter | PG write jobs dropped (channel full) |
+| `li_clickhouse_drop_total` | counter | ClickHouse write jobs dropped (channel full) |
+| `li_source_malformed_total` | counter | Stream messages skipped (bad pubkey/signature) |
+| `li_rocksdb_quarantined_total` | counter | Corrupt SSTs auto-quarantined |
+| `li_rocksdb_l0_files{cf}` | gauge | L0 file count per column family |
+| `li_rocksdb_live_data_bytes{cf}` | gauge | Live data size per column family |
 
 ## Project structure
 
