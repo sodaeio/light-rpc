@@ -14,10 +14,8 @@ use super::files::BlockFileStorage;
 use super::postgres::PgStorage;
 use super::rocks::UnifiedRocksDb;
 
-/// Throttle corruption-error logs to ~once per 30s. RocksDB MANIFEST may
-/// reference a quarantined SST until a future compaction reorganizes the
-/// affected level; until then every write retries the same dangling
-/// reference, which would otherwise flood the log.
+/// 30s log throttle: a quarantined SST stays referenced in MANIFEST until the
+/// next compaction reorganizes the level, so every write hits the same error.
 static LAST_CORRUPTION_LOG: AtomicU64 = AtomicU64::new(0);
 fn should_log_corruption() -> bool {
     let now = SystemTime::now()
@@ -153,9 +151,7 @@ impl StorageWriter {
 
         if let Err(e) = self.rocks.put_slot_index(slot, &slot_data) {
             let s = e.to_string();
-            if !self.rocks.try_quarantine_corrupt_sst(&s, "slot_index")
-                && should_log_corruption()
-            {
+            if !self.rocks.try_quarantine_corrupt_sst(&s, "slot_index") && should_log_corruption() {
                 error!(slot, error = %s, "failed to write slot index");
             }
         }
@@ -179,9 +175,7 @@ impl StorageWriter {
         }
         if let Err(e) = self.rocks.put_tx_index_batch(&tx_entries) {
             let s = e.to_string();
-            if !self.rocks.try_quarantine_corrupt_sst(&s, "tx_index")
-                && should_log_corruption()
-            {
+            if !self.rocks.try_quarantine_corrupt_sst(&s, "tx_index") && should_log_corruption() {
                 error!(slot, error = %s, "failed to write tx index batch");
             }
         }
@@ -298,11 +292,8 @@ impl StorageWriter {
             return;
         }
 
-        // Dedup by pubkey, keep newest (slot, write_version). Same-slot
-        // updates need write_version DESC — without it dedup_by_key keeps
-        // the earliest intra-slot state (stream order), losing the final
-        // value for accounts written multiple times per slot (DEX vaults,
-        // fee payers).
+        // Dedup keeps newest (slot, write_version) per pubkey; without write_version DESC,
+        // intra-slot rewrites (DEX vaults, fee payers) would keep the stream-order earliest.
         buffer.sort_by(|a, b| {
             a.pubkey
                 .cmp(&b.pubkey)
@@ -413,7 +404,9 @@ impl StorageWriter {
                 .try_send(PgWriteJob::TokenAccounts(owned))
                 .is_err()
             {
-                metrics::PG_DROP.with_label_values(&["token_accounts"]).inc();
+                metrics::PG_DROP
+                    .with_label_values(&["token_accounts"])
+                    .inc();
             }
         }
     }

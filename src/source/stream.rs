@@ -10,14 +10,14 @@ use richat_proto::geyser::{
     subscribe_update::UpdateOneof, SlotStatus as ProtoSlotStatus, SubscribeUpdate,
 };
 use richat_proto::richat::{GrpcSubscribeRequest, RichatFilter};
-use yellowstone_grpc_proto::geyser::{
-    SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocksMeta,
-    SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
-};
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+use yellowstone_grpc_proto::geyser::{
+    SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocksMeta,
+    SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
+};
 
 use crate::config::{GrpcMode, SourceConfig};
 use crate::metrics;
@@ -25,9 +25,8 @@ use crate::types::*;
 
 use super::commitment::CommitmentTracker;
 
-// Placeholder prebuilt — replaced with the real agave-shape JSON in
-// `into_block` via rayon par_iter. Using a shared Arc avoids allocating
-// a fresh "null" RawValue per tx on arrival.
+// Shared placeholder; the real agave-shape JSON is built in `into_block`. Sharing the
+// Arc skips a per-tx "null" RawValue alloc on arrival.
 static PLACEHOLDER_RAW: std::sync::LazyLock<Arc<Box<serde_json::value::RawValue>>> =
     std::sync::LazyLock::new(|| {
         Arc::new(serde_json::value::RawValue::from_string("null".into()).unwrap())
@@ -78,9 +77,7 @@ impl SlotAccumulator {
         use yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo;
         use yellowstone_grpc_proto::prost::Message;
 
-        // Parallel per-tx agave-shape JSON build. ~50µs/tx serial becomes
-        // near-instant on a 48-core box; block-seal latency drops from
-        // ~100ms on heavy blocks to a few ms.
+        // Parallel per-tx JSON build cuts heavy-block seal latency from ~100ms to a few ms.
         let mut txs: Vec<TransactionEntry> = self.transactions.into_values().collect();
         txs.par_iter_mut().for_each(|tx| {
             if let Ok(info) = SubscribeUpdateTransactionInfo::decode(tx.payload.as_ref()) {
@@ -136,7 +133,11 @@ impl StreamSource {
             v.extend(self.config.fallback_endpoints.iter().cloned());
             v
         };
-        let transport = if self.config.quic.is_some() { "quic" } else { "grpc" };
+        let transport = if self.config.quic.is_some() {
+            "quic"
+        } else {
+            "grpc"
+        };
         let mut current_idx = 0;
 
         loop {
@@ -148,11 +149,8 @@ impl StreamSource {
                 "connecting to source"
             );
 
-            // Inner loop has per-message timeouts and gap detection; both
-            // surface as Err here, which we handle with rotate + backoff.
-            // Snapshot recovery is NOT triggered on stream errors — it's a
-            // 30+ minute destructive op, while a stream gap usually clears
-            // with a reconnect within seconds.
+            // Stream errors rotate endpoints + backoff. Don't trigger snapshot recovery here:
+            // it's a 30+ min destructive op, while gaps usually clear on reconnect.
             match self.run_stream_endpoint(endpoint).await {
                 Ok(()) => {
                     info!("stream ended cleanly, reconnecting");
@@ -221,13 +219,10 @@ impl StreamSource {
 
             match self.config.grpc_mode {
                 GrpcMode::Yellowstone => {
-                    // Dragon's Mouth subscribe. Per-type maps with empty
-                    // filter values mean "all" for that type. Skip entries
-                    // (high volume, unused) and full blocks (reconstructed
-                    // from txs+accounts+blocks_meta).
+                    // Dragon's Mouth: empty filter values = "all". Skip entries (unused) and
+                    // full blocks (we reconstruct from txs + accounts + blocks_meta).
                     let mut accounts = std::collections::HashMap::new();
-                    accounts
-                        .insert("all".to_string(), SubscribeRequestFilterAccounts::default());
+                    accounts.insert("all".to_string(), SubscribeRequestFilterAccounts::default());
                     let mut transactions = std::collections::HashMap::new();
                     transactions.insert(
                         "all".to_string(),
@@ -256,10 +251,8 @@ impl StreamSource {
                     .into_parsed()
                 }
                 GrpcMode::Richat => {
-                    // Native richat protocol. Use only with richat-native
-                    // servers (richat-plugin-agave, richat-relay). Sesame
-                    // leaves' richat path has backpressure quirks; prefer
-                    // Yellowstone there.
+                    // Richat-native only (richat-plugin-agave, richat-relay). Sesame leaves'
+                    // richat path has backpressure quirks; prefer Yellowstone there.
                     tokio::time::timeout(
                         Duration::from_secs(self.config.request_timeout_secs),
                         client.subscribe_richat(GrpcSubscribeRequest {
@@ -291,8 +284,7 @@ impl StreamSource {
         let mut msg_count: u64 = 0;
 
         loop {
-            // Periodic stats + gap check — runs inline every 10s rather
-            // than in a select branch that gets starved by the stream.
+            // Inline every 10s; a select branch gets starved by the stream.
             if last_stats_time.elapsed() >= Duration::from_secs(10) {
                 let gap_secs = last_block_time.elapsed().as_secs();
                 info!(
@@ -317,8 +309,7 @@ impl StreamSource {
                 }
             }
 
-            // Use timeout to guarantee the loop yields for stats+gap checks
-            // even if the stream is delivering messages continuously.
+            // Timeout guarantees the loop yields for stats/gap checks under continuous load.
             let msg = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
             let update: SubscribeUpdate = match msg {
                 Ok(Some(Ok(update))) => {
@@ -405,8 +396,7 @@ impl StreamSource {
                                 }
                             }
 
-                            // Encode prost payload. Prebuild of the agave-shape
-                            // JSON is deferred to block-seal time (parallel).
+                            // agave-shape JSON prebuild is deferred to block-seal (parallel).
                             let payload = {
                                 use yellowstone_grpc_proto::prost::Message;
                                 let mut buf = Vec::with_capacity(tx_info.encoded_len());
@@ -460,19 +450,15 @@ impl StreamSource {
                             .with_label_values(&["processed"])
                             .set(tracker.processed_slot() as i64);
 
-                        // Check if this block is now complete
                         if acc.is_complete() {
                             acc.sealed = true;
-                            // Block sealing uses rayon par_iter (CPU-heavy: ~10-50ms
-                            // for high-tx blocks). Run it on the blocking pool so the
-                            // tokio worker stays free to keep reading from the source
-                            // stream — otherwise the upstream backs up and times out.
+                            // Seal is CPU-heavy (~10-50ms via rayon); offload so the worker
+                            // keeps reading the stream — otherwise upstream backs up and times out.
                             let accum = accumulators.remove(&slot).unwrap();
-                            let block_data = tokio::task::spawn_blocking(move || {
-                                accum.into_block(slot)
-                            })
-                            .await
-                            .expect("block seal task");
+                            let block_data =
+                                tokio::task::spawn_blocking(move || accum.into_block(slot))
+                                    .await
+                                    .expect("block seal task");
                             let block = Arc::new(block_data);
 
                             blocks_count += 1;
@@ -489,7 +475,6 @@ impl StreamSource {
                             }
                         }
 
-                        // Send slot status
                         let _ = self
                             .sink
                             .send(SourceMessage::SlotStatus {
@@ -516,7 +501,6 @@ impl StreamSource {
                                     .with_label_values(&["finalized"])
                                     .set(tracker.finalized_slot() as i64);
 
-                                // GC old accumulators below finalized
                                 let finalized = tracker.finalized_slot();
                                 accumulators =
                                     accumulators.split_off(&finalized.saturating_sub(32));
@@ -547,5 +531,4 @@ impl StreamSource {
             }
         }
     }
-
 }

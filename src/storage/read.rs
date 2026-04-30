@@ -854,7 +854,7 @@ impl StorageReader {
             }
         }
 
-        all.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        all.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
         all.truncate(limit);
 
         let finalized = self.cache.finalized_slot();
@@ -1078,7 +1078,7 @@ impl StorageReader {
         if !atas.is_empty() {
             let bytes = self.rocks.get_accounts_batch(&atas);
             let mut out = Vec::with_capacity(atas.len());
-            for (pubkey, data) in atas.iter().zip(bytes.into_iter()) {
+            for (pubkey, data) in atas.iter().zip(bytes) {
                 let Some(raw) = data else { continue };
                 let Some(stored) = super::accounts::StoredAccount::deserialize(&raw) else {
                     continue;

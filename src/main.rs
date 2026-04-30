@@ -146,10 +146,8 @@ async fn run(config: Config) -> Result<()> {
         }
     }
 
-    // Writer runs on its own OS thread + single-thread runtime. Its put_cf
-    // calls are synchronous and block when RocksDB throttles writes; running
-    // on a dedicated thread keeps that blocking off the main worker pool, so
-    // the source/RPC tasks aren't starved while compaction is heavy.
+    // Dedicated OS thread: synchronous put_cf calls block under write throttling,
+    // and we don't want that blocking the main worker pool during heavy compaction.
     std::thread::Builder::new()
         .name("li-writer".into())
         .spawn(move || {
@@ -198,10 +196,9 @@ async fn run(config: Config) -> Result<()> {
     server.run().await.context("rpc server failed")
 }
 
-/// Stream-parses AppendVec accounts from the latest local snapshot set
-/// (full + optional matching incremental) into every RocksDB CF.
-/// Auto-compactions run concurrent with the apply — RocksDB is tuned
-/// (large memtables, generous L0 stop_trigger) so writes never stall.
+/// Streams AppendVec accounts from the latest local snapshot set (full +
+/// optional matching incremental) into every RocksDB CF. Tuned so concurrent
+/// auto-compactions never stall the apply (large memtables, high L0 stop_trigger).
 async fn cold_start_snapshot(snapshot_dir: &str, rocks: &UnifiedRocksDb) -> Result<(u64, usize)> {
     use light_rpc::source::snapshot;
 
@@ -284,9 +281,7 @@ async fn run_retention_loop(
                             "pruned slot_index"
                         ),
                         Err(e) => {
-                            // Quarantine on corruption; suppress the noisy
-                            // log on subsequent prunes hitting the same
-                            // dangling MANIFEST reference.
+                            // Suppress repeated logs from prunes hitting the same dangling MANIFEST ref.
                             let s = e.to_string();
                             if !r.try_quarantine_corrupt_sst(&s, "slot_index") {
                                 error!(error = %s, "slot_index prune failed");
