@@ -38,7 +38,7 @@ Validator (Richat gRPC)
            │
            ▼
 ┌─ RPC Server (Axum + jsonrpsee) ──────────────┐
-│  30+ JSON-RPC methods on single endpoint      │
+│  35 JSON-RPC methods on single endpoint       │
 │  Compression (gzip, brotli), CORS, metrics    │
 └──────────────────────────────────────────────┘
 ```
@@ -51,18 +51,20 @@ Validator (Richat gRPC)
 
 **Isolated PostgreSQL writes.** Token and account writes to PostgreSQL go through a separate bounded channel to a dedicated writer task. If PG is slow, the channel buffers and the main pipeline never stalls. Account state is last-write-wins, so dropped updates during backpressure are safe.
 
-**Unified RocksDB.** Block indexes and account data share one RocksDB instance with 5 column families. One compaction budget, one memory pool, one thing to tune.
+**Unified RocksDB.** Block indexes and account data share one RocksDB instance with 7 column families. One compaction budget, one memory pool, one thing to tune.
 
 ## Supported RPC methods
 
 ### Block / History
 - `getBlock` — full block with transactions
+- `getBlocks` — confirmed slots in a range
+- `getBlocksWithLimit` — confirmed slots starting at a slot, limited count
 - `getBlockHeight` — current block height by commitment
 - `getBlockTime` — unix timestamp for a slot
 - `getSlot` — current slot by commitment
 - `getLatestBlockhash` — latest blockhash with validity window
 - `isBlockhashValid` — check if a blockhash is still recent
-- `getVersion` — node version info
+- `getFirstAvailableBlock` — oldest slot still served from local storage
 
 ### Transactions
 - `getTransaction` — transaction details by signature
@@ -90,6 +92,15 @@ Validator (Richat gRPC)
 - `getAssetsByAuthority` — assets by authority
 - `searchAssets` — full-text asset search
 - `getAssetProof` — merkle proof for compressed NFTs
+
+### Chain metadata
+- `getVersion` — node version info
+- `getGenesisHash` — cluster genesis hash
+- `getIdentity` — node identity pubkey
+- `getHealth` — service health
+- `getEpochInfo` — current epoch / slot index / slots-in-epoch
+- `getEpochSchedule` — epoch schedule constants
+- `getMinimumBalanceForRentExemption` — rent-exempt minimum for a data length
 
 ### Forwarded
 Methods like `sendTransaction` and `simulateTransaction` are forwarded to a configured upstream validator RPC.
@@ -174,7 +185,7 @@ See [config.example.yml](config.example.yml) for all options.
 cargo build --release
 ```
 
-The release binary is ~18MB (LTO + stripped).
+The release binary is ~21MB (LTO + stripped).
 
 ## Run
 
@@ -233,7 +244,7 @@ src/
 │   ├── stream.rs          # Richat gRPC subscription, block accumulation
 │   └── commitment.rs      # Slot commitment state machine
 ├── storage/
-│   ├── rocks.rs           # Unified RocksDB (5 column families)
+│   ├── rocks.rs           # Unified RocksDB (7 column families)
 │   ├── files.rs           # LZ4 block file storage
 │   ├── postgres.rs        # PostgreSQL operations (tokens, migrations)
 │   ├── accounts.rs        # Account classification and serialization
@@ -255,6 +266,21 @@ src/
 - Rust stable (1.86+)
 - PostgreSQL 14+
 - A Richat/Yellowstone gRPC source (validator with geyser plugin)
+
+## Hardware
+
+light-rpc is much lighter than a full validator. A single mainnet node fully indexing all accounts, transactions, and blocks comfortably fits on:
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| CPU      | 4 cores | 8 cores     |
+| RAM      | 16 GB   | 32 GB       |
+| Disk     | 500 GB NVMe SSD | 1 TB NVMe SSD |
+| Network  | 1 Gbps  | 1 Gbps      |
+
+Observed steady-state on a mainnet node (2-day retention, gRPC source, all account CFs populated): ~1–3 cores sustained, ~50 GB RES (most of it RocksDB block cache and mmap'd SSTs — the OS reclaims it under pressure), ~390 GB on-disk for RocksDB. PostgreSQL adds ~30 GB.
+
+Disk grows roughly linearly with retention (`storage.blocks.max_stored_blocks`) and with how aggressively you keep `tx_index` / `sfa_index` history. Account CFs are bounded by chain state, not retention.
 
 ## License
 

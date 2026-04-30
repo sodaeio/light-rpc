@@ -55,9 +55,7 @@ fn apply_cf_compaction_tuning(opts: &mut Options) {
 
 fn apply_cf_compaction_tuning_with(opts: &mut Options, l0_trigger: i32) {
     opts.set_level_zero_file_num_compaction_trigger(l0_trigger);
-    // Generous L0 triggers: cold-start writes ~1B keys at high rate; if we
-    // stall on L0 backlog, the entire tokio runtime can hang waiting on
-    // sync put_cf calls. Compactor catches up post-cold-start.
+    // Generous L0 triggers — a cold-start L0 stall would block sync put_cf and hang the runtime.
     opts.set_level_zero_slowdown_writes_trigger(2000);
     opts.set_level_zero_stop_writes_trigger(8000);
     opts.set_target_file_size_base(128 * 1024 * 1024);
@@ -108,39 +106,37 @@ impl UnifiedRocksDb {
         let path = Path::new(&config.path);
         std::fs::create_dir_all(path).context("creating rocksdb directory")?;
 
-        // Restore any quarantined SSTs back to the DB root. The runtime
-        // self-heal moves corrupt files to quarantine to keep the live
-        // process going, but MANIFEST may still reference them on next
-        // open — so without this the next startup crashloops on the
-        // dangling reference. If a file is still corrupt at read time,
-        // self-heal will quarantine it again during normal operation.
+        // Restore quarantined SSTs before open: MANIFEST still references them, so
+        // a missing file crashloops startup. Still-bad files re-quarantine at read time.
         let quarantine = path.join("quarantine");
         if quarantine.exists() {
             if let Ok(entries) = std::fs::read_dir(&quarantine) {
                 for entry in entries.flatten() {
                     let from = entry.path();
-                    let Some(name) = from.file_name() else { continue };
+                    let Some(name) = from.file_name() else {
+                        continue;
+                    };
                     let to = path.join(name);
                     match std::fs::rename(&from, &to) {
-                        Ok(()) => tracing::warn!(file = %from.display(), "restored quarantined SST for DB open"),
-                        Err(e) => tracing::error!(file = %from.display(), error = %e, "failed to restore quarantined SST"),
+                        Ok(()) => {
+                            tracing::warn!(file = %from.display(), "restored quarantined SST for DB open")
+                        }
+                        Err(e) => {
+                            tracing::error!(file = %from.display(), error = %e, "failed to restore quarantined SST")
+                        }
                     }
                 }
             }
         }
 
-        // 64 GiB shared block cache. Sized for cold tx_index lookups on
-        // never-queried wallets without crowding memtables + page cache.
+        // 64 GiB shared block cache: sized for cold tx_index lookups without crowding memtables.
         let cache = Cache::new_lru_cache(64 * 1024 * 1024 * 1024);
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        // 512 MB × 6: large memtables = fewer L0 flushes during cold-start, so
-        // compactor has fewer/larger files to merge. Steady-state RAM ceiling
-        // ~3 GB per active CF. Bigger memtables can regress gSFA range scans
-        // (queries on a CF whose memtable hasn't flushed yet must scan it),
-        // but cold-start dominates ingest cost on this deployment.
+        // 512 MB × 6: fewer L0 flushes during cold-start at the cost of slower gSFA scans
+        // over unflushed memtables — cold-start dominates ingest cost on this deployment.
         db_opts.set_write_buffer_size(512 * 1024 * 1024);
         db_opts.set_max_write_buffer_number(6);
         db_opts.set_max_open_files(config.max_open_files);
@@ -149,22 +145,16 @@ impl UnifiedRocksDb {
             .map(|n| n.get() as i32)
             .unwrap_or(4);
         db_opts.increase_parallelism(parallelism);
-        // Was clamp(8, 16) — too low: capped total background workers below
-        // (subcompactions × active_cfs), so manual full compaction ran 1-thread.
+        // Must exceed subcompactions × active_cfs, otherwise manual compaction runs single-threaded.
         db_opts.set_max_background_jobs(parallelism.max(8));
-        // DBOptions setting (CFOptions value of the same name doesn't reach
-        // the compactor). Splits a single big L0→L1 compaction into N parallel
-        // sub-jobs sharing the per-CF keyspace.
+        // DB-level setting; the CFOptions one of the same name never reaches the compactor.
         db_opts.set_max_subcompactions(parallelism as u32);
         db_opts.set_periodic_compaction_seconds(3600);
 
-        // 2 GB/s: NVMe can sustain this; the old 200 MB/s cap throttled
-        // compactor → L0 grew faster than it could drain.
+        // 2 GB/s: NVMe sustains this; lower caps throttle the compactor faster than L0 drains.
         db_opts.set_ratelimiter(2 * 1024 * 1024 * 1024, 100_000, 10);
 
-        // Direct I/O on flush+compaction bypasses the page cache so a torn
-        // kernel write can't surface a half-written SST. paranoid_file_checks
-        // validates SST checksums on first read.
+        // Direct I/O on flush+compaction prevents torn kernel writes surfacing as half-written SSTs.
         db_opts.set_use_direct_io_for_flush_and_compaction(true);
         db_opts.set_bytes_per_sync(1024 * 1024);
         db_opts.set_wal_bytes_per_sync(1024 * 1024);
@@ -223,9 +213,7 @@ impl UnifiedRocksDb {
         };
 
         let dest = self.root.join("quarantine").join(file_name);
-        // Concurrent callers race on the same bad SST. Only the first rename
-        // moves a file; NotFound on subsequent renames means another thread
-        // already quarantined it.
+        // Concurrent callers race; NotFound means another thread already quarantined this SST.
         let moved_now = match std::fs::rename(&sst_path, &dest) {
             Ok(()) => true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
@@ -370,9 +358,7 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Bulk-insert tx_index entries via a single WriteBatch. Per-tx put_cf
-    /// in a loop is the hot path bottleneck — a 5000-tx block becomes one
-    /// batch commit instead of 5000 FFI calls.
+    /// Single WriteBatch — replaces 5000 per-tx FFI calls per block on the hot path.
     pub fn put_tx_index_batch(&self, entries: &[([u8; 64], Vec<u8>)]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
@@ -416,9 +402,8 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// Reverse slot scan, counting decoded signatures toward `limit`.
-    /// Hot addresses (Token Program) pack hundreds of sigs per slot, so
-    /// `iter_sfa`'s slot-counted limit wastes most of the work.
+    /// Reverse slot scan with sig-counted limit. Hot addresses pack hundreds of sigs per slot,
+    /// so `iter_sfa`'s slot-counted limit overshoots the requested page size.
     pub fn iter_sfa_limited(
         &self,
         address: &solana_pubkey::Pubkey,
@@ -579,19 +564,15 @@ impl UnifiedRocksDb {
                 current.push((*amount, *pk));
             }
         }
-        current.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        current.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
         current.truncate(MINT_TOP_HOLDERS_K);
         let encoded = bincode::serialize(&current)?;
         self.db.put_cf(&cf, mint, encoded)?;
         Ok(())
     }
 
-    /// Bulk apply a snapshot batch: writes accounts, program_index, and owner_atas
-    /// in a single WriteBatch with WAL disabled. Per-account RMW for
-    /// mint_top_holders is deferred — token-account (mint, amount, pubkey)
-    /// triples accumulate in `mint_agg`, then `flush_mint_top_holders`
-    /// commits one entry per mint at the end. This collapses ~150M per-account
-    /// read-modify-writes into ~num_unique_mints write-only ops.
+    /// Snapshot batch apply (WAL off): accounts, program_index, owner_atas in one WriteBatch.
+    /// Mint-top-holders RMW is deferred to `mint_agg` — collapses ~150M RMWs to ~num_mints writes.
     pub fn apply_snapshot_batch(
         &self,
         accounts: &[SnapshotAccount],
@@ -637,7 +618,7 @@ impl UnifiedRocksDb {
                     entry.push((amount, acc.pubkey));
                     // Cap growth at 2K to bound RAM on hot mints; trimmed to top-K below.
                     if entry.len() >= MINT_TOP_HOLDERS_K * 2 {
-                        entry.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                        entry.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
                         entry.truncate(MINT_TOP_HOLDERS_K);
                     }
                 }
@@ -650,18 +631,15 @@ impl UnifiedRocksDb {
         Ok(())
     }
 
-    /// True if the accounts CF has no entries — the canonical "cold-start
-    /// needed" probe. Snapshots populate accounts (and related CFs) but not
-    /// slot_index, so checking slot_index for cold-start would re-trigger
-    /// a full reapply on every restart.
+    /// Cold-start probe. Checking slot_index instead would re-trigger reapply every restart,
+    /// because snapshots populate accounts but not slot_index.
     pub fn accounts_empty(&self) -> bool {
         let cf = self.cf(CF_ACCOUNTS);
         let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::Start);
         iter.next().is_none()
     }
 
-    /// Flush a per-mint top-K aggregate to RocksDB in a single batch.
-    /// Pair with `apply_snapshot_batch`: call once at end of cold-start.
+    /// One-shot batch flush. Pair with `apply_snapshot_batch` at end of cold-start.
     pub fn flush_mint_top_holders(
         &self,
         mut agg: HashMap<[u8; 32], Vec<(u64, [u8; 32])>>,
@@ -670,7 +648,7 @@ impl UnifiedRocksDb {
         let mut batch = WriteBatch::default();
         let count = agg.len();
         for (mint, holders) in agg.iter_mut() {
-            holders.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            holders.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
             holders.truncate(MINT_TOP_HOLDERS_K);
             let encoded = bincode::serialize(holders)?;
             batch.put_cf(&cf, mint, encoded);
@@ -820,8 +798,7 @@ impl UnifiedRocksDb {
         Ok(cutoff_slot)
     }
 
-    /// tx_index key = signature[64], value starts with slot_le(8).
-    /// Full scan: keys aren't slot-ordered.
+    /// Full scan; keys are signatures, not slot-ordered.
     pub fn prune_tx_index_before(&self, cutoff_slot: Slot) -> Result<u64> {
         let cf = self.cf(CF_TX_INDEX);
         let mut iter = self.db.raw_iterator_cf(&cf);
@@ -837,8 +814,7 @@ impl UnifiedRocksDb {
                 continue;
             };
 
-            // JSON backfill values start `{"`; prost values start with
-            // slot u64 LE whose LSB collides with `{` once per 256.
+            // Disambiguate JSON backfill (`{"`) from prost; prost slot LSB collides with `{` 1/256.
             let slot = if value.starts_with(b"{\"") {
                 serde_json::from_slice::<serde_json::Value>(value)
                     .ok()

@@ -29,7 +29,10 @@ pub struct SnapshotSet {
 impl SnapshotSet {
     /// Tip slot of the set: incremental's slot if present, otherwise the full's.
     pub fn tip_slot(&self) -> Slot {
-        self.incremental.as_ref().map(|(_, s)| *s).unwrap_or(self.full_slot)
+        self.incremental
+            .as_ref()
+            .map(|(_, s)| *s)
+            .unwrap_or(self.full_slot)
     }
 }
 
@@ -74,8 +77,8 @@ pub fn find_latest_snapshot(dir: &Path) -> Result<SnapshotSet> {
         }
     }
 
-    let (full_slot, full) = best_full
-        .with_context(|| format!("no full snapshot found in {}", dir.display()))?;
+    let (full_slot, full) =
+        best_full.with_context(|| format!("no full snapshot found in {}", dir.display()))?;
 
     let incremental = incrementals
         .into_iter()
@@ -90,23 +93,18 @@ pub fn find_latest_snapshot(dir: &Path) -> Result<SnapshotSet> {
         "found snapshot set"
     );
 
-    Ok(SnapshotSet { full, full_slot, incremental })
+    Ok(SnapshotSet {
+        full,
+        full_slot,
+        incremental,
+    })
 }
 
 type MintAgg = std::collections::HashMap<[u8; 32], Vec<(u64, [u8; 32])>>;
 
-/// Parse + apply a SnapshotSet to RocksDB. Full first, then incremental on top.
-///
-/// Pipeline: a single tar reader thread streams AppendVec buffers into a
-/// bounded MPMC channel; N worker threads parse + write to RocksDB in parallel.
-/// Each worker accumulates its own mint-top-holders aggregator; aggregators
-/// are merged at the end and flushed in one WriteBatch. RocksDB writes are
-/// thread-safe — multiple workers' WriteBatches serialize internally.
-///
-/// Per-account writes use `apply_snapshot_batch` (WriteBatch + WAL off).
-/// Mint RMW is replaced by the aggregator: ~150M read+writes → ~num_mints writes.
-///
-/// Returns (tip_slot, total_accounts_applied).
+/// Apply a SnapshotSet to RocksDB (full, then incremental). Returns
+/// (tip_slot, total_accounts_applied). Mint RMW is folded into a per-worker
+/// aggregator and flushed at the end — collapses ~150M writes to ~num_mints.
 pub fn apply_snapshot_set(
     rocks: &crate::storage::rocks::UnifiedRocksDb,
     set: &SnapshotSet,
@@ -121,7 +119,11 @@ pub fn apply_snapshot_set(
     );
     let mut total = apply_one_parallel(rocks, &set.full, set.full_slot, workers)?;
     let (full_applied, full_agg) = total;
-    info!(applied = full_applied, mints = full_agg.len(), "full snapshot applied");
+    info!(
+        applied = full_applied,
+        mints = full_agg.len(),
+        "full snapshot applied"
+    );
 
     let mut applied = full_applied;
     let mut merged_agg = full_agg;
@@ -189,7 +191,11 @@ fn apply_one_parallel(
                             )
                             .is_ok()
                     {
-                        info!(applied = n, mints = local_agg.len(), "snapshot apply progress");
+                        info!(
+                            applied = n,
+                            mints = local_agg.len(),
+                            "snapshot apply progress"
+                        );
                     }
                 }
                 Ok(local_agg)
@@ -239,16 +245,14 @@ fn merge_mint_aggs(into: &mut MintAgg, from: MintAgg) {
         let entry = into.entry(mint).or_default();
         entry.extend(holders);
         if entry.len() >= MINT_TOP_HOLDERS_K * 2 {
-            entry.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            entry.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
             entry.truncate(MINT_TOP_HOLDERS_K);
         }
     }
 }
 
-/// Stream per-AppendVec batches through `on_batch` instead of buffering all
-/// accounts in memory. Mainnet has ~300M accounts; loading them all peaks
-/// well past the host's RAM. Per-AppendVec batches keep working set bounded
-/// to one file (~10s of MB).
+/// Per-AppendVec streaming. Mainnet has ~300M accounts; one buffer at a
+/// time bounds working set to a single file (~10s of MB) instead of the host's RAM.
 pub fn stream_snapshot_accounts(
     path: &Path,
     mut on_batch: impl FnMut(&[SnapshotAccount]) -> Result<()>,
@@ -287,7 +291,11 @@ pub fn stream_snapshot_accounts(
         }
     }
 
-    info!(files = files_parsed, accounts = total, "snapshot parsing complete");
+    info!(
+        files = files_parsed,
+        accounts = total,
+        "snapshot parsing complete"
+    );
     Ok(total)
 }
 
