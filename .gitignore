@@ -12,3 +12,4 @@ data/
 docs-local/
 *.md
 !README.md
+!LICENSE.md

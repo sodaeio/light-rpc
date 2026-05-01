@@ -2,8 +2,6 @@
 
 A unified Solana indexer and RPC server. Single binary that replaces the need for separate block history, account indexing, and DAS API services.
 
-> Repo dir is still `light-indexer/`; the Rust crate, library, and binary were renamed to `light-rpc` in v0.2.2. Existing systemd units and `/home/das/light-indexer/` deploy paths were left alone for ops continuity.
-
 ## What it does
 
 light-rpc subscribes to a Solana validator's stream (Yellowstone Dragon's Mouth gRPC, native [Richat](https://github.com/lamports-dev/richat) gRPC, or QUIC firehose) and indexes everything into a tiered storage system. It then serves the full Solana JSON-RPC API from one HTTP endpoint — no validator node required. Cold start can rebuild full account state from a local Solana snapshot (`source.snapshot_dir`).
@@ -284,4 +282,4 @@ Disk grows roughly linearly with retention (`storage.blocks.max_stored_blocks`) 
 
 ## License
 
-MIT
+AGPL-3.0-only. See [LICENSE](LICENSE) for the full text and [LICENSE.md](LICENSE.md) for licensing notes.
