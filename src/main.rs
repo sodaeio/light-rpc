@@ -129,6 +129,7 @@ async fn run(config: Config) -> Result<()> {
         broadcast_tx,
     );
 
+    let mut ch_read_client: Option<clickhouse::Client> = None;
     {
         use light_rpc::storage::clickhouse::{clickhouse_writer_loop, ClickHouseStore};
         if let Some(ch_cfg) = &config.storage.clickhouse {
@@ -136,6 +137,9 @@ async fn run(config: Config) -> Result<()> {
                 .await
                 .context("connecting to clickhouse")?;
             let store = Arc::new(store);
+            if store.read_enabled() {
+                ch_read_client = Some(store.client().clone());
+            }
             let (ch_tx, ch_rx) = tokio::sync::mpsc::channel(4096);
             let store_for_task = Arc::clone(&store);
             tokio::spawn(async move {
@@ -181,7 +185,12 @@ async fn run(config: Config) -> Result<()> {
         }
     });
 
-    let reader = Arc::new(StorageReader::new(memory_cache, rocks, files, pg));
+    let mut reader = StorageReader::new(memory_cache, rocks, files, pg);
+    if let Some(client) = ch_read_client {
+        reader = reader.with_clickhouse(client);
+        info!("clickhouse historical reads enabled");
+    }
+    let reader = Arc::new(reader);
     let invalidator_reader = Arc::clone(&reader);
     tokio::spawn(async move {
         invalidator_reader

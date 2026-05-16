@@ -146,6 +146,10 @@ impl ClickHouseStore {
         self.config.read_enabled
     }
 
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     async fn migrate(&self) -> Result<()> {
         self.client
             .query(&format!(

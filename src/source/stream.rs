@@ -10,6 +10,7 @@ use richat_proto::geyser::{
     subscribe_update::UpdateOneof, SlotStatus as ProtoSlotStatus, SubscribeUpdate,
 };
 use richat_proto::richat::{GrpcSubscribeRequest, RichatFilter};
+use serde_json::Value;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use tokio::sync::mpsc;
@@ -81,10 +82,20 @@ impl SlotAccumulator {
         let mut txs: Vec<TransactionEntry> = self.transactions.into_values().collect();
         txs.par_iter_mut().for_each(|tx| {
             if let Ok(info) = SubscribeUpdateTransactionInfo::decode(tx.payload.as_ref()) {
-                let val = crate::rpc::tx_format::prebuild_tx_value(info, tx.err.clone());
-                if let Ok(raw) = serde_json::value::to_raw_value(&val) {
+                // Single proto decode → prebuilt RawValue + the strings the CH writer stores.
+                let mut comp =
+                    crate::rpc::tx_format::build_tx_components(0, None, tx.err.clone(), info);
+                if let Value::Object(ref mut map) = comp.full {
+                    map.remove("slot");
+                    map.remove("blockTime");
+                }
+                if let Ok(raw) = serde_json::value::to_raw_value(&comp.full) {
                     tx.prebuilt = Arc::new(raw);
                 }
+                tx.message = Arc::from(comp.message);
+                tx.meta = Arc::from(comp.meta);
+                tx.compute_units = comp.compute_units;
+                tx.log_messages = Arc::from(comp.log_messages.into_boxed_slice());
             }
         });
 
@@ -412,6 +423,12 @@ impl StreamSource {
                                     err: err_msg.clone(),
                                     payload,
                                     prebuilt: PLACEHOLDER_RAW.clone(),
+                                    message: Arc::from(""),
+                                    meta: Arc::from(""),
+                                    compute_units: 0,
+                                    log_messages: Arc::from(
+                                        Vec::<String>::new().into_boxed_slice(),
+                                    ),
                                 },
                             );
 

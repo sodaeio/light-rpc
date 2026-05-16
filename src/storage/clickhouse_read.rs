@@ -47,6 +47,12 @@ pub async fn get_transaction(
         return Ok(None);
     };
 
+    // Pre-deploy writer (Apr–May 8) left both columns empty.
+    // Returning a half-row {slot,blockTime,sig} confuses callers — surface as miss.
+    if row.message.is_empty() && row.meta.is_empty() {
+        return Ok(None);
+    }
+
     let meta_val: serde_json::Value = serde_json::from_str(&row.meta).unwrap_or_default();
     let msg_val: serde_json::Value = serde_json::from_str(&row.message).unwrap_or_default();
 

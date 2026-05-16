@@ -39,7 +39,7 @@ pub fn decode_tx_index(bytes: &[u8]) -> Result<Value> {
     };
 
     let info = SubscribeUpdateTransactionInfo::decode(&bytes[payload_start..])?;
-    Ok(build_rpc_shape(
+    Ok(build_tx_components(
         slot,
         if block_time_raw == 0 {
             None
@@ -48,30 +48,21 @@ pub fn decode_tx_index(bytes: &[u8]) -> Result<Value> {
         },
         err_str,
         info,
-    ))
+    )
+    .full)
 }
 
 /// Decode a raw `SubscribeUpdateTransactionInfo` (no tx_index header) into
 /// the `{transaction, meta, version}` shape used by getBlock.
 pub fn decode_payload(payload: &[u8], err_str: Option<String>) -> Result<Value> {
     let info = SubscribeUpdateTransactionInfo::decode(payload)?;
-    let mut v = build_rpc_shape(0, None, err_str, info);
-    if let Value::Object(ref mut map) = v {
-        map.remove("slot");
-        map.remove("blockTime");
-    }
-    Ok(v)
+    Ok(build_tx_components(0, None, err_str, info).full_no_slot())
 }
 
 /// Build the `{transaction, meta, version}` shape from an already-parsed
 /// proto. Called at ingest to populate `TransactionEntry::prebuilt`.
 pub fn prebuild_tx_value(info: SubscribeUpdateTransactionInfo, err_str: Option<String>) -> Value {
-    let mut v = build_rpc_shape(0, None, err_str, info);
-    if let Value::Object(ref mut map) = v {
-        map.remove("slot");
-        map.remove("blockTime");
-    }
-    v
+    build_tx_components(0, None, err_str, info).full_no_slot()
 }
 
 /// Variant of `prebuild_tx_value` that includes slot + blockTime.
@@ -81,15 +72,39 @@ pub fn prebuild_gettx_value(
     block_time: Option<i64>,
     err_str: Option<String>,
 ) -> Value {
-    build_rpc_shape(slot, block_time, err_str, info)
+    build_tx_components(slot, block_time, err_str, info).full
 }
 
-fn build_rpc_shape(
+/// All fields the writer + RPC layer need from a single proto decode.
+/// `message` and `meta` are JSON strings ready for ClickHouse storage.
+pub struct TxComponents {
+    pub full: Value,
+    pub message: String,
+    pub meta: String,
+    pub compute_units: u32,
+    pub log_messages: Vec<String>,
+}
+
+impl TxComponents {
+    fn full_no_slot(mut self) -> Value {
+        if let Value::Object(ref mut map) = self.full {
+            map.remove("slot");
+            map.remove("blockTime");
+        }
+        self.full
+    }
+}
+
+/// Single-pass builder: produces the agave-shape Value plus the pre-serialized
+/// message/meta strings + log_messages and compute_units the CH writer stores.
+/// Decoding the proto twice (once here, again for storage) would waste CPU on
+/// every tx, so callers should produce both products from this one call.
+pub fn build_tx_components(
     slot: u64,
     block_time: Option<i64>,
     err_str: Option<String>,
     info: SubscribeUpdateTransactionInfo,
-) -> Value {
+) -> TxComponents {
     let tx = info.transaction.unwrap_or_default();
     let meta = info.meta.unwrap_or_default();
 
@@ -128,9 +143,19 @@ fn build_rpc_shape(
         json!({})
     };
 
-    let version = if versioned { json!(0) } else { json!("legacy") };
+    let compute_units = meta.compute_units_consumed.unwrap_or(0) as u32;
+    let log_messages = if meta.log_messages_none {
+        Vec::new()
+    } else {
+        meta.log_messages.clone()
+    };
+    let meta_value = meta_json(&meta, err_str);
 
-    json!({
+    let message_str = serde_json::to_string(&message_json).unwrap_or_default();
+    let meta_str = serde_json::to_string(&meta_value).unwrap_or_default();
+
+    let version = if versioned { json!(0) } else { json!("legacy") };
+    let full = json!({
         "slot": slot,
         "blockTime": block_time,
         "version": version,
@@ -138,8 +163,16 @@ fn build_rpc_shape(
             "signatures": signatures,
             "message": message_json,
         },
-        "meta": meta_json(&meta, err_str),
-    })
+        "meta": meta_value,
+    });
+
+    TxComponents {
+        full,
+        message: message_str,
+        meta: meta_str,
+        compute_units,
+        log_messages,
+    }
 }
 
 fn compiled_ix_json(ix: &CompiledInstruction) -> Value {
