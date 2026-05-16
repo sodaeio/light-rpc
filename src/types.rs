@@ -84,6 +84,14 @@ pub struct TransactionEntry {
     /// Pre-built agave-shape JSON. getTransaction / getBlock(full) clone this
     /// Arc instead of re-decoding the prost payload.
     pub prebuilt: Arc<Box<serde_json::value::RawValue>>,
+    /// agave-shape `transaction.message` JSON, built from the gRPC proto.
+    /// Empty until block-seal populates it; the ClickHouse writer copies it
+    /// straight in to avoid re-decoding the proto.
+    pub message: Arc<str>,
+    /// agave-shape `meta` JSON, built from the gRPC proto.
+    pub meta: Arc<str>,
+    pub compute_units: u32,
+    pub log_messages: Arc<[String]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

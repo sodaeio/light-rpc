@@ -129,16 +129,18 @@ impl UnifiedRocksDb {
             }
         }
 
-        // 64 GiB shared block cache: sized for cold tx_index lookups without crowding memtables.
-        let cache = Cache::new_lru_cache(64 * 1024 * 1024 * 1024);
+        // Shared block cache across all CFs. Size is host-dependent; the
+        // previous 64 GiB hardcode OOM'd smaller hosts.
+        let cache_bytes = config.block_cache_gb.saturating_mul(1024 * 1024 * 1024);
+        let cache = Cache::new_lru_cache(cache_bytes);
 
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        // 512 MB × 6: fewer L0 flushes during cold-start at the cost of slower gSFA scans
-        // over unflushed memtables — cold-start dominates ingest cost on this deployment.
-        db_opts.set_write_buffer_size(512 * 1024 * 1024);
-        db_opts.set_max_write_buffer_number(6);
+        // Memtable budget per CF = write_buffer_size × max_write_buffer_number.
+        // Multiply by 7 CFs for the steady-state ceiling.
+        db_opts.set_write_buffer_size(config.write_buffer_size);
+        db_opts.set_max_write_buffer_number(config.max_write_buffer_number);
         db_opts.set_max_open_files(config.max_open_files);
         db_opts.set_allow_concurrent_memtable_write(true);
         let parallelism = std::thread::available_parallelism()

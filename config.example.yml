@@ -23,10 +23,12 @@ source:
 storage:
   rocksdb:
     path: "data/rocksdb"
-    write_buffer_size: 268435456     # 256MB
+    write_buffer_size: 268435456     # 256MB per memtable
     max_open_files: 512
     enable_pipelined_writes: true
     enable_wal: true
+    block_cache_gb: 16               # shared LRU; size to spare RAM, not disk size
+    max_write_buffer_number: 3       # per-CF memtables; total = 7 * write_buffer_size * this
 
   blocks:
     path: "data/blocks"

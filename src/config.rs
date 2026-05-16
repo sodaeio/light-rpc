@@ -136,6 +136,16 @@ pub struct RocksDbConfig {
     pub enable_pipelined_writes: bool,
     #[serde(default = "default_true")]
     pub enable_wal: bool,
+    /// Shared block-cache size across all CFs, in GiB. Right-size for the host:
+    /// big nodes can afford 32+, shared hosts should stay at 4-8 to leave room
+    /// for memtables and other tenants.
+    #[serde(default = "default_block_cache_gb")]
+    pub block_cache_gb: usize,
+    /// Max immutable memtables per CF. Each CF can hold up to this many
+    /// `write_buffer_size`-sized buffers, so total memtable budget is
+    /// roughly `7 (CFs) * write_buffer_size * max_write_buffer_number`.
+    #[serde(default = "default_max_write_buffer_number")]
+    pub max_write_buffer_number: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -308,6 +318,12 @@ fn default_write_buffer() -> usize {
 }
 fn default_max_open_files() -> i32 {
     512
+}
+fn default_block_cache_gb() -> usize {
+    16
+}
+fn default_max_write_buffer_number() -> i32 {
+    3
 }
 fn default_true() -> bool {
     true

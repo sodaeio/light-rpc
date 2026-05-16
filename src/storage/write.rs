@@ -247,14 +247,13 @@ impl StorageWriter {
                 block_time,
                 err: tx.err.is_some(),
                 fee,
-                // TODO: populate from decoded tx payload
-                compute_units: 0,
+                compute_units: tx.compute_units,
                 addresses,
                 writable_mask: vec![0u8; addr_count],
                 signer_mask: vec![0u8; addr_count],
-                log_messages: Vec::new(),
-                message: String::new(),
-                meta: String::new(),
+                log_messages: tx.log_messages.to_vec(),
+                message: tx.message.to_string(),
+                meta: tx.meta.to_string(),
             });
         }
 
